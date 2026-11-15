@@ -91,6 +91,7 @@
   "src/web.rs",
   "tests/backup-qa.Containerfile",
   "tests/backup_repository.rs",
+  "tests/backup_review.rs",
   "tests/backup_transport.rs",
   "tests/browser_login.py",
   "tests/monitor_lifecycle.py",

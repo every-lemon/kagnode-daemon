@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS node_certificates(node TEXT PRIMARY KEY,fingerprint T
 CREATE TABLE IF NOT EXISTS request_limits(node TEXT PRIMARY KEY,second INTEGER NOT NULL,count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tickets(hash TEXT PRIMARY KEY,node TEXT NOT NULL,key TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,node TEXT NOT NULL,snapshot TEXT NOT NULL,body TEXT NOT NULL,expires INTEGER NOT NULL,reserved INTEGER NOT NULL,finished INTEGER NOT NULL DEFAULT 0,UNIQUE(node,snapshot));
+CREATE TABLE IF NOT EXISTS lease_progress(id TEXT PRIMARY KEY,started INTEGER NOT NULL,bytes INTEGER NOT NULL DEFAULT 0,renewed_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS objects(node TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(node,hash));
 CREATE TABLE IF NOT EXISTS snapshots(node TEXT NOT NULL,id TEXT NOT NULL,created INTEGER NOT NULL,body TEXT NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,restore_verified INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(node,id));
 CREATE TABLE IF NOT EXISTS refs(node TEXT NOT NULL,snapshot TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(node,snapshot,object),FOREIGN KEY(node,snapshot) REFERENCES snapshots(node,id) ON DELETE CASCADE,FOREIGN KEY(node,object) REFERENCES objects(node,hash));
@@ -482,6 +483,7 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
                 },
             });
         }
+        self.check_lease_slots(&m.node, "", now)?;
         let missing = self.missing(m)?;
         let needed = missing.iter().try_fold(0u64, |n, o| {
             n.checked_add(o.bytes)
@@ -514,12 +516,24 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
                 i64::try_from(needed)?
             ],
         )?;
+        tx.execute(
+            "INSERT INTO lease_progress(id,started) VALUES(?1,?2)",
+            params![id, now],
+        )?;
         tx.commit()?;
         Ok(Lease {
             id,
             expires,
             missing,
         })
+    }
+    fn check_lease_slots(&self, node: &str, except: &str, now: i64) -> Result<()> {
+        let (global, own): (i64, i64) = self.db.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(node=?1),0) FROM leases WHERE finished=0 AND expires>=?2 AND id!=?3",
+            params![node,now,except], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(own == 0, "Node already holds an active upload lease");
+        ensure!(global < 2, "Backup server lease capacity is busy");
+        Ok(())
     }
     fn missing(&self, m: &Manifest) -> Result<Vec<Object>> {
         let root = self.root.join("objects").join(&m.node);
@@ -550,6 +564,20 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         ensure!(finished == 0, "Completed lease cannot be renewed");
+        self.check_lease_slots(node, id, now)?;
+        let (started, bytes, renewed): (i64, i64, i64) = self.db.query_row(
+            "SELECT started,bytes,renewed_bytes FROM lease_progress WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        ensure!(
+            now >= started && now - started < 86400,
+            "Upload lease reached maximum lifetime; start a new snapshot"
+        );
+        ensure!(
+            bytes > renewed,
+            "Lease renewal requires durable upload progress"
+        );
         let s: SignedSnapshot = serde_json::from_str(&body)?;
         let needed: u64 = self.missing(&s.manifest)?.iter().map(|o| o.bytes).sum();
         let (total, available) = self.capacity()?;
@@ -568,10 +596,14 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         );
         tx.execute(
             "UPDATE leases SET expires=?1,reserved=?2 WHERE id=?3",
-            params![now + 900, i64::try_from(needed)?, id],
+            params![(now + 900).min(started + 86400), i64::try_from(needed)?, id],
+        )?;
+        tx.execute(
+            "UPDATE lease_progress SET renewed_bytes=bytes WHERE id=?1",
+            [id],
         )?;
         tx.commit()?;
-        Ok(now + 900)
+        Ok((now + 900).min(started + 86400))
     }
     fn account_bytes(&mut self, node: &str, bytes: u64, now: i64) -> Result<()> {
         let date = chrono::DateTime::from_timestamp(now, 0)
@@ -693,6 +725,10 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
                 params![node, object, i64::try_from(size)?, now],
             )?;
         }
+        self.db.execute(
+            "UPDATE lease_progress SET bytes=bytes+?1 WHERE id=?2",
+            params![data.len() as i64, id],
+        )?;
         Ok(size)
     }
     pub fn finish(&mut self, node: &str, id: &str, now: i64) -> Result<Value> {
