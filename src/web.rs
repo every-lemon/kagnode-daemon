@@ -111,6 +111,7 @@ pub fn router(app: App) -> Router {
         .route("/", get(page))
         .route("/settings", get(page))
         .route("/audit", get(page))
+        .route("/backup", get(page))
         .route("/ha", get(page))
         .route("/servers/local/applications/{id}", get(application_page))
         .layer(DefaultBodyLimit::max(65536))
@@ -148,7 +149,7 @@ fn shell(s: &App, title: &str, u: Option<&Session>, body: &str) -> String {
     let head=s.core.head(json!({"authenticated":u.is_some(),"subject":u.map(|u|&u.email),"name":u.map(|u|&u.email),"home":"/","publicNavigation":false})).expect("valid Core context");
     let navigation = if u.is_some() {
         let nav = format!(
-            "<div data-core-nav-root><button class=\"quick-search\" data-core-search-open aria-label=\"Quick search\"><span data-core-icon=\"search\"></span><span class=\"nav-label\">Quick search</span><kbd>Ctrl K</kbd></button><a href=\"/\" data-core-icon=\"home\">Overview</a><button data-core-nav-open=\"applications\"><span data-core-icon=\"server\"></span><span class=\"nav-label\">Applications</span></button><a href=\"/ha\" data-core-icon=\"shield\">High availability</a><a href=\"/audit\" data-core-icon=\"activity\">Activity</a><a href=\"/settings\" data-core-icon=\"settings\">Settings</a></div><div data-core-nav-folder=\"applications\" hidden><button data-core-nav-back><span data-core-icon=\"arrow-left\"></span><span class=\"nav-label\">Back to workspace</span></button>{}</div>",
+            "<div data-core-nav-root><button class=\"quick-search\" data-core-search-open aria-label=\"Quick search\"><span data-core-icon=\"search\"></span><span class=\"nav-label\">Quick search</span><kbd>Ctrl K</kbd></button><a href=\"/\" data-core-icon=\"home\">Overview</a><button data-core-nav-open=\"applications\"><span data-core-icon=\"server\"></span><span class=\"nav-label\">Applications</span></button><a href=\"/ha\" data-core-icon=\"shield\">High availability</a><a href=\"/backup\" data-core-icon=\"archive\">Backups</a><a href=\"/audit\" data-core-icon=\"activity\">Activity</a><a href=\"/settings\" data-core-icon=\"settings\">Settings</a></div><div data-core-nav-folder=\"applications\" hidden><button data-core-nav-back><span data-core-icon=\"arrow-left\"></span><span class=\"nav-label\">Back to workspace</span></button>{}</div>",
             catalog::PRODUCTS
                 .iter()
                 .map(|p| format!(
@@ -180,7 +181,7 @@ fn shell(s: &App, title: &str, u: Option<&Session>, body: &str) -> String {
     }).unwrap_or_default();
     let content = if u.is_some() {
         format!(
-            "{navigation}<div class=\"workspace\"><header class=\"topbar\"><span>KagNode. Daemon</span>{account}</header><main id=\"main\">{body}</main><footer><a href=\"https://github.com/every-lemon/kagnode-daemon\">Source and documentation</a></footer></div><div hidden data-core-search-source><a href=\"/\">Overview</a><a href=\"/ha\">High availability</a><a href=\"/settings\">Settings</a><a href=\"/audit\">Activity</a></div>"
+            "{navigation}<div class=\"workspace\"><header class=\"topbar\"><span>KagNode. Daemon</span>{account}</header><main id=\"main\">{body}</main><footer><a href=\"https://github.com/every-lemon/kagnode-daemon\">Source and documentation</a></footer></div><div hidden data-core-search-source><a href=\"/\">Overview</a><a href=\"/ha\">High availability</a><a href=\"/settings\">Settings</a><a href=\"/backup\">Backups</a><a href=\"/audit\">Activity</a></div>"
         )
     } else {
         body.into()
