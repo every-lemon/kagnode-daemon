@@ -285,7 +285,7 @@ impl Queue {
         Ok(())
     }
     pub fn status(&self) -> Result<Value> {
-        let mut stmt=self.db.prepare("SELECT t.id,j.snapshot,t.state,t.attempts,t.next_attempt,t.receipt,t.error FROM transfers t JOIN jobs j ON j.id=t.job ORDER BY t.id DESC LIMIT 128")?;
+        let mut stmt=self.db.prepare("SELECT t.id,j.snapshot,t.state,t.attempts,t.next_attempt,t.receipt,t.error FROM transfers t JOIN jobs j ON j.id=t.job ORDER BY t.id DESC LIMIT 64")?;
         let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"snapshot":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"attempts":r.get::<_,u32>(3)?,"next_attempt":r.get::<_,i64>(4)?,"receipt":r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"error":r.get::<_,Option<String>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(
             json!({"transfers":items,"verification":"ciphertext receipt; not recovery qualification"}),

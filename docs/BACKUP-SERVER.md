@@ -316,3 +316,69 @@ key/certificate matching; it does not prove hostname suitability, operational
 trust distribution or future expiry. Clients must receive replacement CA trust
 through their own protected configuration. Backup admission still requires the
 explicit node fingerprint even when a certificate chains to the accepted CA.
+
+## JSON contract for Core/TUI backup pages
+
+These are **local-administrator controller** APIs, not remote-node APIs. All
+responses use `Cache-Control: no-store`. Authenticate with the `kn_daemon` session
+cookie. Mutations additionally require the exact configured `Origin`, the session
+`x-csrf-token` from `GET /api/v1/session`, and authentication within 15 minutes.
+JSON field names below are literal; UI labels may differ. Unknown body fields and
+incorrect action/route combinations are rejected. Never put credentials or
+confirmation tokens in URLs, analytics, logs or saved page state.
+
+| GET route | Response |
+| --- | --- |
+| `/api/v1/backup-server/status` | Configured: `{process_id,site,server,policy,storage_total_bytes,storage_available_bytes,verification}`. Unconfigured: `{enabled:false,status:"not configured",production_qualified:false}`. |
+| `/api/v1/backup-server/nodes` | `{nodes:[{node,certificate_sha256,enrolled,revoked}]}`; at most 1000, sorted by node. Unconfigured: `{enabled:false,nodes:[]}`. |
+| `/api/v1/backup-server/snapshots/NODE` | `{snapshots:[{id,created,received_at,pinned,restore_tested}],protected:["SNAPSHOT",...]}`. Receipt time determines ordering; claimed creation time does not prove retention eligibility. |
+| `/api/v1/backup-server/policy` | `{enabled:true,policy:{...}}`; unconfigured uses `enabled:false,policy:null`. |
+| `/api/v1/backup-agent/status` | `{revision,status,production_qualified:false}`. This is the last recorded local worker observation, not a new probe of remote servers. |
+
+Agent `status.state` is `not_observed`, `disabled`, `paused`, `deferred`,
+`transferring`, `scheduled`, `source_blocked` or `blocked`. When present, `queue`
+contains the latest 64 `transfers`: `{id,snapshot,state,attempts,next_attempt,
+receipt,error}`. Transfer states are `pending`, `running`, `completed` or `blocked`.
+`receipt` is null or the server's `{snapshot,ciphertext_verified,verified_at,
+restore_tested:false,server}`. A ciphertext receipt is not a successful restore.
+`error` is safe summary text; do not infer retry safety from it alone. Dates are
+integer Unix seconds in UTC; sizes are integer bytes. Do not round large integer
+budgets in JavaScript; restrict editing to exact safe integers or use a lossless
+JSON parser. Missing worker configuration must show setup guidance, not success.
+
+Policy fields: `revision`, `interval_seconds`, `recovery_point_seconds`,
+`keep_snapshots`, `reserve_bytes`, `max_deferral_seconds`, `bandwidth_percent`,
+`monthly_node_bytes` (nullable), `monthly_server_bytes` (nullable),
+`required_copies`. To update, submit the complete policy with revision equal to
+current revision + 1. Conflict returns an error; fetch again and show the changed
+values before retrying. Server policy alone does not create an outbound schedule.
+
+### Confirmed actions
+
+1. Construct one typed request from the table below.
+2. POST `/api/v1/backup-server/confirm` with
+   `{"password":"<entered locally>","request":{...}}` and normal mutation headers.
+   Success returns `{"confirmation":"<opaque>","expires_in":60}`.
+3. POST the **identical typed request** to its route with
+   `x-backup-confirmation: <opaque>` plus normal mutation headers. The confirmation
+   is session-bound, action/payload-bound, one-use and expires after 60 seconds.
+4. Clear the password and token from UI state. Refresh the affected read views.
+
+| POST route suffix under `/api/v1/backup-server/` | Request | Success |
+| --- | --- | --- |
+| `approve` | `{action:"approve",node,public_key,certificate_sha256}` | `{node,expires_in:600,token}`; show the one-use enrollment token only to the local administrator. |
+| `revoke` | `{action:"revoke",node}` | `{revoked:true}` |
+| `rotate-certificate` | `{action:"rotate_certificate",node,expected_sha256,certificate_sha256}` | `{node,certificate_sha256,rotated:true}` |
+| `policy` | `{action:"set_policy",policy:{...}}` | `{revision}` |
+| `pin` | `{action:"pin",node,snapshot,pinned:true|false}` | `{pinned}`; only pinning true skips the extra password-confirmation step. |
+| `delete` | `{action:"delete",node,snapshot,confirm:"delete NODE/SNAPSHOT"}` | `{deleted:true}`; protected snapshots are still refused. |
+| `garbage-collection` | `{action:"collect_garbage",confirm:true}` | `{objects_removed}`; never present it as a restore test. |
+
+Errors use `{error:"message"}`. Missing/expired session is 401; missing/wrong
+CSRF/origin/confirmation is 403; unsupported routes/actions are 404; validation,
+policy conflicts and worker refusals currently use 400. Treat unknown outcomes
+(transport failure/timeouts) as uncertain: inspect current status before a fresh
+confirmation, never silently replay a destructive action. This API does not expose
+restore execution, recovery identities, arbitrary commands or remote deployment.
+Scheduler configuration/pause currently uses the protected local configuration;
+there is no web scheduler mutation endpoint to invent for these pages.

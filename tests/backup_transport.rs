@@ -365,6 +365,37 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?,
         ),
     });
+    for path in [
+        "/api/v1/backup-server/nodes",
+        "/api/v1/backup-server/policy",
+        "/api/v1/backup-agent/status",
+    ] {
+        let denied = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty())?)
+            .await?;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("cookie", format!("kn_daemon={token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(allowed.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(allowed.into_body(), 65536).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if path.ends_with("nodes") {
+            assert_eq!(value["nodes"], serde_json::json!([]));
+        } else if path.ends_with("policy") {
+            assert!(value["policy"].is_null());
+        } else {
+            assert_eq!(value["status"]["state"], "not_observed");
+        }
+    }
     let response = app
         .clone()
         .oneshot(

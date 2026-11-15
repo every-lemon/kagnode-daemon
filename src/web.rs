@@ -91,6 +91,9 @@ pub fn router(app: App) -> Router {
         )
         .route("/api/v1/audit", get(audit))
         .route("/api/v1/backup-server/status", get(backup_server_status))
+        .route("/api/v1/backup-server/nodes", get(backup_server_nodes))
+        .route("/api/v1/backup-server/policy", get(backup_server_policy))
+        .route("/api/v1/backup-agent/status", get(backup_agent_status))
         .route("/api/v1/backup-server/confirm", post(backup_server_confirm))
         .route("/api/v1/backup-server/{action}", post(backup_server_action))
         .route(
@@ -308,6 +311,38 @@ async fn applications(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
     Ok(Json(
         json!({"server":"local","applications":catalog::PRODUCTS.iter().map(|p|json!({"product":p,"installed":catalog::installed(root,p),"url":format!("/servers/local/applications/{}",p.id),"management":"project-owned-adapter","native_actions_enabled":false})).collect::<Vec<_>>()}),
     ))
+}
+async fn backup_agent_status(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    let saved = s.store.document("backup-agent-status")?;
+    Ok(Json(
+        json!({"revision":saved.as_ref().map_or(0,|(r,_)|*r),"status":saved.map_or(json!({"state":"not_observed"}),|(_,v)|v),"production_qualified":false}),
+    ))
+}
+async fn backup_server_nodes(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    if !s.store.root.join("backup-server.json").exists() {
+        return Ok(Json(json!({"enabled":false,"nodes":[]})));
+    }
+    Ok(Json(
+        crate::backup_service::supervisor::request(
+            &s.store,
+            &crate::backup_service::control::AdminRequest::Nodes,
+        )
+        .await?,
+    ))
+}
+async fn backup_server_policy(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    if !s.store.root.join("backup-server.json").exists() {
+        return Ok(Json(json!({"enabled":false,"policy":null})));
+    }
+    let status = crate::backup_service::supervisor::request(
+        &s.store,
+        &crate::backup_service::control::AdminRequest::Status,
+    )
+    .await?;
+    Ok(Json(json!({"enabled":true,"policy":status["policy"]})))
 }
 async fn backup_server_status(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
     user(&s, &h)?;
