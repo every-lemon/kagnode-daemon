@@ -255,9 +255,14 @@ attempts put that target in a 24-hour blocked cooldown. Once it expires, the
 worker allows one retry per day until success; the lifetime attempt count is
 retained across restarts. Pause, readiness, source and lease checks still apply.
 A cooldown retry is not a bypass for a refused or exhausted server lease. Only unfinished jobs count toward the 1024-job admission limit. Completed
-history remains durable for snapshot identity checks and receipts; it does not
-stop future scheduling. History currently grows with successful snapshots, so
-monitor queue disk usage; automated history compaction remains a known limit. Pause/removal or loss of
+history retains the newest 256 queued fully completed jobs, including their
+receipts. Older completed manifests/configuration/receipts are pruned atomically
+on completion and queue reopen. All unfinished jobs and transfers remain, including
+blocked retries; legacy queues migrate without changing their prepared ciphertext.
+A compact schedule/node/snapshot/digest ledger preserves immutable identity checks
+and deduplication after pruning. That ledger grows with unique completed snapshots;
+exact indefinite deduplication is not constant-space. Freed SQLite pages are reused;
+startup does not run a blocking full VACUUM or erase the identity ledger. Pause/removal or loss of
 readiness cancels an active transfer at the next one-second check. A prepared-file
 failure does not discard queued work. Configuration changes affect new jobs;
 existing target/key-path/manifest choices stay frozen. Changing schedule identity
