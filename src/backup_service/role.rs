@@ -283,6 +283,7 @@ fn build_install(
         .ok_or_else(|| anyhow::anyhow!("Missing controller directory"))?;
     ensure!(
         controller_dir.symlink_metadata()?.uid() == controller_uid
+            && controller_dir.symlink_metadata()?.mode() & 0o077 == 0
             && controller_config
                 .file_name()
                 .is_some_and(|f| f == "backup-server.json"),
@@ -298,6 +299,7 @@ fn build_install(
         "Use the dedicated control socket"
     );
     let controller_gid = account_gid(controller_uid)?;
+    ensure!(controller_gid != 0, "Controller IPC group must not be root");
     account_gid(worker.uid())?;
     let mut inputs = std::collections::BTreeMap::new();
     for (p, secret, owners) in [
@@ -410,6 +412,22 @@ pub fn install(plan: &Installation) -> Result<Value> {
         ensure!(
             r["plan_sha256"] == plan.sha256 && r["state"] == "installed_inactive",
             "Incomplete/different install needs recovery review"
+        );
+        let expected_config = kagnode_backup_format::digest(&serde_json::to_vec(&plan.config)?);
+        ensure!(
+            protected_file_hash(&dir.join("config.json"), &[plan.worker_uid], true)?
+                == expected_config
+                && protected_file_hash(
+                    &plan.controller_config,
+                    &[plan.config.controller_uid.unwrap()],
+                    true
+                )? == expected_config
+                && protected_file_hash(
+                    &plan.unit_directory.join("kagnode-backup-server.service"),
+                    &[0],
+                    false
+                )? == kagnode_backup_format::digest(plan.unit.as_bytes()),
+            "Installed files changed; inspect before adopting the receipt"
         );
         return Ok(r);
     }

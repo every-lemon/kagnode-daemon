@@ -50,6 +50,7 @@ fn inactive_install_requires_valid_tls_and_preserves_existing_files() -> Result<
     role::apply(&root, &reservation)?;
     let controller = root.join("controller");
     fs::create_dir(&controller)?;
+    fs::set_permissions(&controller, fs::Permissions::from_mode(0o700))?;
     let repository = t.path().join("repository");
     fs::create_dir(&repository)?;
     fs::set_permissions(&repository, fs::Permissions::from_mode(0o700))?;
@@ -120,5 +121,10 @@ fn inactive_install_requires_valid_tls_and_preserves_existing_files() -> Result<
     assert_eq!(receipt["activation"], false);
     assert_eq!(role::install(&plan)?, receipt);
     assert!(units.join("kagnode-backup-server.service").exists());
+    fs::write(
+        units.join("kagnode-backup-server.service"),
+        "tampered fixture",
+    )?;
+    assert!(role::install(&plan).is_err());
     Ok(())
 }
