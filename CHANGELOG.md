@@ -1,3 +1,9 @@
+# 5.0.3
+
+- Publish the KagNode. Daemon branding in current command help, terminal screens and wordmark artwork.
+- Retain the kagnode command, package/data identities and reviewed Core/application operations.
+- Document the persistent Rust service lifetime and existing native migration gates. This compatibility patch does not replace an existing runtime with an unqualified Rust candidate.
+
 # 5.0.2
 
 - Add KagNode. PM to the project-owned setup catalog, retaining the installed proxy-manager identifier.

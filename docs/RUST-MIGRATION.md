@@ -1,6 +1,6 @@
 # Rust migration and verification matrix
 
-All product versions remain on 5.0.x. The current public 5.0.2 packages preserve the compatibility CLI. Rust 5.0.3 is a staged candidate until the following gates pass.
+All product versions remain on 5.0.x. The current public 5.0.3 compatibility packages preserve the compatibility CLI. Rust 5.0.3 is a staged candidate until the following gates pass.
 
 | Component              | Current implementation                                                                                       | Remaining qualification                                                            |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
