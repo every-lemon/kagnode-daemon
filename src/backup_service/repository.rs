@@ -180,6 +180,8 @@ impl Repository {
         db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS policy(id INTEGER PRIMARY KEY CHECK(id=1),body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,public_key TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS node_certificates(node TEXT PRIMARY KEY,fingerprint TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS request_limits(node TEXT PRIMARY KEY,second INTEGER NOT NULL,count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tickets(hash TEXT PRIMARY KEY,node TEXT NOT NULL,key TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,node TEXT NOT NULL,snapshot TEXT NOT NULL,body TEXT NOT NULL,expires INTEGER NOT NULL,reserved INTEGER NOT NULL,finished INTEGER NOT NULL DEFAULT 0,UNIQUE(node,snapshot));
 CREATE TABLE IF NOT EXISTS objects(node TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(node,hash));
@@ -231,6 +233,78 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             "INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'policy',?3)",
             params![auth::now(), actor, next.revision.to_string()],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn approve_tls_node(
+        &mut self,
+        node: &str,
+        public_key: &str,
+        fingerprint: &str,
+        now: i64,
+    ) -> Result<String> {
+        ensure!(
+            identifier(node) && hash(public_key) && hash(fingerprint),
+            "Invalid approved transport identity"
+        );
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT fingerprint FROM node_certificates WHERE node=?1",
+                [node],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            existing.as_deref().is_none_or(|v| v == fingerprint),
+            "Changing node certificates requires explicit rotation; existing approval retained"
+        );
+        let token = auth::random()?;
+        tx.execute(
+            "INSERT INTO node_certificates VALUES(?1,?2) ON CONFLICT(node) DO NOTHING",
+            params![node, fingerprint],
+        )?;
+        tx.execute(
+            "INSERT INTO tickets VALUES(?1,?2,?3,?4,0)",
+            params![auth::digest(&token), node, public_key, now + 600],
+        )?;
+        tx.execute(
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,'local-admin','approve-node',?2)",
+            params![now, node],
+        )?;
+        tx.commit()?;
+        Ok(token)
+    }
+    pub fn transport_identity(&self, node: &str, fingerprint: &str) -> Result<()> {
+        ensure!(
+            identifier(node) && hash(fingerprint),
+            "Invalid transport identity"
+        );
+        let expected: String = self.db.query_row(
+            "SELECT fingerprint FROM node_certificates WHERE node=?1",
+            [node],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            expected == fingerprint,
+            "Certificate does not belong to the approved node"
+        );
+        Ok(())
+    }
+    pub fn rate_limit(&mut self, node: &str, now: i64) -> Result<()> {
+        self.public_key(node)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO request_limits VALUES(?1,?2,1) ON CONFLICT(node) DO UPDATE SET second=excluded.second,count=CASE WHEN second=excluded.second THEN count+1 ELSE 1 END",params![node,now])?;
+        let count: i64 = tx.query_row(
+            "SELECT count FROM request_limits WHERE node=?1",
+            [node],
+            |r| r.get(0),
+        )?;
+        ensure!(count <= 120, "Request rate exceeded");
         tx.commit()?;
         Ok(())
     }
@@ -289,12 +363,20 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         Ok(())
     }
     pub fn revoke(&mut self, node: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE nodes SET revoked=1 WHERE id=?1", [node])?;
-        self.db.execute(
+        let tx = self.db.transaction()?;
+        ensure!(
+            tx.execute("UPDATE nodes SET revoked=1 WHERE id=?1", [node])? == 1,
+            "Unknown node"
+        );
+        tx.execute(
             "UPDATE leases SET expires=0 WHERE node=?1 AND finished=0",
             [node],
         )?;
+        tx.execute(
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,'local-admin','revoke-node',?2)",
+            params![auth::now(), node],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn public_key(&self, node: &str) -> Result<String> {
@@ -385,10 +467,11 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             .optional()?;
         if let Some((id, body, expires, finished)) = prior {
             ensure!(body == encoded, "Snapshot ID is immutable");
-            ensure!(
-                finished != 0 || expires >= now,
-                "Lease expired; request explicit renewal"
-            );
+            let expires = if finished == 0 && expires < now {
+                self.renew(&m.node, &id, now)?
+            } else {
+                expires
+            };
             return Ok(Lease {
                 id,
                 expires,
@@ -770,13 +853,27 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         Ok(())
     }
     pub fn pin(&mut self, node: &str, snapshot: &str, pin: bool) -> Result<()> {
+        let tx = self.db.transaction()?;
         ensure!(
-            self.db.execute(
+            tx.execute(
                 "UPDATE snapshots SET pinned=?1 WHERE node=?2 AND id=?3",
                 params![pin, node, snapshot]
             )? == 1,
             "Unknown snapshot"
         );
+        tx.execute(
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,'local-admin',?2,?3)",
+            params![
+                auth::now(),
+                if pin {
+                    "pin-snapshot"
+                } else {
+                    "unpin-snapshot"
+                },
+                format!("{node}/{snapshot}")
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn delete(&mut self, node: &str, snapshot: &str, actor: &str) -> Result<()> {

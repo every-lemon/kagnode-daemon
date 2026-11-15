@@ -103,6 +103,10 @@ enum Command {
         #[command(subcommand)]
         command: Backup,
     },
+    BackupServer {
+        #[command(subcommand)]
+        command: BackupServer,
+    },
     Broker {
         #[arg(long, default_value = "/var/lib/kagnode-daemon")]
         state: PathBuf,
@@ -112,6 +116,46 @@ enum Command {
     Services {
         #[command(subcommand)]
         command: Services,
+    },
+}
+#[derive(Subcommand)]
+enum BackupServer {
+    Status,
+    Approve {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        public_key: String,
+        #[arg(long)]
+        certificate_sha256: String,
+    },
+    Revoke {
+        #[arg(long)]
+        node: String,
+    },
+    Snapshots {
+        #[arg(long)]
+        node: String,
+    },
+    Policy {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Pin {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        unpin: bool,
+    },
+    Delete {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        confirm: String,
     },
 }
 #[derive(Subcommand)]
@@ -449,6 +493,9 @@ async fn main() -> Result<()> {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
             let mut terminal_api = tokio::spawn(kagnode_daemon::runtime::serve(store.clone()));
             let collector = tokio::spawn(kagnode_daemon::runtime::collect(store.clone()));
+            let mut backup_server = tokio::spawn(
+                kagnode_daemon::backup_service::supervisor::supervise(store.clone()),
+            );
             let local = web::router(app.clone());
             let mut task = tokio::spawn(async move { axum::serve(listener, local).await });
             let web_store = store.clone();
@@ -480,6 +527,7 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     r = tokio::signal::ctrl_c() => break r.map_err(Into::into),
                     _ = terminate.recv() => break Ok(()),
+                    r = &mut backup_server => break Err(anyhow::anyhow!("Backup supervisor stopped: {r:?}")),
                     r = &mut terminal_api => break Err(anyhow::anyhow!("Terminal API stopped: {r:?}")),
                     r = &mut task => break Err(anyhow::anyhow!("Local health API stopped: {r:?}")),
                     r = &mut web_task, if !web_finished => match r {
@@ -492,6 +540,7 @@ async fn main() -> Result<()> {
             task.abort();
             terminal_api.abort();
             collector.abort();
+            backup_server.abort();
             let _ = std::fs::remove_file(store_root_socket);
             std::fs::remove_file(socket)?;
             result?;
@@ -551,6 +600,53 @@ async fn main() -> Result<()> {
                 value
             };
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Some(Command::BackupServer { command }) => {
+            use kagnode_daemon::backup_service::{
+                control::{self, AdminRequest},
+                transport,
+            };
+            let request = match command {
+                BackupServer::Status => AdminRequest::Status,
+                BackupServer::Approve {
+                    node,
+                    public_key,
+                    certificate_sha256,
+                } => AdminRequest::Approve {
+                    node,
+                    public_key,
+                    certificate_sha256,
+                },
+                BackupServer::Revoke { node } => AdminRequest::Revoke { node },
+                BackupServer::Snapshots { node } => AdminRequest::Snapshots { node },
+                BackupServer::Policy { file } => AdminRequest::SetPolicy {
+                    policy: serde_json::from_slice(&transport::read_file(&file, true)?)?,
+                },
+                BackupServer::Pin {
+                    node,
+                    snapshot,
+                    unpin,
+                } => AdminRequest::Pin {
+                    node,
+                    snapshot,
+                    pinned: !unpin,
+                },
+                BackupServer::Delete {
+                    node,
+                    snapshot,
+                    confirm,
+                } => AdminRequest::Delete {
+                    node,
+                    snapshot,
+                    confirm,
+                },
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &control::request(&store.root.join("run/backup-server.sock"), &request).await?
+                )?
+            );
         }
         Some(Command::Health) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};

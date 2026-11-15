@@ -2,6 +2,7 @@
 name = "kagnode-daemon"
 version = "5.0.3"
 edition = "2024"
+default-run = "kagnode"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
 repository = "https://github.com/every-lemon/kagnode-daemon"
@@ -11,11 +12,20 @@ description = "KagNode application management daemon, Core dashboard and termina
 name = "kagnode"
 path = "src/main.rs"
 
+[[bin]]
+name = "kagnode-backup-server"
+path = "src/bin/backup_server.rs"
+
 [workspace]
 members = ["crates/backup-format"]
 resolver = "3"
 
 [dependencies]
+base64 = "0.22"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 kagnode-backup-format = { path = "crates/backup-format", version = "5.0.3" }
 anyhow = "1"
 argon2 = "0.5"
@@ -39,6 +49,7 @@ tokio = { version = "1", features = ["full"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+age = { version = "0.12", default-features = false }
 base64 = "0.22"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

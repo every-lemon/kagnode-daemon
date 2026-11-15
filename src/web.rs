@@ -90,6 +90,8 @@ pub fn router(app: App) -> Router {
             post(service_apply),
         )
         .route("/api/v1/audit", get(audit))
+        .route("/api/v1/backup-server/status", get(backup_server_status))
+        .route("/api/v1/backup-server/actions", post(backup_server_action))
         .route("/api/v1/monitoring", get(monitoring))
         .route("/api/v1/monitoring/history", get(metric_history))
         .route(
@@ -300,6 +302,35 @@ async fn applications(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
     let root = s.store.managed_root();
     Ok(Json(
         json!({"server":"local","applications":catalog::PRODUCTS.iter().map(|p|json!({"product":p,"installed":catalog::installed(root,p),"url":format!("/servers/local/applications/{}",p.id),"management":"project-owned-adapter","native_actions_enabled":false})).collect::<Vec<_>>()}),
+    ))
+}
+async fn backup_server_status(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    if !s.store.root.join("backup-server.json").exists() {
+        return Ok(Json(
+            json!({"enabled":false,"status":"not configured","production_qualified":false}),
+        ));
+    }
+    Ok(Json(
+        crate::backup_service::control::request(
+            &s.store.root.join("run/backup-server.sock"),
+            &crate::backup_service::control::AdminRequest::Status,
+        )
+        .await?,
+    ))
+}
+async fn backup_server_action(
+    State(s): State<App>,
+    h: HeaderMap,
+    Json(request): Json<crate::backup_service::control::AdminRequest>,
+) -> Api<Json<Value>> {
+    mutation(&s, &h)?;
+    Ok(Json(
+        crate::backup_service::control::request(
+            &s.store.root.join("run/backup-server.sock"),
+            &request,
+        )
+        .await?,
     ))
 }
 async fn audit(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
