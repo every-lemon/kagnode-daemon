@@ -249,7 +249,10 @@ def go_notices(arch):
         subprocess.check_output(["go", "env", "GOROOT"], text=True).strip()
     ).resolve(strict=True)
     directories = subprocess.check_output(
-        ["go", "list", "-deps", "-f", "{{.Dir}}", "."], cwd=ROOT, text=True
+        ["go", "list", "-deps", "-f", "{{.Dir}}", "."],
+        cwd=ROOT,
+        text=True,
+        env={**os.environ, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": arch},
     ).splitlines()
     selected = {
         goroot / name for name in ["LICENSE", "PATENTS"] if (goroot / name).is_file()
@@ -290,7 +293,6 @@ def build(out, native_cli=True):
         ["git", "status", "--porcelain", "--untracked-files=normal"],
         cwd=ROOT,
         text=True,
-        env={**os.environ, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": arch},
     ).strip():
         raise ValueError(
             "Release builds require a clean committed source tree; commit reviewed changes before creating provenance"
