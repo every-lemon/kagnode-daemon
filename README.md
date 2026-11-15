@@ -8,7 +8,7 @@ An administrator workspace for KagNode applications, with a shared Core dashboar
 
 ## Release status
 
-**5.0.2** is the coordinated stable compatibility CLI release. The **5.0.3 Rust Daemon candidate** adds local administration, Core presentation, terminal folder navigation, reviewed native service operations, encrypted control-database backups and fresh-install profiles. Qualification and migration work is tracked in [the Rust migration matrix](docs/RUST-MIGRATION.md).
+**5.0.3** is the coordinated stable compatibility command release. The **5.0.3 Rust Daemon candidate** adds local administration, Core presentation, terminal folder navigation, reviewed native service operations, encrypted control-database backups and fresh-install profiles. Qualification and migration work is tracked in [the Rust migration matrix](docs/RUST-MIGRATION.md).
 
 The Rust candidate does not replace an existing CLI installation until compatibility is qualified. Remote node management, live networking, automatic HA and Core Server Offloading remain gated. Saving a cluster declaration is not HA activation. Existing application runtimes and data stay in place.
 
@@ -27,7 +27,7 @@ The Rust candidate does not replace an existing CLI installation until compatibi
 
 The Rust candidate requires Rust 1.88 or newer to build. Native setup targets Ubuntu 24.04 and Debian 13; Linux amd64/arm64 qualification is recorded separately. The new Rust server/terminal runtime does not require Node.js, Go or Python. Browser UI remains HTML/CSS/JavaScript. Existing third-party engines keep their own dependencies.
 
-The retained 5.0.2 compatibility CLI uses Go and Python management helpers, as documented in its release. It stays available until each Rust replacement passes parity and upgrade checks.
+The retained 5.0.3 compatibility command uses Go and Python management helpers, as documented in its release. It stays available until each Rust replacement passes parity and upgrade checks.
 
 ## Installation and downloads
 
