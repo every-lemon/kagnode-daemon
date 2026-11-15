@@ -209,7 +209,9 @@ async fn mtls_signed_upload_admin_separation_and_restart() -> Result<()> {
         silent_peers.push(socket.connect(address).await?);
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    tokio::time::timeout(Duration::from_secs(2), agent.enroll(token)).await??;
+    let fresh_agent = Agent::new("node", key(), target.clone())?;
+    tokio::time::timeout(Duration::from_secs(2), fresh_agent.enroll(token)).await??;
+    drop(fresh_agent);
     drop(silent_peers);
     assert!(agent.enroll(token).await.is_err());
     assert!(impostor.status().await.is_err());
@@ -433,6 +435,21 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
         let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let challenge = value["confirmation"].as_str().unwrap();
+        let mut changed = body.clone();
+        changed["node"] = serde_json::json!("another-node");
+        let response = app
+            .clone()
+            .oneshot(send(
+                format!("/api/v1/backup-server/{action}"),
+                changed,
+                challenge,
+            ))
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "confirmation is bound to the exact request"
+        );
         let response = app
             .clone()
             .oneshot(send(
@@ -490,6 +507,240 @@ fn f7_same_identity_worker_is_rejected() -> Result<()> {
     assert!(
         err.contains("separate service account") || err.contains("unprivileged"),
         "{err}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f9_agent_refuses_server_requests_outside_its_manifest() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tmp = tempfile::tempdir()?;
+    certificates(tmp.path())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let config = Config {
+        repository: tmp.path().join("unused"),
+        listen: address,
+        certificate: tmp.path().join("server.pem"),
+        private_key: tmp.path().join("server.key"),
+        client_ca: tmp.path().join("ca.pem"),
+        control_socket: tmp.path().join("unused.sock"),
+        controller_uid: None,
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(transport::tls(&config)?);
+    let stolen = b"ciphertext belonging to another snapshot";
+    let object = kagnode_backup_format::Object {
+        sha256: digest(stolen),
+        bytes: stolen.len() as u64,
+    };
+    let objects = tmp.path().join("objects");
+    fs::create_dir(&objects)?;
+    fs::write(objects.join(&object.sha256), stolen)?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let fake = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(tls.read_u8().await.unwrap());
+            }
+            let length = String::from_utf8_lossy(&header)
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|s| s.parse::<usize>().ok())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            tls.read_exact(&mut body).await.unwrap();
+            let n = observed.fetch_add(1, Ordering::SeqCst);
+            let value = match n {
+                0 => serde_json::json!({"id":"lease","expires":i64::MAX,"missing":[object]}),
+                1 => serde_json::json!({"offset":0}),
+                2 => serde_json::json!({"offset":stolen.len()}),
+                _ => serde_json::json!({"ciphertext_verified":true}),
+            };
+            let reply = serde_json::json!({"ok":true,"value":value}).to_string();
+            tls.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",reply.len(),reply).as_bytes()).await.unwrap();
+            tls.shutdown().await.unwrap();
+        }
+    });
+    let agent = Agent::new(
+        "node",
+        key(),
+        Target {
+            site: "site".into(),
+            server: "server".into(),
+            endpoint: format!("https://{address}"),
+            ca: tmp.path().join("ca.pem"),
+            identity_pem: tmp.path().join("client-identity.pem"),
+        },
+    )?;
+    let manifest = Manifest {
+        format: "kagnode-dbackup/v2".into(),
+        site: "site".into(),
+        node: "node".into(),
+        snapshot: "one".into(),
+        created_at: kagnode_daemon::auth::now(),
+        recipient_generation: "initial".into(),
+        catalog: kagnode_backup_format::Object {
+            sha256: digest(b"authorized catalog"),
+            bytes: 18,
+        },
+        objects: vec![],
+    };
+    let result = agent.push(manifest, &objects).await;
+    fake.abort();
+    let _ = fake.await;
+    assert!(result.is_err());
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "Agent must refuse before reading/uploading another snapshot's object"
+    );
+    Ok(())
+}
+
+/// Opt-in disposable root fixture only; it creates numeric-UID processes, never users/services.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f7_worker_has_separate_uid_empty_environment_and_no_inherited_fd() -> Result<()> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::{fs::MetadataExt, process::CommandExt},
+    };
+    if unsafe { libc::geteuid() } != 0 || std::env::var_os("KAGNODE_PRIVILEGED_FIXTURE").is_none() {
+        eprintln!("SKIP numeric-UID fixture: requires isolated root test namespace");
+        return Ok(());
+    }
+    struct Child(Command, Option<std::process::Child>);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            if let Some(c) = self.1.as_mut() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755))?;
+    certificates(root)?;
+    let binary = root.join("worker");
+    fs::copy(env!("CARGO_BIN_EXE_kagnode-backup-server"), &binary)?;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+    let state = root.join("state");
+    fs::create_dir(&state)?;
+    let set_owner = |p: &Path, uid: u32, gid: u32| -> Result<()> {
+        let p = std::ffi::CString::new(p.to_str().unwrap())?;
+        ensure!(
+            unsafe { libc::chown(p.as_ptr(), uid, gid) } == 0,
+            "fixture chown failed"
+        );
+        Ok(())
+    };
+    set_owner(&state, 1002, 1002)?;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+    for name in ["ca.pem", "server.pem", "server.key"] {
+        fs::copy(root.join(name), state.join(name))?;
+        set_owner(&state.join(name), 1002, 1002)?;
+        fs::set_permissions(state.join(name), fs::Permissions::from_mode(0o600))?;
+    }
+    let policy_path = state.join("policy");
+    fs::write(&policy_path, serde_json::to_vec(&policy())?)?;
+    set_owner(&policy_path, 1002, 1002)?;
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600))?;
+    let command = || {
+        let mut c = Command::new(&binary);
+        c.uid(1002).gid(1002);
+        c
+    };
+    let result = command()
+        .arg("init")
+        .arg("--directory")
+        .arg(state.join("repository"))
+        .args(["--site", "site", "--server", "server", "--policy"])
+        .arg(&policy_path)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let config = Config {
+        repository: state.join("repository"),
+        listen: "127.0.0.1:0".parse()?,
+        certificate: state.join("server.pem"),
+        private_key: state.join("server.key"),
+        client_ca: state.join("ca.pem"),
+        control_socket: state.join("control.sock"),
+        controller_uid: Some(1001),
+    };
+    let path = state.join("config");
+    fs::write(&path, serde_json::to_vec(&config)?)?;
+    set_owner(&path, 1002, 1002)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let private = root.join("controller-private");
+    fs::create_dir(&private)?;
+    set_owner(&private, 1001, 1001)?;
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+    fs::write(
+        private.join("synthetic-state"),
+        b"synthetic controller-only data",
+    )?;
+    let inherited = fs::File::open(private.join("synthetic-state"))?;
+    assert_eq!(
+        unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+    let mut child = Child(command(), None);
+    child.1 = Some(
+        child
+            .0
+            .arg("serve")
+            .arg("--config")
+            .arg(&path)
+            .env("KAGNODE_SYNTHETIC_SECRET", "must-not-inherit")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    unsafe {
+        libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let pid = child.1.as_ref().unwrap().id();
+    let mut ready = false;
+    for _ in 0..100 {
+        if control::request_from(&config.control_socket, &AdminRequest::Status, 1002)
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "isolated worker failed to start");
+    assert_eq!(fs::metadata(format!("/proc/{pid}"))?.uid(), 1002);
+    assert!(fs::read(format!("/proc/{pid}/environ"))?.is_empty());
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let entry = entry?;
+        assert_ne!(
+            fs::read_link(entry.path()).ok(),
+            Some(private.join("synthetic-state"))
+        );
+    }
+    let denied = Command::new("/bin/cat")
+        .arg(private.join("synthetic-state"))
+        .uid(1002)
+        .gid(1002)
+        .output()?;
+    assert!(
+        !denied.status.success(),
+        "worker UID could read controller state"
     );
     Ok(())
 }

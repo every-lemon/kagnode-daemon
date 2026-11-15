@@ -45,6 +45,7 @@ pub struct Repository {
     pub root: PathBuf,
     db: Connection,
     pub identity: Identity,
+    pub(crate) admin_actor: String,
     _lock: fs::File,
 }
 fn private(root: &Path, create: bool) -> Result<()> {
@@ -199,6 +200,7 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             root: root.into(),
             db,
             identity,
+            admin_actor: "library:unattributed".into(),
             _lock: lock,
         })
     }
@@ -247,7 +249,10 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         now: i64,
     ) -> Result<String> {
         ensure!(
-            identifier(node) && hash(public_key) && hash(fingerprint),
+            identifier(node)
+                && !matches!(node, "local-admin" | "restore-runner" | "admin" | "root")
+                && hash(public_key)
+                && hash(fingerprint),
             "Invalid approved transport identity"
         );
         let tx = self
@@ -274,8 +279,8 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             params![auth::digest(&token), node, public_key, now + 600],
         )?;
         tx.execute(
-            "INSERT INTO audit(at,actor,action,target) VALUES(?1,'local-admin','approve-node',?2)",
-            params![now, node],
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'approve-node',?3)",
+            params![now, self.admin_actor, node],
         )?;
         tx.commit()?;
         Ok(token)
@@ -313,7 +318,10 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
     }
     pub fn approve_node(&mut self, node: &str, public_key: &str, now: i64) -> Result<String> {
         ensure!(
-            identifier(node) && hash(public_key) && now >= 0,
+            identifier(node)
+                && !matches!(node, "local-admin" | "restore-runner" | "admin" | "root")
+                && hash(public_key)
+                && now >= 0,
             "Invalid node identity"
         );
         let token = auth::random()?;
@@ -376,8 +384,8 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             [node],
         )?;
         tx.execute(
-            "INSERT INTO audit(at,actor,action,target) VALUES(?1,'local-admin','revoke-node',?2)",
-            params![auth::now(), node],
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'revoke-node',?3)",
+            params![auth::now(), self.admin_actor, node],
         )?;
         tx.commit()?;
         Ok(())
@@ -847,13 +855,19 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             )
             .optional()?;
         if let Some(snapshot) = prior {
+            let (body, verified_at): (String,i64) = self.db.query_row("SELECT s.body,COALESCE(r.received,0) FROM snapshots s LEFT JOIN snapshot_receipts r ON r.node=s.node AND r.snapshot=s.id WHERE s.node=?1 AND s.id=?2",params![node,snapshot],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let original: SignedSnapshot = serde_json::from_str(&body)?;
+            ensure!(
+                self.missing(&original.manifest)?.is_empty(),
+                "Stored object metadata changed; receipt cannot be reaffirmed"
+            );
             let restored: i64 = self.db.query_row(
                 "SELECT restore_verified FROM snapshots WHERE node=?1 AND id=?2",
                 params![node, snapshot],
                 |r| r.get(0),
             )?;
             return Ok(
-                json!({"snapshot":snapshot,"ciphertext_verified":true,"restore_tested":restored!=0,"server":self.identity.server}),
+                json!({"snapshot":snapshot,"ciphertext_verified":true,"verified_at":verified_at,"restore_tested":restored!=0,"server":self.identity.server}),
             );
         }
         let s = self.lease(node, id, now)?;
@@ -901,11 +915,11 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         tx.execute("UPDATE leases SET finished=1,reserved=0 WHERE id=?1", [id])?;
         tx.execute(
             "INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'snapshot-verified',?3)",
-            params![now, node, m.snapshot],
+            params![now, format!("node:{node}"), m.snapshot],
         )?;
         tx.commit()?;
         Ok(
-            json!({"snapshot":m.snapshot,"ciphertext_verified":true,"restore_tested":false,"server":self.identity.server}),
+            json!({"snapshot":m.snapshot,"ciphertext_verified":true,"verified_at":now,"restore_tested":false,"server":self.identity.server}),
         )
     }
     pub fn snapshots(&self, node: &str) -> Result<Vec<Value>> {
@@ -1002,9 +1016,10 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             "Unknown snapshot"
         );
         tx.execute(
-            "INSERT INTO audit(at,actor,action,target) VALUES(?1,'local-admin',?2,?3)",
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,?3,?4)",
             params![
                 auth::now(),
+                self.admin_actor,
                 if pin {
                     "pin-snapshot"
                 } else {
@@ -1045,12 +1060,17 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             params![auth::now(), actor, snapshot],
         )?;
         tx.commit()?;
-        fs::remove_file(
+        if let Err(error) = fs::remove_file(
             self.root
                 .join("snapshots")
                 .join(node)
                 .join(format!("{snapshot}.json")),
-        )?;
+        ) && error.kind() != std::io::ErrorKind::NotFound
+        {
+            // Logical deletion already committed: do not report an ambiguous failure.
+            eprintln!("Backup catalog cleanup pending for {node}/{snapshot}: {error}");
+            self.db.execute("INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'catalog-cleanup-pending',?3)",params![auth::now(),actor,format!("{node}/{snapshot}")]).ok();
+        }
         Ok(())
     }
     pub fn gc(&mut self, now: i64) -> Result<usize> {

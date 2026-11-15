@@ -65,9 +65,14 @@ impl AdminRequest {
     }
 }
 pub fn dispatch(shared: &Shared, req: AdminRequest) -> Result<Value> {
+    dispatch_as(shared, req, unsafe { libc::geteuid() })
+}
+fn dispatch_as(shared: &Shared, req: AdminRequest, uid: u32) -> Result<Value> {
     let mut r = shared
         .lock()
         .map_err(|_| anyhow::anyhow!("Storage unavailable"))?;
+    let actor = format!("control:uid:{uid}");
+    r.admin_actor = actor.clone();
     match req {
         AdminRequest::Status => {
             let (total, available) = r.capacity()?;
@@ -90,7 +95,7 @@ pub fn dispatch(shared: &Shared, req: AdminRequest) -> Result<Value> {
             Ok(json!({"snapshots":r.snapshots(&node)?,"protected":r.protected(&node)?}))
         }
         AdminRequest::SetPolicy { policy } => {
-            r.save_policy(&policy, "local-admin")?;
+            r.save_policy(&policy, &actor)?;
             Ok(json!({"revision":policy.revision}))
         }
         AdminRequest::Pin {
@@ -110,7 +115,7 @@ pub fn dispatch(shared: &Shared, req: AdminRequest) -> Result<Value> {
                 confirm == format!("delete {node}/{snapshot}"),
                 "Confirm the exact snapshot identity"
             );
-            r.delete(&node, &snapshot, "local-admin")?;
+            r.delete(&node, &snapshot, &actor)?;
             Ok(json!({"deleted":true}))
         }
         AdminRequest::CollectGarbage { confirm } => {
@@ -176,7 +181,7 @@ pub async fn serve_for(path: &Path, shared: Shared, controller_uid: u32) -> Resu
             .await;
             let result = if matches!(input, Ok(Ok(_))) && line.len() <= 16384 {
                 match serde_json::from_str::<AdminRequest>(&line) {
-                    Ok(req) => tokio::task::spawn_blocking(move || dispatch(&shared, req))
+                    Ok(req) => tokio::task::spawn_blocking(move || dispatch_as(&shared, req, uid))
                         .await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("Control worker failed"))),
                     Err(_) => Err(anyhow::anyhow!("Invalid control request")),

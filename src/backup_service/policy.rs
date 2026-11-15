@@ -95,7 +95,7 @@ impl Hysteresis {
     pub fn observe(&mut self, now: i64, high: bool, low: bool) -> Readiness {
         if self
             .last_observation
-            .is_some_and(|t| now <= t || now - t > 90)
+            .is_some_and(|t| now < t || now - t > 90)
         {
             self.candidate_since = None;
         }

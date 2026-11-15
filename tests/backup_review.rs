@@ -136,7 +136,10 @@ fn f2_failed_uploads_do_not_charge_other_nodes() {
     let good = blob("good", 1, 1024 * 1024);
     let bad = blob("bad", 2, 1024 * 1024);
     let a = r
-        .begin(&signed("evil", 1, "s1", 100, b"cat", &[good.clone()]), 100)
+        .begin(
+            &signed("evil", 1, "s1", 100, b"cat", std::slice::from_ref(&good)),
+            100,
+        )
         .unwrap();
     for _ in 0..4 {
         assert!(
@@ -146,7 +149,7 @@ fn f2_failed_uploads_do_not_charge_other_nodes() {
     }
     let b = r
         .begin(
-            &signed("victim", 2, "s1", 100, b"cat", &[good.clone()]),
+            &signed("victim", 2, "s1", 100, b"cat", std::slice::from_ref(&good)),
             100,
         )
         .unwrap();
@@ -163,7 +166,10 @@ fn f3_abandoned_partials_are_collected_and_quota_is_enforced() {
     enroll(&mut r, "n", 1);
     let data = blob("data", 1, 1024 * 1024);
     let a = r
-        .begin(&signed("n", 1, "s1", 100, b"cat", &[data.clone()]), 100)
+        .begin(
+            &signed("n", 1, "s1", 100, b"cat", std::slice::from_ref(&data)),
+            100,
+        )
         .unwrap();
     r.upload("n", &a.id, &digest(&data), 0, &data[..100], 100)
         .unwrap();
@@ -171,7 +177,10 @@ fn f3_abandoned_partials_are_collected_and_quota_is_enforced() {
     assert_eq!(fs::read_dir(root.join("partial/n")).unwrap().count(), 0);
     // Sparse synthetic partial charges the full durable size without writing 64 MiB.
     let b = r
-        .begin(&signed("n", 1, "s2", 2000, b"cat", &[data.clone()]), 2000)
+        .begin(
+            &signed("n", 1, "s2", 2000, b"cat", std::slice::from_ref(&data)),
+            2000,
+        )
         .unwrap();
     let partial = root
         .join("partial/n")
@@ -194,7 +203,15 @@ fn f4_control_operations_do_not_open_verified_object_payloads() {
     let mut r = Repository::create(&root, "site", "server", &policy(None)).unwrap();
     enroll(&mut r, "n", 1);
     let data = blob("original", 1, 1024 * 1024);
-    commit(&mut r, "n", 1, "s1", 100, b"cat", &[data.clone()]);
+    commit(
+        &mut r,
+        "n",
+        1,
+        "s1",
+        100,
+        b"cat",
+        std::slice::from_ref(&data),
+    );
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
     assert!(fd >= 0);
     let fd = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -246,4 +263,55 @@ fn f5_unverified_arrivals_cannot_displace_recovery_points() {
     }
     r.finish("n", &a.id, 104).unwrap();
     assert_eq!(r.snapshots("n").unwrap()[0]["id"], "backdated");
+}
+
+#[test]
+fn f10_receipt_rejects_missing_or_changed_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("s");
+    let mut r = Repository::create(&root, "site", "server", &policy(None)).unwrap();
+    enroll(&mut r, "n", 1);
+    let a = r
+        .begin(&signed("n", 1, "s1", 100, b"cat", &[]), 100)
+        .unwrap();
+    r.upload("n", &a.id, &digest(b"cat"), 0, b"cat", 100)
+        .unwrap();
+    r.finish("n", &a.id, 100).unwrap();
+    fs::remove_file(root.join("objects/n").join(digest(b"cat"))).unwrap();
+    assert!(r.finish("n", &a.id, 200).is_err());
+}
+#[test]
+fn f12_committed_delete_survives_catalog_already_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("s");
+    let mut p = policy(None);
+    p.keep_snapshots = 2;
+    let mut r = Repository::create(&root, "site", "server", &p).unwrap();
+    enroll(&mut r, "n", 1);
+    for (id, t) in [("a", 100), ("b", 101), ("c", 102)] {
+        commit(&mut r, "n", 1, id, t, b"cat", &[]);
+        r.mark_restore_tested("n", id, "restore-runner").unwrap();
+    }
+    fs::remove_file(root.join("snapshots/n/a.json")).unwrap();
+    assert!(r.delete("n", "a", "admin").is_ok());
+    assert_eq!(r.snapshots("n").unwrap().len(), 2);
+}
+#[test]
+fn f13_same_second_observations_preserve_hysteresis() {
+    let mut h = Hysteresis::default();
+    for t in [0, 0, 60, 60, 120, 120, 180] {
+        h.observe(t, true, false);
+    }
+    assert!(h.busy);
+}
+#[test]
+fn f14_admin_node_names_are_reserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut r = Repository::create(&tmp.path().join("s"), "site", "server", &policy(None)).unwrap();
+    for node in ["local-admin", "restore-runner", "admin", "root"] {
+        assert!(
+            r.approve_node(node, &hex::encode(key(1).public_key().as_ref()), 100)
+                .is_err()
+        );
+    }
 }

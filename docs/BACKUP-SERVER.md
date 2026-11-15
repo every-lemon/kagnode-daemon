@@ -25,12 +25,16 @@ transfer counters, retention protections, restore leases and shared-object GC.
 Snapshot deletion is recorded as a tombstone. Stored signatures bind manifests;
 file contents and filenames remain in encrypted objects.
 
-The `kagnode-backup-server` binary refuses root execution. The Daemon supervises
-it separately from the optional web dashboard and terminal client, restarts it
-after failure, and records failures without taking down monitoring. Repository
-and controller state must be disjoint. Supervision refuses known product and
-legacy-product directories on a Backup Server node. Installer-wide role
-activation and enforcement are not finished.
+The `kagnode-backup-server` binary refuses root execution and requires a distinct
+controller UID. The dedicated systemd service owns its process lifecycle; Daemon
+monitors the private socket and **never** falls back to a same-user network child.
+Before starting Tokio the executable closes inherited descriptors above stderr
+and re-executes with an empty environment. `NoNewPrivileges` is enforced in the
+worker too. See `packaging/kagnode-backup-server.service` for the restricted
+service template. No service is installed or enabled by this source change.
+Repository and controller state must be disjoint. The controller must not give
+the worker read access to its private state. Installer-wide role activation,
+custom-path sandbox generation and real systemd qualification remain unfinished.
 
 Remote requests use mutual TLS plus separately signed, server/site-bound requests.
 Enrollment requires a short-lived, one-use administrator approval bound to the
@@ -42,7 +46,14 @@ Remote nodes have only enrollment, upload, lease and own-status operations.
 They cannot call retention, deletion or restore-attestation methods. Administrative
 operations use an owner-only Unix socket. Daemon exposes status and action routes
 under `/api/v1/backup-server/`, protected by its local administrator session,
-origin/CSRF checks and recent authentication. The CLI exposes the same control
+origin/CSRF checks and recent authentication. The generic `/actions` passthrough
+is removed. Explicit POST routes are `approve`, `revoke`, `policy`, `pin`, `delete`
+and `garbage-collection`; read-only snapshots use `GET snapshots/:node`.
+All mutations except adding a pin require a one-use server confirmation from
+`POST confirm` with a fresh local password. It expires after 60 seconds and is
+bound to the session and exact serialized operation; supply it as
+`X-Backup-Confirmation`. Failed or interrupted operations consume confirmation
+and must be inspected before confirming again. No secret is placed in URLs. The CLI exposes the same control
 socket as `kagnode backup-server`. No recovery keys are accepted by the server.
 Administrative library actor arguments remain audit labels, not authentication;
 new integrations must retain the control-plane authorization boundary.
@@ -71,8 +82,13 @@ The transport tests generate temporary certificates and synthetic encrypted
 snapshots. They exercise real TLS enrollment/upload, recovery from server-held
 ciphertext, client-certificate binding, missing-certificate refusal, revocation,
 retries, local administration separation, session/CSRF enforcement and process
-restart without a dashboard. The unprivileged lifecycle path runs when the test
-process is non-root; on a root development host it tests refusal to start as root.
+worker identity separation. The old same-user child-restart fixture was removed
+because that launch mode is no longer allowed. Systemd restart/sandbox enforcement
+requires its own disposable VM qualification; it is not proven by a unit template. An opt-in `KAGNODE_PRIVILEGED_FIXTURE=1` test
+runs only as root in a disposable namespace: it starts a numeric-UID worker,
+checks empty environment and inherited-descriptor removal through `/proc`, and
+verifies that the worker UID cannot read a different controller UID's directory.
+Never enable this fixture in a live service or production test directory.
 
 `tests/backup-qa.Containerfile` prepares disposable Debian 13 or Ubuntu 24.04
 userspaces with OpenSSL for fixture certificates. Run the backup test binaries
@@ -85,7 +101,7 @@ Do not enable a live Backup Server role based on these checks alone.
 ## Unfinished integration and qualification
 
 - Reviewed exclusive-role installation, legacy installer enforcement and native
-  service sandbox/volume permissions for the separate worker.
+  service sandbox/volume permission qualification for the separate worker.
 - Automated certificate lifecycle, signed portable server receipts, node/site
   enrollment management and durable node-to-all-server transfer jobs.
 - Durable scheduling and `/api/v1/backups/` job APIs, Core pages and TUI controls.
@@ -94,7 +110,7 @@ Do not enable a live Backup Server role based on these checks alone.
   accounting for restore downloads, recovery reminders and multi-server K state.
 - Complete v1 recovery, dedicated restore runner, adapter-consistent snapshots,
   operational logs and coordinated SQLite PITR for Daemon, Passwords, Mail and PM.
-- Index-loss reconciliation, orphan/expired-partial cleanup, crash injection at
+- Index-loss/orphan reconciliation, lease-row pruning, crash injection at
   every filesystem/SQLite boundary, automatic retention and volume replacement.
 - RAID/SMART/scrub reporting, restore drills, Debian 13/Ubuntu 24.04 qualification,
   permissions review, release, deployment and rollback verification.
@@ -105,13 +121,26 @@ updates, Media deployment and hardware qualification remain outside this work.
 
 ## Experimental process configuration
 
-The daemon reads a private, service-owned `backup-server.json` in its controller
-state directory only when explicitly present. The schema has `repository`,
-`listen`, `certificate`, `private_key`, `client_ca` and `control_socket` fields.
-The control socket must be `run/backup-server.sock` under the controller. TLS keys
-and configuration must be regular, owned, private files; certificates and the CA
-must not be writable by other users. Install both executables alongside each
-other in an administrator-controlled directory for supervision.
+Daemon reads a private controller-owned `backup-server.json` only when explicitly
+present. Its schema has `repository`, `listen`, `certificate`, `private_key`,
+`client_ca`, `control_socket` and `controller_uid`. The controller configuration
+is a non-secret path/UID descriptor; the service has its own copy at
+`/srv/kagnode/backup-server/config.json`. Its repository is owned by
+`kagnode-backup`, not the controller. `controller_uid` must match the unprivileged
+Daemon and differ from the worker. A root-owned traversable parent (for example
+0751) contains the worker's 0700 repository and 0600 credentials, so the controller
+can inspect the repository owner without reading its contents. The socket is `/run/kagnode-backup/admin.sock`,
+0660, in a worker-owned 0750 runtime directory. A dedicated
+`kagnode-backup-control` group allows the controller to connect; peer UID checking
+permits only that configured controller or root. Group access alone grants no
+administration. The controller verifies the server peer UID against the reviewed
+repository owner. Controller private state stays 0700 with its separate owner.
+
+The unit template uses fixed example paths; administrators must review accounts,
+volume ownership, executable location and inaccessible controller paths before
+installation. It requires Linux `close_range`; unsupported hosts fail closed.
+Certificates and config must be protected regular files. Changing certificate
+contents requires a reviewed service restart; Daemon does not restart services.
 
 Initialize an empty synthetic repository with the unprivileged binary's `init`
 command and an explicit policy file. Policy requires a schedule interval, recovery
@@ -128,3 +157,54 @@ snapshots. There is no command that uploads recovery identities.
 
 TLS implementation uses [rustls client-certificate verification](https://docs.rs/rustls/latest/rustls/server/struct.WebPkiClientVerifier.html)
 and [Hyper connection serving](https://docs.rs/hyper-util/latest/hyper_util/server/conn/auto/struct.Builder.html).
+
+## Independent review follow-up (PR #28)
+
+- **F1:** one active lease per node, two globally. Renewal requires new durable
+  upload bytes; maximum lifetime is 24 hours. An expired/old lease without a
+  progress record cannot renew. Start a new snapshot identity when exhausted.
+- **F2/F3:** only checksum-verified, durably completed objects count toward monthly
+  accepted-transfer budgets. Failed/partial writes do not consume that budget;
+  partially failed writes truncate back to the last acknowledged offset. This is
+  **not** a wire-bandwidth meter. Without an explicit node cap, a configured
+  server cap gives each node at most half. Partial data has a fixed 64 MiB/node
+  quota and total indexed-plus-partial data a 1 TiB/node ceiling. Configurable
+  storage quotas and audited budget overrides remain future work. Begin and GC
+  sweep expired/finished partials; automatic periodic maintenance is not wired.
+- **F4:** digest verification happens at object completion. Control operations
+  compare an indexed verification stamp (device, inode, length, modification and
+  change timestamps) rather than hashing payloads. Metadata mismatch fails closed.
+  Old unstamped objects require re-verification through upload. Independent
+  background scrubbing and fully asynchronous metadata/index work remain pending.
+- **F5:** server receive time orders snapshots. Unverified newer snapshots do not
+  satisfy `keep_snapshots`; until enough newer restore-tested copies exist,
+  older snapshots remain protected. Restoring/marking through a qualified
+  runner is still required before retention can safely free those copies.
+- **F6:** separate bounded handshakes (32 global, four per source, three-second
+  timeout) precede the eight authenticated connection slots. Accept errors back
+  off rather than terminate the listener. Distributed connection/CPU flooding
+  still requires network admission controls; this is not DDoS protection.
+- **F7/F8:** dedicated service identity, empty startup environment and descriptor
+  closure replace same-user supervision. Explicit action routes and password-bound
+  confirmations replace web administration passthrough. The template and source
+  are not evidence of a qualified live systemd installation.
+- **F9/F10:** agents reject server requests for ciphertext outside their manifest.
+  Repeated receipts check indexed metadata and expose the original `verified_at`;
+  this is upload-time verification, not a fresh cryptographic scrub or recovery proof.
+- **F11 — known limit:** restore leases/attestation remain internal library APIs,
+  not supported remote/control actions. The fixed one-hour restore lease has no
+  renewal. Do not run long restores concurrently with deletion. No recovery path
+  was changed in this repair; dedicated restore authorization/renewal is separate.
+- **F12 — partly fixed:** post-commit catalog-file cleanup no longer reports a
+  successful logical deletion as failed. Orphan object reconciliation, durable
+  cleanup retries and pruning completed/expired lease rows remain unfinished;
+  do not claim crash/power-loss qualification. Keep the repository index backed up.
+- **F13/F14:** repeated same-second observations preserve hysteresis. New nodes
+  cannot use reserved admin names; node audit labels are namespaced. Local control
+  records peer UID; dashboard audit records authenticated email and request digest.
+  Worker and dashboard events require correlation; there is no global signed audit ledger.
+- **F15 — known limit:** no automated certificate rotation, CRL or file-content
+  watcher. Node revocation is enforced on signed operations; rotate certificates
+  with explicit service restart and independently verify the new identity.
+
+The backup format, age encryption and recovery implementation are unchanged.

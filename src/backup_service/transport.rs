@@ -299,12 +299,12 @@ impl SourceSlot {
 }
 impl Drop for SourceSlot {
     fn drop(&mut self) {
-        if let Ok(mut counts) = self.counts.lock() {
-            if let Some(count) = counts.get_mut(&self.source) {
-                *count -= 1;
-                if *count == 0 {
-                    counts.remove(&self.source);
-                }
+        if let Ok(mut counts) = self.counts.lock()
+            && let Some(count) = counts.get_mut(&self.source)
+        {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.source);
             }
         }
     }

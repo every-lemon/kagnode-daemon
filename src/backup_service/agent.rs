@@ -146,6 +146,10 @@ impl Agent {
             "Snapshot identity mismatch"
         );
         let signature = hex::encode(self.key.sign(&manifest.bytes()?).as_ref());
+        let allowed: std::collections::HashMap<_, _> = manifest
+            .all_objects()
+            .map(|o| (o.sha256.clone(), o.bytes))
+            .collect();
         let lease: Lease = serde_json::from_value(
             self.call(&NodeRequest::Begin {
                 snapshot: SignedSnapshot {
@@ -155,6 +159,14 @@ impl Agent {
             })
             .await?,
         )?;
+        let mut requested = std::collections::HashSet::new();
+        for object in &lease.missing {
+            ensure!(
+                allowed.get(&object.sha256) == Some(&object.bytes)
+                    && requested.insert(&object.sha256),
+                "Server requested an object outside this snapshot or repeated an object"
+            );
+        }
         let mut renewed = std::time::Instant::now();
         for object in lease.missing {
             let bytes = read_object(objects, &object)?;
