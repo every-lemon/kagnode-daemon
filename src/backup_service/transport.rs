@@ -259,7 +259,14 @@ pub async fn serve(
     config: Arc<rustls::ServerConfig>,
     state: Shared,
 ) -> Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let (_sender, receiver) = tokio::sync::watch::channel(config);
+    serve_dynamic(listener, receiver, state).await
+}
+pub async fn serve_dynamic(
+    listener: tokio::net::TcpListener,
+    config: tokio::sync::watch::Receiver<Arc<rustls::ServerConfig>>,
+    state: Shared,
+) -> Result<()> {
     let limit = Arc::new(tokio::sync::Semaphore::new(8));
     let certificates = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
@@ -279,7 +286,8 @@ pub async fn serve(
         let Some(source) = SourceSlot::acquire(sources.clone(), address.ip()) else {
             continue;
         };
-        let acceptor = acceptor.clone();
+        let mut generation = config.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(generation.borrow_and_update().clone());
         let state = state.clone();
         let limit = limit.clone();
         let certificates = certificates.clone();
@@ -340,7 +348,10 @@ pub async fn serve(
                 hyper_util::rt::TokioIo::new(IdleIo::new(tls, activity)),
                 service,
             );
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(120), connection).await;
+            tokio::select! {
+                _ = tokio::time::timeout(std::time::Duration::from_secs(120), connection) => {},
+                _ = generation.changed() => {}, // trust/certificate changes retire existing sessions
+            }
         });
     }
 }
@@ -496,5 +507,65 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for IdleIo<T> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Reload only a fully parsed, matching TLS material set. Invalid replacements
+/// retain the old context. Receivers retire old sessions on a successful change.
+pub struct TlsReloader {
+    config: Config,
+    fingerprint: String,
+    sender: tokio::sync::watch::Sender<Arc<rustls::ServerConfig>>,
+}
+fn material(config: &Config) -> Result<(String, Arc<rustls::ServerConfig>)> {
+    let ca = read_file(&config.client_ca, false)?;
+    let cert = read_file(&config.certificate, false)?;
+    let key = zeroize::Zeroizing::new(read_file(&config.private_key, true)?);
+    let fingerprint = format!("{}:{}:{}", digest(&ca), digest(&cert), digest(&key));
+    Ok((fingerprint, tls_material(&ca, &cert, &key)?))
+}
+impl TlsReloader {
+    pub fn new(
+        config: Config,
+    ) -> Result<(
+        Self,
+        tokio::sync::watch::Receiver<Arc<rustls::ServerConfig>>,
+    )> {
+        let (fingerprint, tls) = material(&config)?;
+        let (sender, receiver) = tokio::sync::watch::channel(tls);
+        Ok((
+            Self {
+                config,
+                fingerprint,
+                sender,
+            },
+            receiver,
+        ))
+    }
+    pub fn reload(&mut self) -> Result<bool> {
+        let (fingerprint, tls) = material(&self.config)?;
+        if fingerprint == self.fingerprint {
+            return Ok(false);
+        }
+        self.sender.send_replace(tls);
+        self.fingerprint = fingerprint;
+        Ok(true)
+    }
+    pub async fn watch(mut self) -> Result<()> {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        loop {
+            tokio::select! {_=tokio::time::sleep(std::time::Duration::from_secs(30))=>{},_=signal.recv()=>{}}
+            let (next, result) = tokio::task::spawn_blocking(move || {
+                let result = self.reload();
+                (self, result)
+            })
+            .await?;
+            self = next;
+            match result {
+                Ok(true) => eprintln!("Backup TLS context reloaded; prior sessions retired"),
+                Ok(false) => {}
+                Err(_) => eprintln!("Backup TLS replacement rejected; previous context retained"),
+            }
+        }
     }
 }

@@ -182,6 +182,7 @@ impl Repository {
 CREATE TABLE IF NOT EXISTS policy(id INTEGER PRIMARY KEY CHECK(id=1),body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,public_key TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS node_certificates(node TEXT PRIMARY KEY,fingerprint TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS revoked_certificates(fingerprint TEXT PRIMARY KEY,node TEXT NOT NULL,revoked_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS request_limits(node TEXT PRIMARY KEY,second INTEGER NOT NULL,count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tickets(hash TEXT PRIMARY KEY,node TEXT NOT NULL,key TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,node TEXT NOT NULL,snapshot TEXT NOT NULL,body TEXT NOT NULL,expires INTEGER NOT NULL,reserved INTEGER NOT NULL,finished INTEGER NOT NULL DEFAULT 0,UNIQUE(node,snapshot));
@@ -258,6 +259,14 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM revoked_certificates WHERE fingerprint=?1",
+                [fingerprint],
+                |r| r.get::<_, i64>(0)
+            )? == 0,
+            "Revoked certificate cannot be approved again"
+        );
         let existing: Option<String> = tx
             .query_row(
                 "SELECT fingerprint FROM node_certificates WHERE node=?1",
@@ -291,7 +300,7 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         ensure!(hash(fingerprint), "Invalid certificate fingerprint");
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM node_certificates c
-             LEFT JOIN nodes n ON n.id=c.node WHERE c.fingerprint=?1 AND
+             LEFT JOIN nodes n ON n.id=c.node WHERE c.fingerprint=?1 AND NOT EXISTS(SELECT 1 FROM revoked_certificates r WHERE r.fingerprint=c.fingerprint) AND
              (n.revoked=0 OR (n.id IS NULL AND EXISTS(
                SELECT 1 FROM tickets t WHERE t.node=c.node AND t.used=0 AND t.expires>=?2))))",
             params![fingerprint, now],
@@ -309,7 +318,12 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             |r| r.get(0),
         )?;
         ensure!(
-            expected == fingerprint,
+            expected == fingerprint
+                && self.db.query_row(
+                    "SELECT COUNT(*) FROM revoked_certificates WHERE fingerprint=?1",
+                    [fingerprint],
+                    |r| r.get::<_, i64>(0)
+                )? == 0,
             "Certificate does not belong to the approved node"
         );
         Ok(())
@@ -386,12 +400,79 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         tx.commit()?;
         Ok(())
     }
+    pub fn rotate_certificate(
+        &mut self,
+        node: &str,
+        expected: &str,
+        replacement: &str,
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            identifier(node) && hash(expected) && hash(replacement) && expected != replacement,
+            "Invalid certificate rotation"
+        );
+        self.public_key(node)?;
+        let tx = self.db.transaction()?;
+        let current: String = tx.query_row(
+            "SELECT fingerprint FROM node_certificates WHERE node=?1",
+            [node],
+            |r| r.get(0),
+        )?;
+        // A lost reply may be retried only for the same old/new binding.
+        if current == replacement {
+            ensure!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM revoked_certificates WHERE fingerprint=?1 AND node=?2",
+                    params![expected, node],
+                    |r| r.get::<_, i64>(0)
+                )? == 1,
+                "Rotation precondition mismatch"
+            );
+            return Ok(());
+        }
+        ensure!(
+            current == expected,
+            "Certificate changed; review a fresh rotation"
+        );
+        ensure!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM revoked_certificates WHERE fingerprint=?1",
+                [replacement],
+                |r| r.get::<_, i64>(0)
+            )? == 0,
+            "Cannot reuse a revoked certificate"
+        );
+        tx.execute(
+            "INSERT INTO revoked_certificates VALUES(?1,?2,?3)",
+            params![expected, node, now],
+        )?;
+        tx.execute(
+            "UPDATE node_certificates SET fingerprint=?2 WHERE node=?1",
+            params![node, replacement],
+        )?;
+        tx.execute("UPDATE tickets SET used=1 WHERE node=?1", [node])?;
+        tx.execute(
+            "INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'rotate-certificate',?3)",
+            params![
+                now,
+                self.admin_actor,
+                format!("{node}:{expected}:{replacement}")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn nodes(&self) -> Result<Value> {
+        let mut s=self.db.prepare("SELECT c.node,c.fingerprint,n.id IS NOT NULL,COALESCE(n.revoked,0)=1 OR EXISTS(SELECT 1 FROM revoked_certificates r WHERE r.fingerprint=c.fingerprint) FROM node_certificates c LEFT JOIN nodes n ON n.id=c.node ORDER BY c.node LIMIT 1000")?;
+        let nodes=s.query_map([],|r|Ok(json!({"node":r.get::<_,String>(0)?,"certificate_sha256":r.get::<_,String>(1)?,"enrolled":r.get::<_,bool>(2)?,"revoked":r.get::<_,bool>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({"nodes":nodes}))
+    }
     pub fn revoke(&mut self, node: &str) -> Result<()> {
         let tx = self.db.transaction()?;
-        ensure!(
-            tx.execute("UPDATE nodes SET revoked=1 WHERE id=?1", [node])? == 1,
-            "Unknown node"
-        );
+        let changed = tx.execute("UPDATE nodes SET revoked=1 WHERE id=?1", [node])?;
+        let certificate=tx.execute("INSERT OR IGNORE INTO revoked_certificates SELECT fingerprint,node,?2 FROM node_certificates WHERE node=?1",params![node,auth::now()])?;
+        ensure!(changed + certificate > 0, "Unknown or already revoked node");
+        tx.execute("UPDATE tickets SET used=1 WHERE node=?1", [node])?;
         tx.execute(
             "UPDATE leases SET expires=0 WHERE node=?1 AND finished=0",
             [node],

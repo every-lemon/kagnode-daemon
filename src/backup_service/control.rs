@@ -16,6 +16,12 @@ use tokio::{
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminRequest {
     Status,
+    Nodes,
+    RotateCertificate {
+        node: String,
+        expected_sha256: String,
+        certificate_sha256: String,
+    },
     Approve {
         node: String,
         public_key: String,
@@ -48,6 +54,8 @@ impl AdminRequest {
     pub fn action(&self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::Nodes => "nodes",
+            Self::RotateCertificate { .. } => "rotate-certificate",
             Self::Approve { .. } => "approve",
             Self::Revoke { .. } => "revoke",
             Self::Snapshots { .. } => "snapshots",
@@ -60,7 +68,7 @@ impl AdminRequest {
     pub fn needs_confirmation(&self) -> bool {
         !matches!(
             self,
-            Self::Status | Self::Snapshots { .. } | Self::Pin { pinned: true, .. }
+            Self::Status | Self::Nodes | Self::Snapshots { .. } | Self::Pin { pinned: true, .. }
         )
     }
 }
@@ -79,6 +87,20 @@ fn dispatch_as(shared: &Shared, req: AdminRequest, uid: u32) -> Result<Value> {
             Ok(
                 json!({"process_id":std::process::id(),"site":r.identity.site,"server":r.identity.server,"policy":r.policy()?,"storage_total_bytes":total,"storage_available_bytes":available,"verification":"ciphertext checks are not restore qualification"}),
             )
+        }
+        AdminRequest::Nodes => r.nodes(),
+        AdminRequest::RotateCertificate {
+            node,
+            expected_sha256,
+            certificate_sha256,
+        } => {
+            r.rotate_certificate(
+                &node,
+                &expected_sha256,
+                &certificate_sha256,
+                crate::auth::now(),
+            )?;
+            Ok(json!({"node":node,"certificate_sha256":certificate_sha256,"rotated":true}))
         }
         AdminRequest::Approve {
             node,

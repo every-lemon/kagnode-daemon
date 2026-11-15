@@ -255,3 +255,36 @@ fn unsafe_never_overridden_and_busy_has_hysteresis() {
     }
     assert_eq!(h.observe(420, false, true), Readiness::Ready);
 }
+
+#[test]
+fn certificate_revocation_and_rotation_survive_repository_restart() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let root = t.path().join("repository");
+    let mut r = Repository::create(&root, "site", "server", &policy())?;
+    enroll(&mut r)?;
+    r.approve_tls_node(
+        "node",
+        &hex::encode(key().public_key().as_ref()),
+        &"a".repeat(64),
+        100,
+    )?;
+    r.rotate_certificate("node", &"a".repeat(64), &"b".repeat(64), 101)?;
+    drop(r);
+    let mut r = Repository::open(&root)?;
+    assert!(!r.approved_transport(&"a".repeat(64), 102)?);
+    assert!(r.approved_transport(&"b".repeat(64), 102)?);
+    assert!(
+        r.approve_tls_node(
+            "other",
+            &hex::encode(key().public_key().as_ref()),
+            &"a".repeat(64),
+            102
+        )
+        .is_err()
+    );
+    r.revoke("node")?;
+    drop(r);
+    let r = Repository::open(&root)?;
+    assert!(!r.approved_transport(&"b".repeat(64), 103)?);
+    Ok(())
+}

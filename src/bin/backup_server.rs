@@ -110,12 +110,12 @@ async fn run() -> Result<()> {
                 unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0,
                 "Cannot restrict worker privileges"
             );
-            let tls = transport::tls(&config)?;
+            let (reloader, tls) = transport::TlsReloader::new(config.clone())?;
             let shared: Shared = Arc::new(Mutex::new(Repository::open(&config.repository)?));
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! {result=transport::serve(listener,tls,shared.clone())=>result?,result=control::serve_for(&config.control_socket,shared,config.controller_uid.unwrap())=>result?,result=tokio::signal::ctrl_c()=>result?,_=terminate.recv()=>{}}
+            tokio::select! {result=transport::serve_dynamic(listener,tls,shared.clone())=>result?,result=reloader.watch()=>result?,result=control::serve_for(&config.control_socket,shared,config.controller_uid.unwrap())=>result?,result=tokio::signal::ctrl_c()=>result?,_=terminate.recv()=>{}}
         }
     }
     Ok(())

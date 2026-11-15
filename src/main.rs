@@ -139,6 +139,15 @@ enum Command {
 #[derive(Subcommand)]
 enum BackupServer {
     Status,
+    Nodes,
+    RotateCertificate {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        expected_sha256: String,
+        #[arg(long)]
+        certificate_sha256: String,
+    },
     Approve {
         #[arg(long)]
         node: String,
@@ -679,6 +688,16 @@ async fn main() -> Result<()> {
             use kagnode_daemon::backup_service::{control::AdminRequest, transport};
             let request = match command {
                 BackupServer::Status => AdminRequest::Status,
+                BackupServer::Nodes => AdminRequest::Nodes,
+                BackupServer::RotateCertificate {
+                    node,
+                    expected_sha256,
+                    certificate_sha256,
+                } => AdminRequest::RotateCertificate {
+                    node,
+                    expected_sha256,
+                    certificate_sha256,
+                },
                 BackupServer::Approve {
                     node,
                     public_key,

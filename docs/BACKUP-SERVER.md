@@ -211,9 +211,13 @@ and [Hyper connection serving](https://docs.rs/hyper-util/latest/hyper_util/serv
   cannot use reserved admin names; node audit labels are namespaced. Local control
   records peer UID; dashboard audit records authenticated email and request digest.
   Worker and dashboard events require correlation; there is no global signed audit ledger.
-- **F15 — known limit:** no automated certificate rotation, CRL or file-content
-  watcher. Node revocation is enforced on signed operations; rotate certificates
-  with explicit service restart and independently verify the new identity.
+- **F15:** explicit certificate rotation binds expected/current/new fingerprints,
+  permanently rejects retired fingerprints and invalidates pending tickets.
+  Revocation includes pending approvals. TLS material is rechecked every 30 seconds
+  or on SIGHUP, validated as a complete matching set, then swapped atomically;
+  existing sessions retire. Invalid replacements retain the prior context and log
+  failure. CA issuance, external CRL/OCSP fetching and expiry-alert automation are
+  not implemented; operators must supply and independently verify replacements.
 
 The backup format, age encryption and recovery implementation are unchanged.
 
@@ -292,3 +296,23 @@ Synthetic filesystem tests cover reservation conflicts, installer guards,
 changed-input rejection and inactive-install idempotency. They do not qualify
 real systemd startup, sandbox enforcement, existing-host adoption or unattended
 account provisioning. Those remain activation prerequisites.
+
+
+## Certificate lifecycle
+
+`kagnode backup-server rotate-certificate --node NODE --expected-sha256 OLD
+--certificate-sha256 NEW` changes an enrolled, non-revoked node's binding without
+changing its signing identity or stored data. The local dashboard's corresponding
+route requires the same fresh-password, session/action-bound confirmation as
+approval/deletion. A lost response can be retried for the exact old/new pair;
+a stale precondition or attempt to reuse a retired fingerprint is rejected.
+Revocation cancels enrollment tickets as well as active upload leases. Revoked
+identities are not silently restored by rotation or approval.
+
+The worker reloads protected files at its existing certificate/private-key/client-CA
+paths; change paths or listener settings through a separately reviewed restart.
+Replace the files atomically as a coordinated set. The loader checks parsing and
+key/certificate matching; it does not prove hostname suitability, operational
+trust distribution or future expiry. Clients must receive replacement CA trust
+through their own protected configuration. Backup admission still requires the
+explicit node fingerprint even when a certificate chains to the accepted CA.

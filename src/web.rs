@@ -375,7 +375,13 @@ async fn backup_server_action(
     if action != request.action()
         || !matches!(
             action.as_str(),
-            "approve" | "revoke" | "policy" | "pin" | "delete" | "garbage-collection"
+            "approve"
+                | "revoke"
+                | "rotate-certificate"
+                | "policy"
+                | "pin"
+                | "delete"
+                | "garbage-collection"
         )
     {
         return Err(Error(StatusCode::NOT_FOUND, "Unknown backup action".into()));

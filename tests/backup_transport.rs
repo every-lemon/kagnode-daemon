@@ -396,9 +396,11 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
         )
         .await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    for action in ["approve", "delete"] {
+    for action in ["approve", "delete", "rotate-certificate"] {
         let body = if action == "approve" {
             serde_json::json!({"action":"approve","node":"node","public_key":"a".repeat(64),"certificate_sha256":"b".repeat(64)})
+        } else if action == "rotate-certificate" {
+            serde_json::json!({"action":"rotate_certificate","node":"node","expected_sha256":"a".repeat(64),"certificate_sha256":"b".repeat(64)})
         } else {
             serde_json::json!({"action":"delete","node":"node","snapshot":"one","confirm":"delete node/one"})
         };
@@ -1064,6 +1066,140 @@ async fn residual_f6_lock_wait_bounded_without_timing_out_server_processing() ->
         response.starts_with(b"HTTP/1.1 403"),
         "Server-side processing was incorrectly treated as client inactivity"
     );
+    f.responds("client").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certificate_rotation_revokes_old_sessions_and_pending_approvals() -> Result<()> {
+    let f = SessionFixture::new().await?;
+    let old = fingerprint(&f.root.path().join("client.pem"))?;
+    let new = fingerprint(&f.root.path().join("other.pem"))?;
+    let mut target = Target {
+        site: "site".into(),
+        server: "server".into(),
+        endpoint: format!("https://{}", f.address),
+        ca: f.root.path().join("ca.pem"),
+        identity_pem: f.root.path().join("client-identity.pem"),
+    };
+    let agent = Agent::new("client", key(), target.clone())?;
+    let ticket = f.shared.lock().unwrap().approve_tls_node(
+        "client",
+        &agent.public_key(),
+        &old,
+        kagnode_daemon::auth::now(),
+    )?;
+    agent.enroll(&ticket).await?;
+    agent.status().await?;
+    {
+        let mut r = f.shared.lock().unwrap();
+        r.rotate_certificate("client", &old, &new, kagnode_daemon::auth::now())?;
+        r.rotate_certificate("client", &old, &new, kagnode_daemon::auth::now())?;
+        assert!(
+            r.rotate_certificate("client", &old, &"c".repeat(64), kagnode_daemon::auth::now())
+                .is_err()
+        );
+        assert!(
+            r.rotate_certificate("client", &new, &old, kagnode_daemon::auth::now())
+                .is_err()
+        );
+    }
+    assert!(
+        agent.status().await.is_err(),
+        "Existing pooled old certificate stayed authorized"
+    );
+    target.identity_pem = f.root.path().join("other-identity.pem");
+    let rotated = Agent::new("client", key(), target)?;
+    rotated.status().await?;
+    let mut r = f.shared.lock().unwrap();
+    r.revoke("client")?;
+    assert!(!r.approved_transport(&new, kagnode_daemon::auth::now())?);
+    r.approve_tls_node(
+        "pending",
+        &agent.public_key(),
+        &"d".repeat(64),
+        kagnode_daemon::auth::now(),
+    )?;
+    r.revoke("pending")?;
+    assert!(!r.approved_transport(&"d".repeat(64), kagnode_daemon::auth::now())?);
+    assert!(
+        r.approve_tls_node(
+            "replacement",
+            &agent.public_key(),
+            &new,
+            kagnode_daemon::auth::now()
+        )
+        .is_err()
+    );
+    assert!(
+        AdminRequest::RotateCertificate {
+            node: "client".into(),
+            expected_sha256: old,
+            certificate_sha256: new
+        }
+        .needs_confirmation()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_reload_retires_sessions_and_rejects_invalid_material() -> Result<()> {
+    let mut f = SessionFixture::new().await?;
+    f.approve("client")?;
+    f.task.abort();
+    while !f.task.is_finished() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listener = tokio::net::TcpListener::bind(f.address).await?;
+    let root = f.root.path();
+    let cfg = Config {
+        repository: root.join("repo"),
+        listen: f.address,
+        certificate: root.join("server.pem"),
+        private_key: root.join("server.key"),
+        client_ca: root.join("ca.pem"),
+        control_socket: root.join("admin.sock"),
+        controller_uid: None,
+    };
+    let (mut reload, rx) = transport::TlsReloader::new(cfg)?;
+    f.task = tokio::spawn(transport::serve_dynamic(listener, rx, f.shared.clone()));
+    f.responds("client").await?;
+    assert!(!reload.reload()?);
+    let root = f.root.path();
+    let saved = fs::read(root.join("server.key"))?;
+    fs::write(root.join("server.key"), b"invalid key")?;
+    assert!(reload.reload().is_err());
+    f.responds("client").await?;
+    fs::write(root.join("server.key"), saved)?;
+    let mut old = f.connect("client").await?;
+    fs::write(
+        root.join("server-extension"),
+        "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+    )?;
+    openssl(
+        root,
+        &[
+            "x509",
+            "-req",
+            "-in",
+            "server.csr",
+            "-CA",
+            "ca.pem",
+            "-CAkey",
+            "ca.key",
+            "-set_serial",
+            "20261115",
+            "-out",
+            "server-next.pem",
+            "-days",
+            "1",
+            "-extfile",
+            "server-extension",
+        ],
+    )?;
+    fs::rename(root.join("server-next.pem"), root.join("server.pem"))?;
+    assert!(reload.reload()?);
+    session_closed(&mut old, Duration::from_secs(2)).await?;
     f.responds("client").await?;
     Ok(())
 }
