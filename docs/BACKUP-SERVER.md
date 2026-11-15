@@ -112,11 +112,15 @@ Do not enable a live Backup Server role based on these checks alone.
 
 ## Unfinished integration and qualification
 
-- Reviewed exclusive-role installation, legacy installer enforcement and native
-  service sandbox/volume permission qualification for the separate worker.
-- Automated certificate lifecycle, signed portable server receipts, node/site
-  enrollment management and durable node-to-all-server transfer jobs.
-- Durable scheduling and `/api/v1/backups/` job APIs, Core pages and TUI controls.
+- Reviewed role reservation, inactive installation and legacy installer guards are
+  implemented in source. Automatic account provisioning, existing-host adoption
+  and real systemd activation/sandbox/volume qualification remain unfinished.
+- Explicit certificate pin rotation/revocation and validated TLS reload are
+  implemented in source. Automated issuance/expiry management, portable signed
+  receipts and qualified multi-server copy health remain unfinished.
+- Durable scheduling, per-target retry/resumption and administrator read/action
+  APIs are implemented in source. Scheduler configuration is still private JSON;
+  web/TUI schedule mutation and application-consistent producers remain unfinished.
   Existing backup-server CLI/API controls require a separately configured worker.
 - Measured bandwidth, aggregate/time-window throttling, audited cap overrides,
   accounting for restore downloads, recovery reminders and multi-server K state.
@@ -358,7 +362,7 @@ confirmation tokens in URLs, analytics, logs or saved page state.
 
 | GET route | Response |
 | --- | --- |
-| `/api/v1/backup-server/status` | Configured: `{process_id,site,server,policy,storage_total_bytes,storage_available_bytes,verification}`. Unconfigured: `{enabled:false,status:"not configured",production_qualified:false}`. |
+| `/api/v1/backup-server/status` | Configured: `{process_id,site,server,policy,storage_total_bytes,storage_available_bytes,pending_catalog_cleanups,verification}`. Unconfigured: `{enabled:false,status:"not configured",production_qualified:false}`. |
 | `/api/v1/backup-server/nodes` | `{nodes:[{node,certificate_sha256,enrolled,revoked}]}`; at most 1000, sorted by node. Unconfigured: `{enabled:false,nodes:[]}`. |
 | `/api/v1/backup-server/snapshots/NODE` | `{snapshots:[{id,created,received_at,pinned,restore_tested}],protected:["SNAPSHOT",...]}`. Receipt time determines ordering; claimed creation time does not prove retention eligibility. |
 | `/api/v1/backup-server/policy` | `{enabled:true,policy:{...}}`; unconfigured uses `enabled:false,policy:null`. |
@@ -366,7 +370,7 @@ confirmation tokens in URLs, analytics, logs or saved page state.
 
 Agent `status.state` is `not_observed`, `disabled`, `paused`, `deferred`,
 `transferring`, `scheduled`, `source_blocked` or `blocked`. When present, `queue`
-contains the latest 64 `transfers`: `{id,snapshot,state,attempts,next_attempt,
+contains `history:{completed_job_limit:256,compacted_identities:N}` and the latest 64 `transfers`: `{id,snapshot,state,attempts,next_attempt,
 receipt,error}`. Transfer states are `pending`, `running`, `completed` or `blocked`.
 `receipt` is null or the server's `{snapshot,ciphertext_verified,verified_at,
 restore_tested:false,server}`. A ciphertext receipt is not a successful restore.
