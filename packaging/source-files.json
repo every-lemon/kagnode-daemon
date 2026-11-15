@@ -56,6 +56,7 @@
   "go.mod",
   "main.go",
   "main_test.go",
+  "packaging/kagnode-backup-server.service",
   "packaging/kagnode-updates.service",
   "packaging/release.json",
   "packaging/source-files.json",

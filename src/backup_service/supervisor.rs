@@ -31,14 +31,23 @@ pub fn validate(store: &Store) -> Result<Option<Config>> {
     require_exclusive(store.managed_root())?;
     let config = Config::load(&path)?;
     ensure!(
-        config.control_socket == store.root.join("run/backup-server.sock"),
-        "Use Daemon's private backup control socket"
+        config.control_socket == Path::new("/run/kagnode-backup/admin.sock"),
+        "Use the dedicated backup control socket"
     );
     let volume = config.repository.canonicalize()?;
     let controller = store.root.canonicalize()?;
     ensure!(
         !volume.starts_with(&controller) && !controller.starts_with(&volume),
         "Repository and control state must be disjoint"
+    );
+    let worker_uid = volume.metadata()?.uid();
+    ensure!(
+        worker_uid != 0 && worker_uid != unsafe { libc::geteuid() },
+        "Backup worker requires a separate service account"
+    );
+    ensure!(
+        config.controller_uid == Some(unsafe { libc::geteuid() }),
+        "Backup configuration belongs to another controller"
     );
     Ok(Some(config))
 }
@@ -68,35 +77,32 @@ fn status(store: &Store, state: &str, message: &str) {
         );
     }
 }
+/// The privileged service manager owns process lifetime, privilege separation and
+/// sandboxing. Never fall back to spawning a network worker as the controller.
+pub async fn request(
+    store: &Store,
+    request: &super::control::AdminRequest,
+) -> Result<serde_json::Value> {
+    let config =
+        validate(store)?.ok_or_else(|| anyhow::anyhow!("Backup service is not configured"))?;
+    super::control::request_from(
+        &config.control_socket,
+        request,
+        config.repository.metadata()?.uid(),
+    )
+    .await
+}
 async fn cycle(store: &Store) -> Result<()> {
-    let Some(initial) = validate(store)? else {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        return Ok(());
-    };
-    ensure!(
-        unsafe { libc::geteuid() } != 0,
-        "Backup supervision requires an unprivileged Daemon"
-    );
-    let mut child = tokio::process::Command::new(child_binary()?)
-        .arg("serve")
-        .arg("--config")
-        .arg(store.root.join("backup-server.json"))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    status(
-        store,
-        "starting",
-        "Backup worker process started; consult its control socket for readiness",
-    );
-    loop {
-        tokio::select! {
-            result=child.wait()=>{let result=result?;anyhow::bail!("Backup worker exited with {result}");},
-            _=tokio::time::sleep(Duration::from_secs(2))=>{
-                if validate(store)?.as_ref()!=Some(&initial){child.kill().await?;let _=child.wait().await;status(store,"reconfiguring","Backup configuration changed or was disabled");return Ok(());}
-            }
-        }
+    if validate(store)?.is_some() {
+        let value = request(store, &super::control::AdminRequest::Status).await?;
+        ensure!(
+            value["process_id"].is_u64(),
+            "Backup service status is invalid"
+        );
+        status(store, "ready", "Dedicated backup service is responding");
     }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    Ok(())
 }
 pub async fn supervise(store: Store) -> Result<()> {
     loop {

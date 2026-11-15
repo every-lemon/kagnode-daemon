@@ -91,7 +91,12 @@ pub fn router(app: App) -> Router {
         )
         .route("/api/v1/audit", get(audit))
         .route("/api/v1/backup-server/status", get(backup_server_status))
-        .route("/api/v1/backup-server/actions", post(backup_server_action))
+        .route("/api/v1/backup-server/confirm", post(backup_server_confirm))
+        .route("/api/v1/backup-server/{action}", post(backup_server_action))
+        .route(
+            "/api/v1/backup-server/snapshots/{node}",
+            get(backup_server_snapshots),
+        )
         .route("/api/v1/monitoring", get(monitoring))
         .route("/api/v1/monitoring/history", get(metric_history))
         .route(
@@ -312,9 +317,50 @@ async fn backup_server_status(State(s): State<App>, h: HeaderMap) -> Api<Json<Va
         ));
     }
     Ok(Json(
-        crate::backup_service::control::request(
-            &s.store.root.join("run/backup-server.sock"),
+        crate::backup_service::supervisor::request(
+            &s.store,
             &crate::backup_service::control::AdminRequest::Status,
+        )
+        .await?,
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupConfirmation {
+    password: String,
+    request: crate::backup_service::control::AdminRequest,
+}
+async fn backup_server_confirm(
+    State(s): State<App>,
+    h: HeaderMap,
+    Json(input): Json<BackupConfirmation>,
+) -> Api<Json<Value>> {
+    mutation(&s, &h)?;
+    let password = zeroize::Zeroizing::new(input.password);
+    if !input.request.needs_confirmation() {
+        return Err(Error(
+            StatusCode::BAD_REQUEST,
+            "This action needs no confirmation".into(),
+        ));
+    }
+    let encoded = serde_json::to_string(&input.request).map_err(anyhow::Error::from)?;
+    let token = s.store.confirm_backup_action(
+        cookie(&h, "kn_daemon").unwrap_or(""),
+        &password,
+        &encoded,
+    )?;
+    Ok(Json(json!({"confirmation":token,"expires_in":60})))
+}
+async fn backup_server_snapshots(
+    State(s): State<App>,
+    h: HeaderMap,
+    Path(node): Path<String>,
+) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    Ok(Json(
+        crate::backup_service::supervisor::request(
+            &s.store,
+            &crate::backup_service::control::AdminRequest::Snapshots { node },
         )
         .await?,
     ))
@@ -322,16 +368,54 @@ async fn backup_server_status(State(s): State<App>, h: HeaderMap) -> Api<Json<Va
 async fn backup_server_action(
     State(s): State<App>,
     h: HeaderMap,
+    Path(action): Path<String>,
     Json(request): Json<crate::backup_service::control::AdminRequest>,
 ) -> Api<Json<Value>> {
-    mutation(&s, &h)?;
-    Ok(Json(
-        crate::backup_service::control::request(
-            &s.store.root.join("run/backup-server.sock"),
-            &request,
+    let owner = mutation(&s, &h)?;
+    if action != request.action()
+        || !matches!(
+            action.as_str(),
+            "approve" | "revoke" | "policy" | "pin" | "delete" | "garbage-collection"
         )
-        .await?,
-    ))
+    {
+        return Err(Error(StatusCode::NOT_FOUND, "Unknown backup action".into()));
+    }
+    let encoded = serde_json::to_string(&request).map_err(anyhow::Error::from)?;
+    if request.needs_confirmation() {
+        let confirmation = h
+            .get("x-backup-confirmation")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        s.store
+            .consume_backup_confirmation(
+                cookie(&h, "kn_daemon").unwrap_or(""),
+                confirmation,
+                &encoded,
+            )
+            .map_err(|_| {
+                Error(
+                    StatusCode::FORBIDDEN,
+                    "Confirm this action with your password again".into(),
+                )
+            })?;
+    }
+    // Log authenticated identity, operation and request digest, never approval tokens.
+    let actor = format!("dashboard:{}", owner.email);
+    s.store.backup_audit(
+        &actor,
+        &format!("backup-{action}-requested"),
+        &auth::digest(&encoded),
+    )?;
+    let result = crate::backup_service::supervisor::request(&s.store, &request).await;
+    s.store.backup_audit(
+        &actor,
+        &format!(
+            "backup-{action}-{}",
+            if result.is_ok() { "accepted" } else { "failed" }
+        ),
+        &auth::digest(&encoded),
+    )?;
+    Ok(Json(result?))
 }
 async fn audit(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
     user(&s, &h)?;

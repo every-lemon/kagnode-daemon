@@ -32,6 +32,8 @@ pub struct Config {
     pub private_key: PathBuf,
     pub client_ca: PathBuf,
     pub control_socket: PathBuf,
+    #[serde(default)]
+    pub controller_uid: Option<u32>,
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -228,19 +230,36 @@ pub async fn serve(
 ) -> Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let limit = Arc::new(tokio::sync::Semaphore::new(8));
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
+    let sources = Arc::new(Mutex::new(std::collections::HashMap::new()));
     loop {
-        let (stream, _) = listener.accept().await?;
-        let Ok(permit) = limit.clone().try_acquire_owned() else {
+        let (stream, address) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("Backup listener accept error: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(handshake) = handshakes.clone().try_acquire_owned() else {
+            continue;
+        };
+        let Some(source) = SourceSlot::acquire(sources.clone(), address.ip()) else {
             continue;
         };
         let acceptor = acceptor.clone();
         let state = state.clone();
+        let limit = limit.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let Ok(Ok(tls)) =
-                tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(stream))
+                tokio::time::timeout(std::time::Duration::from_secs(3), acceptor.accept(stream))
                     .await
             else {
+                return;
+            };
+            drop(handshake);
+            drop(source);
+            let Ok(_permit) = limit.try_acquire_owned() else {
                 return;
             };
             let Some(cert) = tls.get_ref().1.peer_certificates().and_then(|c| c.first()) else {
@@ -254,5 +273,39 @@ pub async fn serve(
             let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(tls), service);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(120), connection).await;
         });
+    }
+}
+
+// RAII cleanup also releases the per-source limit after timeout or cancellation.
+struct SourceSlot {
+    counts: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    source: std::net::IpAddr,
+}
+impl SourceSlot {
+    fn acquire(
+        counts: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+        source: std::net::IpAddr,
+    ) -> Option<Self> {
+        {
+            let mut map = counts.lock().ok()?;
+            let count = map.entry(source).or_default();
+            if *count >= 4 {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(Self { counts, source })
+    }
+}
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.counts.lock() {
+            if let Some(count) = counts.get_mut(&self.source) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&self.source);
+                }
+            }
+        }
     }
 }

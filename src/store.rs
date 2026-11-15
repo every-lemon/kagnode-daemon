@@ -88,6 +88,7 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
 CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS admins(email TEXT PRIMARY KEY, password_hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backup_confirmations(token_hash TEXT PRIMARY KEY,session_hash TEXT NOT NULL,request_hash TEXT NOT NULL,expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, email TEXT NOT NULL REFERENCES admins(email), csrf TEXT NOT NULL, authenticated_at INTEGER NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts(identity TEXT PRIMARY KEY, start INTEGER NOT NULL, count INTEGER NOT NULL);
@@ -216,6 +217,55 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
     pub fn session(&self, token: &str) -> Result<Option<Session>> {
         ensure!(token.len() <= 128, "Invalid session");
         Ok(self.db()?.query_row("SELECT email,csrf,authenticated_at FROM sessions WHERE token_hash=?1 AND expires>?2", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
+    }
+    pub fn confirm_backup_action(
+        &self,
+        session: &str,
+        password: &str,
+        request: &str,
+    ) -> Result<String> {
+        let owner = self
+            .session(session)?
+            .ok_or_else(|| anyhow::anyhow!("Sign in again"))?;
+        let temporary = self.login(
+            &owner.email,
+            password,
+            &format!("backup-confirm:{}", owner.email),
+        )?;
+        self.logout(&temporary)?;
+        let token = auth::random()?;
+        let db = self.db()?;
+        db.execute(
+            "DELETE FROM backup_confirmations WHERE expires<?1",
+            [auth::now()],
+        )?;
+        db.execute(
+            "INSERT INTO backup_confirmations VALUES(?1,?2,?3,?4)",
+            params![
+                auth::digest(&token),
+                auth::digest(session),
+                auth::digest(request),
+                auth::now() + 60
+            ],
+        )?;
+        Ok(token)
+    }
+    pub fn consume_backup_confirmation(
+        &self,
+        session: &str,
+        token: &str,
+        request: &str,
+    ) -> Result<()> {
+        let db = self.db()?;
+        ensure!(db.execute("DELETE FROM backup_confirmations WHERE token_hash=?1 AND session_hash=?2 AND request_hash=?3 AND expires>=?4",params![auth::digest(token),auth::digest(session),auth::digest(request),auth::now()])?==1,"Fresh confirmation required for this exact backup action");
+        Ok(())
+    }
+    pub fn backup_audit(&self, actor: &str, action: &str, detail: &str) -> Result<()> {
+        self.db()?.execute(
+            "INSERT INTO audit(at,actor,action,detail) VALUES(?1,?2,?3,?4)",
+            params![auth::now(), actor, action, detail],
+        )?;
+        Ok(())
     }
     pub fn logout(&self, token: &str) -> Result<()> {
         self.db()?.execute(

@@ -44,6 +44,26 @@ pub enum AdminRequest {
         confirm: bool,
     },
 }
+impl AdminRequest {
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Approve { .. } => "approve",
+            Self::Revoke { .. } => "revoke",
+            Self::Snapshots { .. } => "snapshots",
+            Self::SetPolicy { .. } => "policy",
+            Self::Pin { .. } => "pin",
+            Self::Delete { .. } => "delete",
+            Self::CollectGarbage { .. } => "garbage-collection",
+        }
+    }
+    pub fn needs_confirmation(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status | Self::Snapshots { .. } | Self::Pin { pinned: true, .. }
+        )
+    }
+}
 pub fn dispatch(shared: &Shared, req: AdminRequest) -> Result<Value> {
     let mut r = shared
         .lock()
@@ -100,6 +120,9 @@ pub fn dispatch(shared: &Shared, req: AdminRequest) -> Result<Value> {
     }
 }
 pub async fn serve(path: &Path, shared: Shared) -> Result<()> {
+    serve_for(path, shared, unsafe { libc::geteuid() }).await
+}
+pub async fn serve_for(path: &Path, shared: Shared, controller_uid: u32) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Socket parent missing"))?;
@@ -108,7 +131,7 @@ pub async fn serve(path: &Path, shared: Shared) -> Result<()> {
         m.is_dir()
             && !m.file_type().is_symlink()
             && m.uid() == unsafe { libc::geteuid() }
-            && m.mode() & 0o077 == 0,
+            && m.mode() & 0o027 == 0,
         "Control socket needs a private owned directory"
     );
     if let Ok(m) = path.symlink_metadata() {
@@ -123,12 +146,19 @@ pub async fn serve(path: &Path, shared: Shared) -> Result<()> {
         std::fs::remove_file(path)?;
     }
     let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(if controller_uid == unsafe { libc::geteuid() } {
+            0o600
+        } else {
+            0o660
+        }),
+    )?;
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     loop {
         let (stream, _) = listener.accept().await?;
         let uid = stream.peer_cred()?.uid();
-        if uid != 0 && uid != unsafe { libc::geteuid() } {
+        if uid != 0 && uid != controller_uid {
             continue;
         }
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -167,14 +197,21 @@ pub async fn serve(path: &Path, shared: Shared) -> Result<()> {
     }
 }
 pub async fn request(path: &Path, request: &AdminRequest) -> Result<Value> {
+    request_from(path, request, unsafe { libc::geteuid() }).await
+}
+pub async fn request_from(path: &Path, request: &AdminRequest, worker_uid: u32) -> Result<Value> {
     let m = path.symlink_metadata()?;
     ensure!(
         m.file_type().is_socket()
-            && m.mode() & 0o077 == 0
-            && (m.uid() == unsafe { libc::geteuid() } || unsafe { libc::geteuid() } == 0),
+            && m.mode() & 0o007 == 0
+            && (m.uid() == worker_uid || unsafe { libc::geteuid() } == 0),
         "Unsafe control socket"
     );
     let mut stream = UnixStream::connect(path).await?;
+    ensure!(
+        stream.peer_cred()?.uid() == worker_uid,
+        "Unexpected backup control service identity"
+    );
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     let value = tokio::time::timeout(Duration::from_secs(30), async {

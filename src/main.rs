@@ -602,10 +602,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some(Command::BackupServer { command }) => {
-            use kagnode_daemon::backup_service::{
-                control::{self, AdminRequest},
-                transport,
-            };
+            use kagnode_daemon::backup_service::{control::AdminRequest, transport};
             let request = match command {
                 BackupServer::Status => AdminRequest::Status,
                 BackupServer::Approve {
@@ -644,7 +641,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &control::request(&store.root.join("run/backup-server.sock"), &request).await?
+                    &kagnode_daemon::backup_service::supervisor::request(&store, &request).await?
                 )?
             );
         }

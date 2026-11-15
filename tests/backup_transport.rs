@@ -148,6 +148,7 @@ async fn mtls_signed_upload_admin_separation_and_restart() -> Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let config = Config {
+        controller_uid: None,
         repository: repository.clone(),
         listen: address,
         certificate: root.join("server.pem"),
@@ -201,7 +202,15 @@ async fn mtls_signed_upload_admin_separation_and_restart() -> Result<()> {
         impostor.enroll(token).await.is_err(),
         "A trusted but unbound certificate must fail"
     );
-    agent.enroll(token).await?;
+    let mut silent_peers = Vec::new();
+    for _ in 0..8 {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind("127.0.0.2:0".parse()?)?;
+        silent_peers.push(socket.connect(address).await?);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(2), agent.enroll(token)).await??;
+    drop(silent_peers);
     assert!(agent.enroll(token).await.is_err());
     assert!(impostor.status().await.is_err());
     let cert = reqwest::Certificate::from_pem(&fs::read(root.join("ca.pem"))?)?;
@@ -345,6 +354,7 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
         true,
     )?;
     let token = store.login("owner@fixture.invalid", "fixture-password-long", "test")?;
+    let csrf = store.session(&token)?.unwrap().csrf;
     let app = router(App {
         store,
         origin: "http://127.0.0.1:8750".into(),
@@ -373,6 +383,7 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/backup-server/actions")
@@ -383,108 +394,102 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
         )
         .await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    for action in ["approve", "delete"] {
+        let body = if action == "approve" {
+            serde_json::json!({"action":"approve","node":"node","public_key":"a".repeat(64),"certificate_sha256":"b".repeat(64)})
+        } else {
+            serde_json::json!({"action":"delete","node":"node","snapshot":"one","confirm":"delete node/one"})
+        };
+        let send = |path: String, body: serde_json::Value, confirmation: &str| {
+            Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("cookie", format!("kn_daemon={token}"))
+                .header("origin", "http://127.0.0.1:8750")
+                .header("x-csrf-token", &csrf)
+                .header("x-backup-confirmation", confirmation)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(send(
+                format!("/api/v1/backup-server/{action}"),
+                body.clone(),
+                "",
+            ))
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app
+            .clone()
+            .oneshot(send(
+                "/api/v1/backup-server/confirm".into(),
+                serde_json::json!({"password":"fixture-password-long","request":body}),
+                "",
+            ))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let challenge = value["confirmation"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(send(
+                format!("/api/v1/backup-server/{action}"),
+                body.clone(),
+                challenge,
+            ))
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "confirmed action reaches unconfigured worker"
+        );
+        let response = app
+            .clone()
+            .oneshot(send(
+                format!("/api/v1/backup-server/{action}"),
+                body,
+                challenge,
+            ))
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "challenge must not replay"
+        );
+    }
     Ok(())
 }
-struct Process(std::process::Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unprivileged_process_is_supervised_without_dashboard() -> Result<()> {
+
+#[test]
+fn f7_same_identity_worker_is_rejected() -> Result<()> {
     let binary = std::env::var("KAGNODE_BACKUP_BINARY")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kagnode-backup-server").into());
-    if unsafe { libc::geteuid() } == 0 {
-        let result = Command::new(&binary)
-            .args(["serve", "--config", "/nonexistent-fixture"])
-            .output()?;
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("unprivileged"));
-        return Ok(());
-    }
-    let main_binary = std::env::var("KAGNODE_DAEMON_BINARY")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_kagnode").into());
     let tmp = tempfile::tempdir()?;
-    let root = tmp.path();
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-    certificates(root)?;
-    let controller = root.join("daemon/controller");
-    let store = kagnode_daemon::store::Store::open(&controller)?;
-    store.init(
-        "owner@fixture.invalid",
-        "fixture-password-long",
-        kagnode_daemon::store::Profile::Light,
-        false,
-    )?;
-    let repository = root.join("repository");
-    drop(Repository::create(
-        &repository,
-        "site",
-        "server",
-        &policy(),
-    )?);
     let config = Config {
-        repository,
+        repository: tmp.path().join("repository"),
         listen: "127.0.0.1:0".parse()?,
-        certificate: root.join("server.pem"),
-        private_key: root.join("server.key"),
-        client_ca: root.join("ca.pem"),
-        control_socket: controller.join("run/backup-server.sock"),
+        certificate: tmp.path().join("cert"),
+        private_key: tmp.path().join("key"),
+        client_ca: tmp.path().join("ca"),
+        control_socket: tmp.path().join("control.sock"),
+        controller_uid: Some(unsafe { libc::geteuid() }),
     };
-    let path = controller.join("backup-server.json");
-    fs::write(&path, serde_json::to_vec(&config)?)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    let mut daemon = Process(
-        Command::new(&main_binary)
-            .arg("--root")
-            .arg(&controller)
-            .arg("serve")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
-    let mut first = None;
-    for _ in 0..100 {
-        if let Ok(value) = control::request(&config.control_socket, &AdminRequest::Status).await {
-            first = value["process_id"].as_u64();
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let first = first.ok_or_else(|| anyhow::anyhow!("Supervised backup worker did not start"))?;
+    let p = tmp.path().join("config");
+    fs::write(&p, serde_json::to_vec(&config)?)?;
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600))?;
+    let result = Command::new(binary)
+        .arg("serve")
+        .arg("--config")
+        .arg(p)
+        .output()?;
+    assert!(!result.status.success());
+    let err = String::from_utf8_lossy(&result.stderr);
     assert!(
-        kagnode_daemon::runtime::request(&controller, &kagnode_daemon::runtime::Request::Overview)
-            .is_ok()
+        err.contains("separate service account") || err.contains("unprivileged"),
+        "{err}"
     );
-    ensure!(
-        unsafe { libc::kill(first as i32, libc::SIGKILL) } == 0,
-        "Cannot interrupt fixture child"
-    );
-    let mut second = None;
-    for _ in 0..450 {
-        if let Ok(value) = control::request(&config.control_socket, &AdminRequest::Status).await {
-            let pid = value["process_id"].as_u64();
-            if pid.is_some() && pid != Some(first) {
-                second = pid;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    ensure!(
-        second.is_some(),
-        "Daemon failed to restart interrupted backup worker"
-    );
-    assert!(
-        kagnode_daemon::runtime::request(&controller, &kagnode_daemon::runtime::Request::Overview)
-            .is_ok()
-    );
-    ensure!(
-        unsafe { libc::kill(daemon.0.id() as i32, libc::SIGTERM) } == 0,
-        "Cannot terminate fixture Daemon"
-    );
-    ensure!(daemon.0.wait()?.success(), "Daemon did not stop cleanly");
     Ok(())
 }
