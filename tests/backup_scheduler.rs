@@ -144,3 +144,98 @@ fn readiness_staleness_unsafe_and_busy_are_enforced() -> Result<()> {
     assert_eq!(c.gate(200, 0)?, Admission::Blocked);
     Ok(())
 }
+
+#[test]
+fn completed_history_does_not_exhaust_pending_capacity() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("queue");
+    let mut c = config(tmp.path());
+    c.targets.truncate(1);
+    let mut q = Queue::open(&root)?;
+    for n in 0..1100 {
+        let at = 100 + n * 60;
+        let mut m = manifest();
+        m.snapshot = format!("snapshot-{n}");
+        assert!(q.enqueue_due(&c, &m, at)?);
+        let w = q.next(at)?.unwrap();
+        q.start(w.id)?;
+        q.finish(&w, Some(&json!({"snapshot":m.snapshot,"server":"one","ciphertext_verified":true,"verified_at":at})), at)?;
+    }
+    drop(q);
+    let mut q = Queue::open(&root)?;
+    // Completed identities remain immutable and deduplicated after restart.
+    let mut old = manifest();
+    old.snapshot = "snapshot-0".into();
+    assert!(!q.enqueue_due(&c, &old, 100000)?);
+    old.created_at += 1;
+    assert!(q.enqueue_due(&c, &old, 100060).is_err());
+    for n in 0..1024 {
+        let mut m = manifest();
+        m.snapshot = format!("pending-{n}");
+        assert!(q.enqueue_due(&c, &m, 100060 + n * 60)?);
+    }
+    let mut m = manifest();
+    m.snapshot = "over-capacity".into();
+    assert!(
+        q.enqueue_due(&c, &m, 200000)
+            .unwrap_err()
+            .to_string()
+            .contains("Pending job limit")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_status_reports_actual_preparation_and_configuration_errors() -> Result<()> {
+    use kagnode_daemon::{backup_service::scheduler::supervise, store::Store};
+    for invalid_config in [false, true] {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("controller"))?;
+        let mut c = config(tmp.path());
+        if invalid_config {
+            c.targets.clear();
+        }
+        let mut m = manifest();
+        m.node = "wrong-node".into();
+        for (path, value) in [
+            (
+                store.root.join("backup-agent.json"),
+                serde_json::to_value(&c)?,
+            ),
+            (c.manifest.clone(), serde_json::to_value(&m)?),
+        ] {
+            fs::write(&path, serde_json::to_vec(&value)?)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        let task = tokio::spawn(supervise(store.clone()));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some((_, status)) = store.document("backup-agent-status").unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        let status = result?;
+        assert_eq!(
+            status["state"],
+            if invalid_config {
+                "blocked"
+            } else {
+                "source_blocked"
+            }
+        );
+        assert_eq!(
+            status["error"],
+            if invalid_config {
+                "Invalid target/copy count"
+            } else {
+                "Prepared snapshot identity mismatch"
+            }
+        );
+    }
+    Ok(())
+}

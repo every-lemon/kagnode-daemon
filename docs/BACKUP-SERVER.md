@@ -251,13 +251,17 @@ SQLite FULL/WAL and an exclusive worker lock persist due times, frozen inputs,
 each target's attempts/backoff, receipts and completion independently. Restart
 requeues interrupted work. Successful targets are not resent. At most one target
 runs locally at a time. Retry delays grow from one minute to one hour; ten failed
-attempts block that target for review. The history limit is 1024 jobs; exceeding
-it stops new jobs rather than silently deleting history. Pause/removal or loss of
+attempts block that target for review. Only unfinished jobs count toward the 1024-job admission limit. Completed
+history remains durable for snapshot identity checks and receipts; it does not
+stop future scheduling. History currently grows with successful snapshots, so
+monitor queue disk usage; automated history compaction remains a known limit. Pause/removal or loss of
 readiness cancels an active transfer at the next one-second check. A prepared-file
 failure does not discard queued work. Configuration changes affect new jobs;
 existing target/key-path/manifest choices stay frozen. Changing schedule identity
 while jobs remain requires review. Status is persisted in the controller's
-`backup-agent-status` document, including blocked/deferred/paused states.
+`backup-agent-status` document, including blocked/deferred/paused states. Configuration and prepared-input errors
+are recorded in the administrator-only status as `error`; `source_error` keeps a
+prepared-input failure visible while older work is deferred or transferring.
 
 The existing server's acknowledged partial offset resumes interrupted transfers;
 repeating finish returns the original verified receipt. Lease admission, maximum

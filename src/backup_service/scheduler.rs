@@ -176,6 +176,7 @@ impl Queue {
         CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY,next_run INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,schedule TEXT NOT NULL,node TEXT NOT NULL,snapshot TEXT NOT NULL,digest TEXT NOT NULL,manifest TEXT NOT NULL,config TEXT NOT NULL,queued INTEGER NOT NULL,UNIQUE(schedule,node,snapshot));
         CREATE TABLE IF NOT EXISTS transfers(id INTEGER PRIMARY KEY,job INTEGER NOT NULL,target TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL,receipt TEXT,error TEXT,UNIQUE(job,target));
+        CREATE INDEX IF NOT EXISTS unfinished_jobs ON transfers(job) WHERE state!='completed';
         UPDATE transfers SET state='pending' WHERE state='running';")?;
         Ok(Self { db, _lock: lock })
     }
@@ -219,10 +220,10 @@ impl Queue {
             );
         }
         if prior.is_none() {
-            let count: i64 = tx.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))?;
+            let count: i64 = tx.query_row("SELECT COUNT(DISTINCT job) FROM transfers WHERE state!='completed'", [], |r| r.get(0))?;
             ensure!(
                 count < 1024,
-                "Queue history limit reached; export/review before increasing retention"
+                "Pending job limit reached (1024); resolve unfinished transfers before adding jobs"
             );
             tx.execute("INSERT INTO jobs(schedule,node,snapshot,digest,manifest,config,queued) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![config.id,config.node,manifest.snapshot,hash,String::from_utf8(raw)?,serde_json::to_string(config)?,now])?;
             let id = tx.last_insert_rowid();
@@ -329,13 +330,14 @@ pub async fn supervise(store: Store) -> Result<()> {
             let q=queue.as_mut().unwrap();
             if config.paused { return Ok(json!({"state":"paused","queue":q.status()?})); }
             let prepared = config.prepared().and_then(|m| q.enqueue_due(&config, &m, auth::now()));
+            let source_error = prepared.as_ref().err().map(ToString::to_string);
             if let Some(work)=q.next(auth::now())? {
                 // A different schedule identity cannot silently inherit old pending work.
                 ensure!(work.schedule.id==config.id && work.schedule.node==config.node,"Pending jobs belong to a different schedule");
                 let gate=config.gate(auth::now(),work.queued)?;
-                if !matches!(gate,Admission::Normal|Admission::Throttled) { return Ok(json!({"state":"deferred","admission":gate,"queue":q.status()?})); }
+                if !matches!(gate,Admission::Normal|Admission::Throttled) { return Ok(json!({"state":"deferred","admission":gate,"source_error":source_error,"queue":q.status()?})); }
                 q.start(work.id)?;
-                publish(&store,json!({"state":"transferring","queue":q.status()?}));
+                publish(&store,json!({"state":"transferring","source_error":source_error,"queue":q.status()?}));
                 let send=transfer(&work); tokio::pin!(send);
                 let result=loop {
                     tokio::select! {
@@ -348,9 +350,12 @@ pub async fn supervise(store: Store) -> Result<()> {
                 };
                 if q.finish(&work,result.as_ref().ok(),auth::now()).is_err() { q.finish(&work,None,auth::now())?; }
             }
-            Ok(json!({"state":if prepared.is_ok() { "scheduled" } else { "source_blocked" },"queue":q.status()?}))
+            Ok(json!({"state":if prepared.is_ok() { "scheduled" } else { "source_blocked" },"error":source_error,"queue":q.status()?}))
         }.await;
-        publish(&store,result.unwrap_or_else(|_|json!({"state":"blocked","error":"Review private agent configuration, prepared snapshot and queue status"})));
+        publish(
+            &store,
+            result.unwrap_or_else(|e| json!({"state":"blocked","error":e.to_string()})),
+        );
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
