@@ -221,3 +221,29 @@ fn f4_control_operations_do_not_open_verified_object_payloads() {
         Some(libc::EAGAIN)
     );
 }
+
+#[test]
+fn f5_unverified_arrivals_cannot_displace_recovery_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut r = Repository::create(&tmp.path().join("s"), "site", "server", &policy(None)).unwrap();
+    enroll(&mut r, "n", 1);
+    for (id, t) in [
+        ("good1", 100),
+        ("good2", 101),
+        ("junk1", 102),
+        ("junk2", 103),
+    ] {
+        commit(&mut r, "n", 1, id, t, id.as_bytes(), &[]);
+    }
+    assert!(r.delete("n", "good1", "admin").is_err());
+    assert!(r.delete("n", "good2", "admin").is_err());
+    // This newly received snapshot claims an old creation date. Receipt order wins.
+    let a = r
+        .begin(&signed("n", 1, "backdated", 1, b"cat", &[]), 104)
+        .unwrap();
+    for o in a.missing {
+        r.upload("n", &a.id, &o.sha256, 0, b"cat", 104).unwrap();
+    }
+    r.finish("n", &a.id, 104).unwrap();
+    assert_eq!(r.snapshots("n").unwrap()[0]["id"], "backdated");
+}

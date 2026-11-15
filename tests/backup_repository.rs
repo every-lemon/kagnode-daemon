@@ -171,6 +171,11 @@ fn retention_keeps_latest_verified_rollback_and_pins() -> anyhow::Result<()> {
         r.begin_restore("node", "two", "restore-runner", kagnode_daemon::auth::now())?;
     assert!(r.delete("node", "two", "admin").is_err());
     r.end_restore(&restore_lease, "restore-runner")?;
+    assert!(r.delete("node", "two", "admin").is_err());
+    for (id, at) in [("four", 103), ("five", 104), ("six", 105)] {
+        commit(&mut r, id, at)?;
+        r.mark_restore_tested("node", id, "restore-runner")?;
+    }
     r.delete("node", "two", "admin")?;
     assert!(r.begin(&signed("two", 101), 102).is_err());
     assert_eq!(
@@ -178,7 +183,7 @@ fn retention_keeps_latest_verified_rollback_and_pins() -> anyhow::Result<()> {
         0,
         "shared object still needed by protected snapshots"
     );
-    assert_eq!(r.snapshots("node")?.len(), 2);
+    assert_eq!(r.snapshots("node")?.len(), 5);
     Ok(())
 }
 #[test]

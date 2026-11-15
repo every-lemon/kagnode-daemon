@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS lease_progress(id TEXT PRIMARY KEY,started INTEGER NO
 CREATE TABLE IF NOT EXISTS objects(node TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(node,hash));
 CREATE TABLE IF NOT EXISTS object_verification(node TEXT NOT NULL,hash TEXT NOT NULL,stamp TEXT NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(node,hash));
 CREATE TABLE IF NOT EXISTS snapshots(node TEXT NOT NULL,id TEXT NOT NULL,created INTEGER NOT NULL,body TEXT NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,restore_verified INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(node,id));
+CREATE TABLE IF NOT EXISTS snapshot_receipts(node TEXT NOT NULL,snapshot TEXT NOT NULL,received INTEGER NOT NULL,PRIMARY KEY(node,snapshot));
 CREATE TABLE IF NOT EXISTS refs(node TEXT NOT NULL,snapshot TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(node,snapshot,object),FOREIGN KEY(node,snapshot) REFERENCES snapshots(node,id) ON DELETE CASCADE,FOREIGN KEY(node,object) REFERENCES objects(node,hash));
 CREATE TABLE IF NOT EXISTS usage(month TEXT NOT NULL,node TEXT NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(month,node));
 CREATE TABLE IF NOT EXISTS replay(node TEXT NOT NULL,nonce TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(node,nonce));
@@ -883,6 +884,10 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             "INSERT INTO snapshots(node,id,created,body) VALUES(?1,?2,?3,?4)",
             params![node, m.snapshot, m.created_at, encoded],
         )?;
+        tx.execute(
+            "INSERT INTO snapshot_receipts VALUES(?1,?2,?3)",
+            params![node, m.snapshot, now],
+        )?;
         for o in m.all_objects() {
             tx.execute(
                 "INSERT OR IGNORE INTO objects VALUES(?1,?2,?3,?4)",
@@ -905,27 +910,23 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
     }
     pub fn snapshots(&self, node: &str) -> Result<Vec<Value>> {
         ensure!(identifier(node), "Invalid node");
-        let mut q=self.db.prepare("SELECT id,created,pinned,restore_verified FROM snapshots WHERE node=?1 ORDER BY created DESC,id DESC")?;
-        Ok(q.query_map([node],|r|Ok(json!({"id":r.get::<_,String>(0)?,"created":r.get::<_,i64>(1)?,"pinned":r.get::<_,i64>(2)?!=0,"restore_tested":r.get::<_,i64>(3)?!=0})))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut q=self.db.prepare("SELECT s.id,s.created,s.pinned,s.restore_verified,COALESCE(r.received,0) FROM snapshots s LEFT JOIN snapshot_receipts r ON r.node=s.node AND r.snapshot=s.id WHERE s.node=?1 ORDER BY COALESCE(r.received,0) DESC,s.rowid DESC")?;
+        Ok(q.query_map([node],|r|Ok(json!({"id":r.get::<_,String>(0)?,"created":r.get::<_,i64>(1)?,"pinned":r.get::<_,i64>(2)?!=0,"restore_tested":r.get::<_,i64>(3)?!=0,"received_at":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn protected(&self, node: &str) -> Result<Vec<String>> {
         let snapshots = self.snapshots(node)?;
-        let mut protected: Vec<String> = snapshots
-            .iter()
-            .filter(|s| s["pinned"] == true)
-            .map(|s| s["id"].as_str().unwrap().into())
-            .collect();
-        if let Some(latest) = snapshots.first() {
-            protected.push(latest["id"].as_str().unwrap().into());
-        }
-        if let Some(rollback) = snapshots
-            .iter()
-            .skip(1)
-            .find(|s| s["restore_tested"] == true)
-        {
-            protected.push(rollback["id"].as_str().unwrap().into());
-        } else if let Some(previous) = snapshots.get(1) {
-            protected.push(previous["id"].as_str().unwrap().into());
+        let keep = self.policy()?.keep_snapshots;
+        let mut verified = 0;
+        let mut protected = Vec::new();
+        // Unverified arrivals cannot age out a known recovery point. Until the
+        // requested number of newer restore-tested snapshots exists, retain it.
+        for snapshot in &snapshots {
+            if verified < keep || snapshot["pinned"] == true {
+                protected.push(snapshot["id"].as_str().unwrap().to_owned());
+            }
+            if snapshot["restore_tested"] == true {
+                verified += 1;
+            }
         }
         let mut q = self
             .db
