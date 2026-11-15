@@ -11,7 +11,12 @@ description = "KagNode application management daemon, Core dashboard and termina
 name = "kagnode"
 path = "src/main.rs"
 
+[workspace]
+members = ["crates/backup-format"]
+resolver = "3"
+
 [dependencies]
+kagnode-backup-format = { path = "crates/backup-format", version = "5.0.3" }
 anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["form", "json"] }
