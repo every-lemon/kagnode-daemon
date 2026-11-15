@@ -66,9 +66,19 @@ pub fn read_file(path: &Path, secret: bool) -> Result<Vec<u8>> {
     Ok(raw)
 }
 pub fn tls(config: &Config) -> Result<Arc<rustls::ServerConfig>> {
+    let ca = read_file(&config.client_ca, false)?;
+    let certificate = read_file(&config.certificate, false)?;
+    let key = zeroize::Zeroizing::new(read_file(&config.private_key, true)?);
+    tls_material(&ca, &certificate, &key)
+}
+pub(crate) fn tls_material(
+    ca: &[u8],
+    certificate: &[u8],
+    key_bytes: &[u8],
+) -> Result<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut read_file(&config.client_ca, false)?.as_slice()) {
+    for c in rustls_pemfile::certs(&mut &*ca) {
         roots.add(c?)?;
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -76,10 +86,8 @@ pub fn tls(config: &Config) -> Result<Arc<rustls::ServerConfig>> {
         provider.clone(),
     )
     .build()?;
-    let certs = rustls_pemfile::certs(&mut read_file(&config.certificate, false)?.as_slice())
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let key_bytes = zeroize::Zeroizing::new(read_file(&config.private_key, true)?);
-    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
+    let certs = rustls_pemfile::certs(&mut &*certificate).collect::<std::io::Result<Vec<_>>>()?;
+    let key = rustls_pemfile::private_key(&mut &*key_bytes)?
         .ok_or_else(|| anyhow::anyhow!("TLS key is missing"))?;
     let mut result = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?

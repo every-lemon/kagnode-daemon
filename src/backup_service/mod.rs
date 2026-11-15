@@ -3,6 +3,7 @@ pub mod agent;
 pub mod control;
 pub mod policy;
 pub mod repository;
+pub mod role;
 pub mod scheduler;
 pub mod supervisor;
 pub mod transport;

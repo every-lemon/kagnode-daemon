@@ -606,6 +606,31 @@ class Manager:
             yield
 
     @contextlib.contextmanager
+    def role_lock(self):
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        with lock_handle(
+            self.root / ".kagnode-role.lock", create=True, privileged=self.require_root
+        ) as descriptor:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ManagerError("Another installer is reviewing/changing this root.")
+            for candidate in (
+                self.root / ".kagnode-role.json",
+                self.root / "backup-server",
+                self.root / "daemon/controller/backup-server.json",
+                self.root / "controller/backup-server.json",
+            ):
+                try:
+                    candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                raise ManagerError(
+                    "Backup Server reservation/configuration blocks application installation."
+                )
+            yield
+
+    @contextlib.contextmanager
     def lock(self, name):
         if self.require_root and os.geteuid() != 0:
             raise ManagerError(
@@ -613,6 +638,10 @@ class Manager:
             )
         name, path = self.project(name)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        with self.role_lock():
+            yield from self._project_lock(name, path)
+
+    def _project_lock(self, name, path):
         path.mkdir(exist_ok=True, mode=0o755)
         self.root.chmod(0o755)
         path.chmod(0o755)
@@ -1825,6 +1854,13 @@ class Manager:
 
 
 def bitwarden_setup(root, origin, image, port=8816, apply=False):
+    if apply:
+        with Manager(root, apply).role_lock():
+            return _bitwarden_setup(root, origin, image, port, apply)
+    return _bitwarden_setup(root, origin, image, port, apply)
+
+
+def _bitwarden_setup(root, origin, image, port=8816, apply=False):
     """Pinned upstream engine, isolated data; no automatic legacy-vault conversion."""
     root = validate_root(root, apply)
     Manager(root, apply).project("passwords")

@@ -118,6 +118,8 @@ pub fn apply(
         unsafe { libc::geteuid() } == 0,
         "Installation needs root privileges"
     );
+    let _role = crate::backup_service::role::Guard::acquire(Path::new("/srv/kagnode"))?;
+    crate::backup_service::role::require_applications(Path::new("/srv/kagnode"))?;
     let reviewed = plan(profile, web, origin)?;
     let os = std::fs::read_to_string("/etc/os-release")?;
     ensure!(

@@ -103,6 +103,24 @@ enum Command {
         #[command(subcommand)]
         command: Backup,
     },
+    BackupInstall {
+        #[arg(long)]
+        managed_root: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        worker_binary: PathBuf,
+        #[arg(long)]
+        controller_config: PathBuf,
+        #[arg(long)]
+        apply_plan: Option<PathBuf>,
+    },
+    BackupRole {
+        #[arg(long)]
+        managed_root: PathBuf,
+        #[arg(long)]
+        apply_plan: Option<PathBuf>,
+    },
     BackupServer {
         #[command(subcommand)]
         command: BackupServer,
@@ -263,6 +281,57 @@ fn prompt(message: &str) -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::BackupInstall {
+        managed_root,
+        config,
+        worker_binary,
+        controller_config,
+        apply_plan,
+    }) = &args.command
+    {
+        use kagnode_daemon::backup_service::{role, transport};
+        let result = if let Some(path) = apply_plan {
+            let plan: role::Installation =
+                serde_json::from_slice(&transport::read_file(path, true)?)?;
+            ensure!(
+                plan.root == *managed_root
+                    && plan.unit_directory == std::path::Path::new("/etc/systemd/system"),
+                "Installation root mismatch"
+            );
+            role::install(&plan)?
+        } else {
+            serde_json::to_value(role::installation_plan(
+                managed_root,
+                config,
+                worker_binary,
+                std::path::Path::new("/etc/systemd/system"),
+                controller_config,
+            )?)?
+        };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if let Some(Command::BackupRole {
+        managed_root,
+        apply_plan,
+    }) = &args.command
+    {
+        ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "Role reservation requires root"
+        );
+        use kagnode_daemon::backup_service::{role, transport};
+        let result = if let Some(path) = apply_plan {
+            role::apply(
+                managed_root,
+                &serde_json::from_slice(&transport::read_file(path, true)?)?,
+            )?
+        } else {
+            serde_json::to_value(role::plan(managed_root)?)?
+        };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     if let Some(Command::Install {
         email,
         password_file,
@@ -672,6 +741,8 @@ async fn main() -> Result<()> {
         Some(
             Command::Broker { .. }
             | Command::Services { .. }
+            | Command::BackupInstall { .. }
+            | Command::BackupRole { .. }
             | Command::Install { .. }
             | Command::Backup { .. },
         ) => unreachable!(),

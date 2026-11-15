@@ -262,3 +262,33 @@ inactivity timer is suspended only after the complete request body is extracted
 and while server-side handling is active; it resets before writing the response.
 The 120-second total cap remains. A busy repository may refuse new sessions;
 clients retry idempotently rather than holding handshake capacity indefinitely.
+
+## Reviewed role installation
+
+Root first runs `kagnode backup-role --managed-root /srv/kagnode` and saves the
+returned plan privately, then repeats with `--apply-plan <file>`. Apply rechecks
+the inventory/hash under a shared installer lock. Its durable reservation blocks
+application/source/native installers in both Rust and the compatibility manager,
+even if the marker is malformed or points at a missing target. Competing or
+changed plans fail without deleting existing installations. The role is exclusive
+within that managed root; this is not a host-wide scanner for arbitrary software
+installed outside Daemon. Do not use alternate roots to bypass role separation.
+
+After provisioning a dedicated non-root worker account and initializing its private
+repository with the existing worker `init` command, `kagnode backup-install` takes
+`--managed-root`, `--config` (private root-owned Config JSON), `--worker-binary`
+(root-owned executable), and `--controller-config` (the existing controller's
+backup-server.json destination). It prints a review plan; `--apply-plan <file>`
+revalidates hashes, users, TLS key/certificate compatibility and destinations.
+It writes dedicated-user configuration and an **inactive** systemd unit, plus a
+durable installation receipt. Existing files are retained; partial installation
+requires recovery review and cannot be blindly retried. No service is started or
+restarted. The numeric service UID differs from the controller; the controller's
+primary group owns the private IPC access boundary. No supplementary memberships
+are silently changed. Configuration/credential paths must be accessible under the
+unit's filesystem restrictions before activation.
+
+Synthetic filesystem tests cover reservation conflicts, installer guards,
+changed-input rejection and inactive-install idempotency. They do not qualify
+real systemd startup, sandbox enforcement, existing-host adoption or unattended
+account provisioning. Those remain activation prerequisites.
