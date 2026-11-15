@@ -1,5 +1,7 @@
 # 5.0.3
 
+- Include Go standard-library and linked vendored notices in binary archives and system packages.
+
 - Publish the KagNode. Daemon branding in current command help, terminal screens and wordmark artwork.
 - Retain the kagnode command, package/data identities and reviewed Core/application operations.
 - Document the persistent Rust service lifetime and existing native migration gates. This compatibility patch does not replace an existing runtime with an unqualified Rust candidate.

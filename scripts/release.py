@@ -243,6 +243,48 @@ cp -a {root}/. %{{buildroot}}/
         shutil.copyfile(rpms[0], out / f"{package}_{version}_{arch}.rpm")
 
 
+def go_notices():
+    """Carry license/patent notices from the actual linked standard-library tree."""
+    goroot = Path(
+        subprocess.check_output(["go", "env", "GOROOT"], text=True).strip()
+    ).resolve(strict=True)
+    directories = subprocess.check_output(
+        ["go", "list", "-deps", "-f", "{{.Dir}}", "."], cwd=ROOT, text=True
+    ).splitlines()
+    selected = {
+        goroot / name for name in ["LICENSE", "PATENTS"] if (goroot / name).is_file()
+    }
+    if goroot / "LICENSE" not in selected:
+        raise ValueError("The build toolchain is missing its Go license")
+    for directory in directories:
+        path = Path(directory).resolve(strict=True)
+        if not path.is_relative_to(goroot):
+            continue
+        while path != goroot:
+            selected.update(
+                p
+                for p in path.iterdir()
+                if p.is_file()
+                and p.name
+                in {
+                    "LICENSE",
+                    "LICENSE.txt",
+                    "COPYRIGHT",
+                    "COPYING",
+                    "NOTICE",
+                    "PATENTS",
+                }
+            )
+            path = path.parent
+    return (
+        "Go standard-library and linked vendored component notices\n\n"
+        + "\n\n".join(
+            "=== " + str(p.relative_to(goroot)) + " ===\n" + p.read_text()
+            for p in sorted(selected)
+        )
+    )
+
+
 def build(out, native_cli=True):
     if subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=normal"],
@@ -281,6 +323,8 @@ def build(out, native_cli=True):
     if cfg["kind"] == "cli" and native_cli:
         with tempfile.TemporaryDirectory(prefix="kagnode-cli-") as temporary:
             stage = Path(temporary)
+            notices = stage / "THIRD-PARTY-NOTICES.txt"
+            notices.write_text(go_notices())
             for arch in ["amd64", "arm64"]:
                 binary = stage / "kagnode"
                 subprocess.run(
@@ -314,6 +358,7 @@ def build(out, native_cli=True):
                         "assets/kagnode-wordmark.svg",
                     ]
                 ]
+                payload.append((notices.name, notices))
                 archives(
                     payload, f"{cfg['repository']}_{version}_linux_{arch}", out, epoch
                 )
