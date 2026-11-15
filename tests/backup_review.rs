@@ -297,6 +297,93 @@ fn f12_committed_delete_survives_catalog_already_missing() {
     assert_eq!(r.snapshots("n").unwrap().len(), 2);
 }
 #[test]
+fn f12_catalog_cleanup_retries_after_storage_failure_and_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("s");
+    let mut p = policy(None);
+    p.keep_snapshots = 2;
+    let mut r = Repository::create(&root, "site", "server", &p).unwrap();
+    enroll(&mut r, "n", 1);
+    for (id, t) in [("a", 100), ("b", 101), ("c", 102)] {
+        commit(&mut r, "n", 1, id, t, b"cat", &[]);
+        r.mark_restore_tested("n", id, "restore-runner").unwrap();
+    }
+    let file = root.join("snapshots/n/a.json");
+    let original = fs::read(&file).unwrap();
+    let retained = fs::read(root.join("snapshots/n/b.json")).unwrap();
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap(); // Deterministic unlink failure, including root fixtures.
+    r.delete("n", "a", "admin").unwrap();
+    assert_eq!(r.snapshots("n").unwrap().len(), 2);
+    assert!(
+        r.begin(&signed("n", 1, "a", 100, b"cat", &[]), 1000)
+            .is_err()
+    );
+    r.gc(100000).unwrap(); // Bad cleanup must not claim to restore deleted content.
+    fs::remove_dir(&file).unwrap();
+    fs::write(&file, original).unwrap(); // Storage repaired; leftover can now be removed.
+    drop(r);
+    let mut r = Repository::open(&root).unwrap();
+    r.gc(100001).unwrap();
+    assert!(
+        !file.exists(),
+        "logical-deletion leftovers must be retried after restart"
+    );
+    assert_eq!(fs::read(root.join("snapshots/n/b.json")).unwrap(), retained);
+    let db = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM catalog_cleanup", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn f12_legacy_tombstones_seed_cleanup_once_without_removing_unknown_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("s");
+    let mut p = policy(None);
+    p.keep_snapshots = 2;
+    let mut r = Repository::create(&root, "site", "server", &p).unwrap();
+    enroll(&mut r, "n", 1);
+    for (id, t) in [("a", 100), ("b", 101), ("c", 102)] {
+        commit(&mut r, "n", 1, id, t, b"cat", &[]);
+        r.mark_restore_tested("n", id, "restore-runner").unwrap();
+    }
+    let file = root.join("snapshots/n/a.json");
+    let original = fs::read(&file).unwrap();
+    r.delete("n", "a", "admin").unwrap();
+    drop(r);
+    fs::write(&file, original).unwrap(); // Legacy crash after logical commit, before unlink.
+    let unknown = root.join("snapshots/n/unknown.json");
+    fs::write(&unknown, b"unindexed; no tombstone authorizes removal").unwrap();
+    let db = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TABLE IF EXISTS catalog_cleanup; DROP TABLE IF EXISTS repository_migrations;",
+    )
+    .unwrap();
+    drop(db);
+    let mut r = Repository::open(&root).unwrap();
+    r.gc(100000).unwrap();
+    assert!(
+        !file.exists(),
+        "old tombstones must reconcile their leftover catalog"
+    );
+    assert!(unknown.exists());
+    drop(r);
+    let mut r = Repository::open(&root).unwrap();
+    r.gc(100001).unwrap();
+    let db = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM catalog_cleanup", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(unknown.exists());
+}
+#[test]
 fn f13_same_second_observations_preserve_hysteresis() {
     let mut h = Hysteresis::default();
     for t in [0, 0, 60, 60, 120, 120, 180] {

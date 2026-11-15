@@ -22,7 +22,14 @@ private files, storage-directory identity checks, approved enrollment challenges
 Ed25519 verification, persistent nonce replay rejection, upload leases, resumable
 bounded chunks, ciphertext verification, snapshot commit receipts, monthly
 transfer counters, retention protections, restore leases and shared-object GC.
-Snapshot deletion is recorded as a tombstone. Stored signatures bind manifests;
+Snapshot deletion is recorded as a tombstone and a durable catalog-cleanup intent
+in the same database transaction. If unlinking or directory synchronization fails,
+the logical deletion still succeeds; administrator status reports
+`pending_catalog_cleanups`. Explicit garbage collection retries at most 128
+pending catalogs per call, favoring entries with fewer failed attempts. Existing
+repositories seed this queue once from historical tombstones, including a restart
+between logical deletion and unlink. No unindexed file without a tombstone is
+removed by this cleanup; general object-orphan reconciliation remains separate. Stored signatures bind manifests;
 file contents and filenames remain in encrypted objects.
 
 The `kagnode-backup-server` binary refuses root execution and requires a distinct
