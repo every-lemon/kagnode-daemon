@@ -230,6 +230,7 @@ pub async fn serve(
 ) -> Result<()> {
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let limit = Arc::new(tokio::sync::Semaphore::new(8));
+    let certificates = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let handshakes = Arc::new(tokio::sync::Semaphore::new(32));
     let sources = Arc::new(Mutex::new(std::collections::HashMap::new()));
     loop {
@@ -250,6 +251,7 @@ pub async fn serve(
         let acceptor = acceptor.clone();
         let state = state.clone();
         let limit = limit.clone();
+        let certificates = certificates.clone();
         tokio::spawn(async move {
             let Ok(Ok(tls)) =
                 tokio::time::timeout(std::time::Duration::from_secs(3), acceptor.accept(stream))
@@ -257,20 +259,45 @@ pub async fn serve(
             else {
                 return;
             };
-            drop(handshake);
-            drop(source);
-            let Ok(_permit) = limit.try_acquire_owned() else {
-                return;
-            };
             let Some(cert) = tls.get_ref().1.peer_certificates().and_then(|c| c.first()) else {
                 return;
             };
-            let app = router(state, PeerCertificate(digest(cert.as_ref())));
+            let fingerprint = digest(cert.as_ref());
+            // Retain the handshake bounds while approval is checked. This avoids
+            // unbounded tasks waiting for the repository and excludes merely
+            // CA-issued, expired enrollment and revoked identities from sessions.
+            let repository = state.clone();
+            let identity = fingerprint.clone();
+            let approved = tokio::task::spawn_blocking(move || {
+                repository.lock().ok().is_some_and(|repo| {
+                    repo.approved_transport(&identity, auth::now())
+                        .unwrap_or(false)
+                })
+            })
+            .await;
+            if !matches!(approved, Ok(true)) {
+                return;
+            }
+            let Some(_certificate) = CertificateSlot::acquire(certificates, fingerprint.clone())
+            else {
+                return;
+            };
+            let Ok(_permit) = limit.try_acquire_owned() else {
+                return;
+            };
+            drop(handshake);
+            drop(source);
+            let app = router(state, PeerCertificate(fingerprint));
             let service = hyper_util::service::TowerToHyperService::new(app);
-            let builder =
+            let mut builder =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                     .http1_only();
-            let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(tls), service);
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_secs(12));
+            let connection =
+                builder.serve_connection(hyper_util::rt::TokioIo::new(IdleIo::new(tls)), service);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(120), connection).await;
         });
     }
@@ -307,5 +334,113 @@ impl Drop for SourceSlot {
                 counts.remove(&self.source);
             }
         }
+    }
+}
+
+// Permit guards are scoped to the connection, including cancellation/error paths.
+struct CertificateSlot {
+    counts: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    fingerprint: String,
+}
+impl CertificateSlot {
+    fn acquire(
+        counts: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+        fingerprint: String,
+    ) -> Option<Self> {
+        {
+            let mut map = counts.lock().ok()?;
+            let count = map.entry(fingerprint.clone()).or_default();
+            if *count >= 2 {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(Self {
+            counts,
+            fingerprint,
+        })
+    }
+}
+impl Drop for CertificateSlot {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.counts.lock()
+            && let Some(count) = counts.get_mut(&self.fingerprint)
+        {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.fingerprint);
+            }
+        }
+    }
+}
+
+// Bounds silent keep-alive, partial bodies and stalled response readers. The
+// separate absolute header deadline also stops one-byte header trickling.
+struct IdleIo<T> {
+    inner: T,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+impl<T> IdleIo<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(12))),
+        }
+    }
+    fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        std::future::Future::poll(self.deadline.as_mut(), cx).is_ready()
+    }
+    fn activity(&mut self) {
+        self.deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
+    }
+}
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for IdleIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.expired(cx) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+        }
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.activity();
+        }
+        result
+    }
+}
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for IdleIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.expired(cx) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+        }
+        let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity();
+        }
+        result
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.expired(cx) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

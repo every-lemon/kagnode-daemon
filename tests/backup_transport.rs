@@ -744,3 +744,218 @@ async fn f7_worker_has_separate_uid_empty_environment_and_no_inherited_fd() -> R
     );
     Ok(())
 }
+
+struct SessionFixture {
+    root: tempfile::TempDir,
+    shared: Shared,
+    address: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+impl Drop for SessionFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl SessionFixture {
+    async fn new() -> Result<Self> {
+        let root = tempfile::tempdir()?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+        certificates(root.path())?;
+        let shared = Arc::new(Mutex::new(Repository::create(
+            &root.path().join("repo"),
+            "site",
+            "server",
+            &policy(),
+        )?));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let cfg = Config {
+            repository: root.path().join("repo"),
+            listen: address,
+            certificate: root.path().join("server.pem"),
+            private_key: root.path().join("server.key"),
+            client_ca: root.path().join("ca.pem"),
+            control_socket: root.path().join("control.sock"),
+            controller_uid: None,
+        };
+        let task = tokio::spawn(transport::serve(
+            listener,
+            transport::tls(&cfg)?,
+            shared.clone(),
+        ));
+        Ok(Self {
+            root,
+            shared,
+            address,
+            task,
+        })
+    }
+    fn approve(&self, name: &str) -> Result<()> {
+        self.shared.lock().unwrap().approve_tls_node(
+            name,
+            &hex::encode(key().public_key().as_ref()),
+            &fingerprint(&self.root.path().join(format!("{name}.pem")))?,
+            kagnode_daemon::auth::now(),
+        )?;
+        Ok(())
+    }
+    async fn connect(
+        &self,
+        name: &str,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let root = self.root.path();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut fs::read(root.join("ca.pem"))?.as_slice()) {
+            roots.add(cert?)?;
+        }
+        let certs =
+            rustls_pemfile::certs(&mut fs::read(root.join(format!("{name}.pem")))?.as_slice())
+                .collect::<std::io::Result<Vec<_>>>()?;
+        let private_key = rustls_pemfile::private_key(
+            &mut fs::read(root.join(format!("{name}.key")))?.as_slice(),
+        )?
+        .unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, private_key)?;
+        let socket = tokio::net::TcpStream::connect(self.address).await?;
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::IpAddress(self.address.ip().into()),
+                socket,
+            )
+            .await?;
+        // TLS client completion can precede the server processing its Finished.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        Ok(stream)
+    }
+    async fn responds(&self, name: &str) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = self.connect(name).await?;
+        stream
+            .write_all(b"GET /missing HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut bytes = [0; 128];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut bytes)).await??;
+        ensure!(
+            n > 0 && bytes[..n].starts_with(b"HTTP/1.1 404"),
+            "Unrelated approved node lost its HTTP session"
+        );
+        Ok(())
+    }
+}
+async fn session_closed(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    within: Duration,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(within, async {
+        let mut buf = [0; 512];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn residual_f6_unapproved_certificates_never_hold_sessions() -> Result<()> {
+    let f = SessionFixture::new().await?;
+    f.approve("other")?;
+    let mut peers = Vec::new();
+    for _ in 0..8 {
+        peers.push(f.connect("client").await?);
+    }
+    f.responds("other").await?;
+    for peer in &mut peers {
+        session_closed(peer, Duration::from_secs(2)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn residual_f6_certificate_cap_releases_and_preserves_other_nodes() -> Result<()> {
+    let f = SessionFixture::new().await?;
+    f.approve("client")?;
+    f.approve("other")?;
+    let first = f.connect("client").await?;
+    let second = f.connect("client").await?;
+    let mut excess = f.connect("client").await?;
+    session_closed(&mut excess, Duration::from_secs(2)).await?;
+    f.responds("other").await?;
+    drop((first, second));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.responds("client").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn residual_f6_header_body_and_keepalive_deadlines() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = SessionFixture::new().await?;
+    f.approve("client")?;
+    f.approve("other")?;
+    let mut silent = f.connect("client").await?;
+    let mut header = f.connect("client").await?;
+    header
+        .write_all(b"POST /api/v1/backup-server/node HTTP/1.1\r\nHost:")
+        .await?;
+    let mut body = f.connect("other").await?;
+    body.write_all(
+        b"POST /api/v1/backup-server/node HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n\r\n{",
+    )
+    .await?;
+    let mut keepalive = f.connect("other").await?;
+    keepalive
+        .write_all(b"GET /missing HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await?;
+    let mut response = [0; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(2), keepalive.read(&mut response)).await??;
+    assert!(response[..n].starts_with(b"HTTP/1.1 404"));
+    tokio::try_join!(
+        session_closed(&mut silent, Duration::from_secs(15)),
+        session_closed(&mut header, Duration::from_secs(15)),
+        session_closed(&mut body, Duration::from_secs(15)),
+        session_closed(&mut keepalive, Duration::from_secs(15)),
+    )?;
+    f.responds("client").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn residual_f6_revoked_and_expired_pending_certificates_rejected() -> Result<()> {
+    let f = SessionFixture::new().await?;
+    let target = Target {
+        site: "site".into(),
+        server: "server".into(),
+        endpoint: format!("https://{}", f.address),
+        ca: f.root.path().join("ca.pem"),
+        identity_pem: f.root.path().join("client-identity.pem"),
+    };
+    let agent = Agent::new("client", key(), target)?;
+    let token = f.shared.lock().unwrap().approve_tls_node(
+        "client",
+        &agent.public_key(),
+        &fingerprint(&f.root.path().join("client.pem"))?,
+        kagnode_daemon::auth::now(),
+    )?;
+    agent.enroll(&token).await?;
+    f.shared.lock().unwrap().revoke("client")?;
+    let mut revoked = f.connect("client").await?;
+    session_closed(&mut revoked, Duration::from_secs(2)).await?;
+    f.shared.lock().unwrap().approve_tls_node(
+        "other",
+        &agent.public_key(),
+        &fingerprint(&f.root.path().join("other.pem"))?,
+        kagnode_daemon::auth::now() - 601,
+    )?;
+    let mut expired = f.connect("other").await?;
+    session_closed(&mut expired, Duration::from_secs(2)).await?;
+    Ok(())
+}

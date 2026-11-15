@@ -181,8 +181,16 @@ and [Hyper connection serving](https://docs.rs/hyper-util/latest/hyper_util/serv
   older snapshots remain protected. Restoring/marking through a qualified
   runner is still required before retention can safely free those copies.
 - **F6:** separate bounded handshakes (32 global, four per source, three-second
-  timeout) precede the eight authenticated connection slots. Accept errors back
-  off rather than terminate the listener. Distributed connection/CPU flooding
+  timeout) precede the eight approved-certificate connection slots. A fingerprint
+  needs a non-revoked enrolled node or a live unused enrollment approval before
+  taking a slot; a CA signature alone is insufficient. Each fingerprint may hold
+  two sessions. Headers have a 12-second absolute deadline; reads/writes have a
+  12-second inactivity deadline, including keep-alive and incomplete bodies. A
+  120-second total connection deadline remains. Guards release on disconnect,
+  timeout and cancellation. Existing requests still recheck node authorization.
+  Nodes sharing an IP can share the three-second handshake lockout; many approved
+  identities can still fill the global cap. Accept errors back off rather than
+  terminate the listener. Distributed connection/CPU flooding
   still requires network admission controls; this is not DDoS protection.
 - **F7/F8:** dedicated service identity, empty startup environment and descriptor
   closure replace same-user supervision. Explicit action routes and password-bound

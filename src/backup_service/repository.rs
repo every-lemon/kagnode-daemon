@@ -285,6 +285,19 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         tx.commit()?;
         Ok(token)
     }
+    /// Admission before allocating an HTTP session. Pending enrollment is allowed
+    /// only with a live administrator-issued ticket; revoked nodes fail closed.
+    pub fn approved_transport(&self, fingerprint: &str, now: i64) -> Result<bool> {
+        ensure!(hash(fingerprint), "Invalid certificate fingerprint");
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM node_certificates c
+             LEFT JOIN nodes n ON n.id=c.node WHERE c.fingerprint=?1 AND
+             (n.revoked=0 OR (n.id IS NULL AND EXISTS(
+               SELECT 1 FROM tickets t WHERE t.node=c.node AND t.used=0 AND t.expires>=?2))))",
+            params![fingerprint, now],
+            |r| r.get(0),
+        )?)
+    }
     pub fn transport_identity(&self, node: &str, fingerprint: &str) -> Result<()> {
         ensure!(
             identifier(node) && hash(fingerprint),
