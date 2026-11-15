@@ -5,9 +5,9 @@ CLI 5.0.1 retires all fictional example commands and assets. The old instruction
 ---
 
 <!-- Retained operational documentation; historical version labels refer to their original release. -->
-<p align="center"><img src="../assets/kagnode-wordmark.svg" width="440" alt="KagNode. CLI"></p>
+<p align="center"><img src="../assets/kagnode-wordmark.svg" width="440" alt="KagNode. Daemon"></p>
 
-# KagNode CLI
+# KagNode Daemon
 
 A Linux command line interface for your KagNode account and **fictional cloud demos**. Sign in through your browser, then explore all 13 products in a terminal or a local web interface. There is no live provisioning, inference or billing API in this release.
 

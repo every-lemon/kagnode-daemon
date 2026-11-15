@@ -48,3 +48,16 @@ Recovery keys default outside application state and backup payloads at `/var/lib
 Run `kagnode` or `kagnode tui --no-mouse`. Search with `/`, open an application with Enter, and return with Left/Escape. Within an application, `i` inspects enrolled services and `h` reads operation history. `s`, `t`, and `r` request start, stop and restart plans. Only `y` confirms the displayed plan; Escape cancels. The broker rechecks the plan hash and definitions before applying it. Page Up/Down scroll long details. Ctrl+C and `q` restore terminal settings on exit. The workspace `w` key changes only the Daemon dashboard preference.
 
 Missing enrollment, broker failures and uncertain operations appear as explicit results. No application is installed or configured merely by opening its folder. Remote nodes and full configuration wizards remain separate migration gates.
+
+## Background process and terminal lifecycle
+
+The Rust Daemon runtime is a persistent administrator service. `kagnode` opens
+its terminal workspace; leaving that workspace does not stop the background
+service or managed applications. The optional web dashboard is another client,
+not the lifetime owner of the worker. A disabled dashboard retains private local
+administration. Native installation creates one supervised service rather than
+starting a new worker per terminal.
+
+The retained compatibility CLI is named KagNode. Daemon in current presentation,
+but it is not a substitute for the persistent Rust service. Existing installations
+must pass the migration gates in RUST-MIGRATION.md before replacing native tools.

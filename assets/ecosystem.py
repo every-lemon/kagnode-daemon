@@ -96,7 +96,7 @@ CATALOG = {
         "port": None,
     },
     "cli": {
-        "name": "KagNode CLI",
+        "name": "KagNode Daemon",
         "repo": "kagnode-cli",
         "kind": "binary",
         "port": None,

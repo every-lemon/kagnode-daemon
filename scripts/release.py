@@ -197,7 +197,7 @@ def system_packages(files, package, version, out, epoch, arch="all", binary=Fals
         spec.write_text(f"""Name: {package}
 Version: {rpmversion}
 Release: 1
-Summary: KagNode CLI application and source payload
+Summary: KagNode Daemon application and source payload
 License: {license_id}
 URL: https://github.com/every-lemon/{config()["repository"]}
 BuildArch: {rpmarch}
@@ -209,7 +209,7 @@ AutoReqProv: no
 %global clamp_mtime_to_source_date_epoch 1
 %global use_source_date_epoch_as_buildtime 1
 %description
-KagNode CLI payload. Source packages require manual setup.
+KagNode Daemon payload. Source packages require manual setup.
 Native service provisioning is not performed or qualified by this RPM.
 %prep
 %build

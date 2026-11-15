@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="kagnode-tui-") as temporary:
             assert until in output, "expected terminal state missing"
 
         try:
-            collect(b"KagNode. CLI")
+            collect(b"KagNode. Daemon")
             os.write(master, b"/help\r")
             collect(b"installer plan.")
             os.write(master, b"/catalog\r")
