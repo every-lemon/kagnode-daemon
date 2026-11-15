@@ -239,3 +239,46 @@ async fn agent_status_reports_actual_preparation_and_configuration_errors() -> R
     }
     Ok(())
 }
+
+#[test]
+fn blocked_transfer_retries_after_durable_cooldown_without_resending_successes() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("queue");
+    let c = config(tmp.path());
+    let mut q = Queue::open(&root)?;
+    q.enqueue_due(&c, &manifest(), 100)?;
+    let successful = q.next(100)?.unwrap();
+    q.start(successful.id)?;
+    q.finish(&successful, Some(&json!({"snapshot":"sample","server":"one","ciphertext_verified":true,"verified_at":100})),100)?;
+    let mut at = 100;
+    for n in 0..10 {
+        let w = q.next(at)?.unwrap();
+        assert_eq!(w.target.server, "two");
+        q.start(w.id)?;
+        q.finish(&w, None, at)?;
+        if n < 9 {
+            at = q.status()?["transfers"][0]["next_attempt"]
+                .as_i64()
+                .unwrap();
+        }
+    }
+    let retry_at = at + 86400;
+    assert_eq!(q.status()?["transfers"][0]["state"], "blocked");
+    assert!(q.next(retry_at - 1)?.is_none());
+    drop(q);
+    let q = Queue::open(&root)?;
+    assert!(q.next(retry_at - 1)?.is_none());
+    let w = q
+        .next(retry_at)?
+        .expect("blocked work should become retryable after cooldown");
+    assert_eq!(w.target.server, "two");
+    assert_eq!(q.status()?["transfers"][0]["attempts"], 10);
+    q.start(w.id)?;
+    q.finish(&w, None, retry_at)?;
+    assert!(q.next(retry_at + 86399)?.is_none());
+    let w = q.next(retry_at + 86400)?.unwrap();
+    q.start(w.id)?;
+    q.finish(&w, Some(&json!({"snapshot":"sample","server":"two","ciphertext_verified":true,"verified_at":retry_at + 86400})), retry_at + 86400)?;
+    assert!(q.next(retry_at + 864000)?.is_none());
+    Ok(())
+}

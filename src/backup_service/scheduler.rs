@@ -129,6 +129,9 @@ impl Schedule {
         Ok(m)
     }
 }
+// After ten failures, probe at most once per day; readiness and pause still gate sends.
+const BLOCKED_RETRY_SECONDS: i64 = 24 * 60 * 60;
+
 pub struct Queue {
     db: Connection,
     _lock: fs::File,
@@ -220,7 +223,11 @@ impl Queue {
             );
         }
         if prior.is_none() {
-            let count: i64 = tx.query_row("SELECT COUNT(DISTINCT job) FROM transfers WHERE state!='completed'", [], |r| r.get(0))?;
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(DISTINCT job) FROM transfers WHERE state!='completed'",
+                [],
+                |r| r.get(0),
+            )?;
             ensure!(
                 count < 1024,
                 "Pending job limit reached (1024); resolve unfinished transfers before adding jobs"
@@ -246,6 +253,10 @@ impl Queue {
         Ok(prior.is_none())
     }
     pub fn next(&self, now: i64) -> Result<Option<Work>> {
+        self.db.execute(
+            "UPDATE transfers SET state='pending' WHERE state='blocked' AND next_attempt<=?1",
+            [now],
+        )?;
         let row:Option<(i64,String,String,String,i64)>=self.db.query_row("SELECT t.id,j.manifest,j.config,t.target,j.queued FROM transfers t JOIN jobs j ON j.id=t.job WHERE t.state='pending' AND t.next_attempt<=?1 ORDER BY t.next_attempt,t.id LIMIT 1",[now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         row.map(|(id, m, c, t, queued)| {
             Ok(Work {
@@ -280,7 +291,11 @@ impl Queue {
                 [work.id],
                 |r| r.get(0),
             )?;
-            let delay = (30i64.saturating_mul(1i64 << attempts.min(10))).min(3600);
+            let delay = if attempts >= 10 {
+                BLOCKED_RETRY_SECONDS
+            } else {
+                (30i64.saturating_mul(1i64 << attempts.min(10))).min(3600)
+            };
             ensure!(self.db.execute("UPDATE transfers SET state=?2,next_attempt=?3,error='Transfer interrupted/refused; inspect identity, quota, lease and source health' WHERE id=?1 AND state='running'",params![work.id,if attempts>=10 {"blocked"} else {"pending"},now+delay])?==1,"Transfer is not running");
         }
         Ok(())

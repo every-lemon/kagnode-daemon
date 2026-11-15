@@ -251,7 +251,10 @@ SQLite FULL/WAL and an exclusive worker lock persist due times, frozen inputs,
 each target's attempts/backoff, receipts and completion independently. Restart
 requeues interrupted work. Successful targets are not resent. At most one target
 runs locally at a time. Retry delays grow from one minute to one hour; ten failed
-attempts block that target for review. Only unfinished jobs count toward the 1024-job admission limit. Completed
+attempts put that target in a 24-hour blocked cooldown. Once it expires, the
+worker allows one retry per day until success; the lifetime attempt count is
+retained across restarts. Pause, readiness, source and lease checks still apply.
+A cooldown retry is not a bypass for a refused or exhausted server lease. Only unfinished jobs count toward the 1024-job admission limit. Completed
 history remains durable for snapshot identity checks and receipts; it does not
 stop future scheduling. History currently grows with successful snapshots, so
 monitor queue disk usage; automated history compaction remains a known limit. Pause/removal or loss of
