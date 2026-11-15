@@ -1234,3 +1234,59 @@ async fn tls_reload_retires_sessions_and_rejects_invalid_material() -> Result<()
     f.responds("client").await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn node_inventory_requires_a_current_local_administrator() -> Result<()> {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use kagnode_daemon::{
+        store::{Profile, Store},
+        web::{App, router},
+    };
+    use tower::ServiceExt;
+    let tmp = tempfile::tempdir()?;
+    let store = Store::open(tmp.path())?;
+    store.init(
+        "owner@fixture.invalid",
+        "fixture-password-long",
+        Profile::Light,
+        true,
+    )?;
+    assert!(
+        store
+            .login("viewer@fixture.invalid", "fixture-password-long", "viewer")
+            .is_err()
+    );
+    let token = store.login("owner@fixture.invalid", "fixture-password-long", "owner")?;
+    let app = router(App {
+        store: store.clone(),
+        origin: "http://127.0.0.1:8750".into(),
+        core: Arc::new(
+            kagnode_core::Core::new("/nonexistent-core", "daemon")
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ),
+    });
+    let request = || {
+        Request::builder()
+            .uri("/api/v1/backup-server/nodes")
+            .header("cookie", format!("kn_daemon={token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(request()).await?.status(),
+        StatusCode::OK
+    );
+    // Simulate privileged maintenance retaining an orphaned session. Normal
+    // controller writes enforce foreign keys; this fixture deliberately does not.
+    let db = rusqlite::Connection::open(tmp.path().join("daemon.sqlite"))?;
+    db.execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM admins;")?;
+    assert!(store.session(&token)?.is_none());
+    assert_eq!(
+        app.oneshot(request()).await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}

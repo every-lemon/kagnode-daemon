@@ -214,9 +214,11 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
         db.execute("DELETE FROM attempts WHERE identity=?1", [&identity])?;
         Ok(token)
     }
+    // This dashboard has local administrators only. Recheck membership on every
+    // request, including sessions retained after an administrator is removed.
     pub fn session(&self, token: &str) -> Result<Option<Session>> {
         ensure!(token.len() <= 128, "Invalid session");
-        Ok(self.db()?.query_row("SELECT email,csrf,authenticated_at FROM sessions WHERE token_hash=?1 AND expires>?2", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
+        Ok(self.db()?.query_row("SELECT s.email,s.csrf,s.authenticated_at FROM sessions s JOIN admins a ON a.email=s.email WHERE s.token_hash=?1 AND s.expires>?2", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
     }
     pub fn confirm_backup_action(
         &self,

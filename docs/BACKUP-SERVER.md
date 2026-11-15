@@ -333,7 +333,12 @@ explicit node fingerprint even when a certificate chains to the accepted CA.
 
 These are **local-administrator controller** APIs, not remote-node APIs. All
 responses use `Cache-Control: no-store`. Authenticate with the `kn_daemon` session
-cookie. Mutations additionally require the exact configured `Origin`, the session
+cookie. The Rust controller has only an `admins` account table: local
+initialization creates the administrator, sign-in checks that table, and every
+session lookup rechecks current membership. There is no public signup or
+non-administrator dashboard role. This also protects the node inventory route;
+remote backup-node certificates do not create dashboard sessions.
+Mutations additionally require the exact configured `Origin`, the session
 `x-csrf-token` from `GET /api/v1/session`, and authentication within 15 minutes.
 JSON field names below are literal; UI labels may differ. Unknown body fields and
 incorrect action/route combinations are rejected. Never put credentials or
