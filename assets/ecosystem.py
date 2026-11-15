@@ -42,7 +42,7 @@ RELEASE_PUBLIC_KEY = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAuJzR4gg2djgIr
 
 CATALOG = {
     "proxy-manager": {
-        "name": "KagNode. PM",
+        "name": "KagNode. Proxy",
         "repo": "kagnode-pm",
         "kind": "native",
         "port": 9443,

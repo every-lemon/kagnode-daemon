@@ -13,7 +13,7 @@ pub struct Product {
 pub const PRODUCTS: &[Product] = &[
     Product {
         id: "proxy-manager",
-        name: "PM",
+        name: "Proxy",
         repository: "kagnode-pm",
         icon: "network",
         units: &[
@@ -73,7 +73,7 @@ pub const PRODUCTS: &[Product] = &[
     },
     Product {
         id: "netctl",
-        name: "Netctl",
+        name: "Network",
         repository: "kagnode-netctl",
         icon: "network",
         units: &["kagnode-netctl.service"],

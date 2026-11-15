@@ -2,6 +2,15 @@
 
 CLI 5.0.1 retires all fictional example commands and assets. The old instructions below are retained as historical context; they do not describe the current distribution. Use [real application setup](INSTALLERS.md), [the ecosystem manager](ECOSYSTEM.md), and [browser/account sign-in](ACCOUNT-SYNC.md) for current operations. Existing user runtime data is retained.
 
+## Current product names
+
+The application catalog displays **KagNode. Proxy** and **KagNode. Network**.
+Their technical identifiers remain `proxy-manager` (alias `pm`) and `netctl`;
+repositories remain `every-lemon/kagnode-pm` and `every-lemon/kagnode-netctl`.
+Existing commands, installation directories and service names keep working under
+those identifiers. The compatibility Python manager retains its existing product
+coverage; the Rust catalog includes Network.
+
 ---
 
 <!-- Retained operational documentation; historical version labels refer to their original release. -->
