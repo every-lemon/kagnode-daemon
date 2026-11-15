@@ -185,3 +185,39 @@ fn f3_abandoned_partials_are_collected_and_quota_is_enforced() {
             .is_err()
     );
 }
+
+#[test]
+fn f4_control_operations_do_not_open_verified_object_payloads() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("s");
+    let mut r = Repository::create(&root, "site", "server", &policy(None)).unwrap();
+    enroll(&mut r, "n", 1);
+    let data = blob("original", 1, 1024 * 1024);
+    commit(&mut r, "n", 1, "s1", 100, b"cat", &[data.clone()]);
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(fd >= 0);
+    let fd = unsafe { std::fs::File::from_raw_fd(fd) };
+    let path = std::ffi::CString::new(root.join("objects/n").join(digest(&data)).to_str().unwrap())
+        .unwrap();
+    assert!(unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) } >= 0);
+    let a = r
+        .begin(&signed("n", 1, "s2", 101, b"catalog", &[data]), 101)
+        .unwrap();
+    r.upload("n", &a.id, &digest(b"catalog"), 0, b"cat", 101)
+        .unwrap();
+    r.renew("n", &a.id, 102).unwrap();
+    r.upload("n", &a.id, &digest(b"catalog"), 3, b"alog", 102)
+        .unwrap();
+    r.finish("n", &a.id, 102).unwrap();
+    let mut events = [0u8; 4096];
+    assert_eq!(
+        unsafe { libc::read(fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) },
+        -1,
+        "control operations opened stored ciphertext"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EAGAIN)
+    );
+}

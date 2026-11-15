@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS tickets(hash TEXT PRIMARY KEY,node TEXT NOT NULL,key 
 CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,node TEXT NOT NULL,snapshot TEXT NOT NULL,body TEXT NOT NULL,expires INTEGER NOT NULL,reserved INTEGER NOT NULL,finished INTEGER NOT NULL DEFAULT 0,UNIQUE(node,snapshot));
 CREATE TABLE IF NOT EXISTS lease_progress(id TEXT PRIMARY KEY,started INTEGER NOT NULL,bytes INTEGER NOT NULL DEFAULT 0,renewed_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS objects(node TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(node,hash));
+CREATE TABLE IF NOT EXISTS object_verification(node TEXT NOT NULL,hash TEXT NOT NULL,stamp TEXT NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(node,hash));
 CREATE TABLE IF NOT EXISTS snapshots(node TEXT NOT NULL,id TEXT NOT NULL,created INTEGER NOT NULL,body TEXT NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,restore_verified INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(node,id));
 CREATE TABLE IF NOT EXISTS refs(node TEXT NOT NULL,snapshot TEXT NOT NULL,object TEXT NOT NULL,PRIMARY KEY(node,snapshot,object),FOREIGN KEY(node,snapshot) REFERENCES snapshots(node,id) ON DELETE CASCADE,FOREIGN KEY(node,object) REFERENCES objects(node,hash));
 CREATE TABLE IF NOT EXISTS usage(month TEXT NOT NULL,node TEXT NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(month,node));
@@ -536,10 +537,42 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         ensure!(global < 2, "Backup server lease capacity is busy");
         Ok(())
     }
+    fn object_stamp(&self, node: &str, object: &Object) -> Result<String> {
+        let m = self
+            .root
+            .join("objects")
+            .join(node)
+            .join(&object.sha256)
+            .symlink_metadata()?;
+        ensure!(
+            m.is_file()
+                && !m.file_type().is_symlink()
+                && m.nlink() == 1
+                && m.len() == object.bytes
+                && m.uid() == unsafe { libc::geteuid() }
+                && m.mode() & 0o077 == 0,
+            "Object metadata changed"
+        );
+        Ok(format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec()
+        ))
+    }
+    fn object_verified(&self, node: &str, object: &Object) -> bool {
+        let Ok(stamp) = self.object_stamp(node, object) else {
+            return false;
+        };
+        self.db.query_row("SELECT COUNT(*) FROM objects o JOIN object_verification v ON v.node=o.node AND v.hash=o.hash WHERE o.node=?1 AND o.hash=?2 AND o.bytes=?3 AND v.stamp=?4",params![node,object.sha256,object.bytes as i64,stamp],|r|r.get::<_,i64>(0)).is_ok_and(|count|count==1)
+    }
     fn missing(&self, m: &Manifest) -> Result<Vec<Object>> {
-        let root = self.root.join("objects").join(&m.node);
         Ok(m.all_objects()
-            .filter(|o| read_object(&root, o).is_err())
+            .filter(|o| !self.object_verified(&m.node, o))
             .cloned()
             .collect())
     }
@@ -783,11 +816,13 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
                 fs::rename(path, &dest)?;
                 fs::File::open(dest.parent().unwrap())?.sync_all()?;
             }
+            let stamp = self.object_stamp(node, o)?;
             let tx = self.db.transaction()?;
             let added = tx.execute(
                 "INSERT OR IGNORE INTO objects VALUES(?1,?2,?3,?4)",
                 params![node, object, i64::try_from(size)?, now],
             )?;
+            tx.execute("INSERT INTO object_verification VALUES(?1,?2,?3,?4) ON CONFLICT(node,hash) DO UPDATE SET stamp=excluded.stamp,verified_at=excluded.verified_at", params![node,object,stamp,now])?;
             if added != 0 {
                 tx.execute("INSERT INTO usage VALUES(?1,?2,?3) ON CONFLICT(month,node) DO UPDATE SET bytes=bytes+excluded.bytes", params![month,node,i64::try_from(size)?])?;
             }
