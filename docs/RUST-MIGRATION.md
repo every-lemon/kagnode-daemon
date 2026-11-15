@@ -6,7 +6,7 @@ All product versions remain on 5.0.x. The current public 5.0.3 compatibility pac
 | ---------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
 | Local admin/auth       | Rust Argon2, hashed revocable sessions, CSRF, private SQLite                                                 | Optional KagNode linking and application-specific user adapters                          |
 | Dashboard              | Rust/Axum with canonical Core templates and local assets                                                     | Full application adapters and remote-node roles                     |
-| Terminal               | Rust/Ratatui folder browsing, search, keyboard and optional mouse                                            | Interactive configuration/action parity                                            |
+| Terminal               | Rust/Ratatui charcoal/blue dashboard, command palette, host monitoring, folder browsing, keyboard and optional mouse                                            | Interactive configuration/action parity                                            |
 | Native lifecycle       | Rust root broker, root-enrolled fixed units, reviewed hashes, idempotency and uncertainty journal            | Remote-node enrollment and per-product recovery qualification                                        |
 | Install profiles       | Rust guarded fresh install, optional loopback dashboard, concrete Production hardening/monitor/backup timers | Debian native lifecycle and legacy migration                                      |
 | Backups                | Rust consistent SQLite snapshot, authenticated encryption, restore/integrity checks, separate recovery key   | Retention/off-host handling and application-specific backup adapters               |
@@ -24,3 +24,19 @@ Native activation on existing machines remains a later reviewed phase. Public Co
 The Rust 5.0.3 candidate was installed on an owned Ubuntu 24.04 disposable VM in Production mode. Native checks passed fresh-install conflict protection, private health access, hardened services/timers, allowlisted start/stop/restart, duplicate request replay, changed unit rejection and unprivileged peer refusal. An intentionally failed operation remained uncertain across broker restart; a fresh root inspection resolved it without another service operation. Encrypted control-database snapshots passed a separate restore/integrity check. Existing PM traffic was not restarted.
 
 Chromium and WebKit passed the real VM dashboard on desktop and mobile: progressive login, folder entry/back, settings, HA declarations, application status, activity and sign-out/session revocation. These results cover the tested candidate and fixture, not live host migration, remote control, actual cluster failover or every supported platform. Subsequent hardening retains unit regressions and must pass CI before merge.
+
+## Monitoring candidate — 2026-11-15
+
+The new source candidate adds a private terminal API, a ten-second Linux collector,
+CPU/memory/load/network/disk history, retention policy and authenticated monitoring
+HTTP endpoints. The terminal disconnects independently of the service; SIGTERM
+cleans up listeners and restarts preserve history. See [MONITORING.md](MONITORING.md).
+
+The cluster maintenance admission gate rejects stale/duplicate observations,
+concurrent maintenance, unsafe quorum/fencing/replication, and fewer than three
+other eligible service nodes stable for five minutes. This is a tested policy
+function, not a remote executor or implemented HA deployment.
+
+Remote node enrollment, persistent package jobs, APT native execution, scheduling,
+seven application failover adapters and their Debian/Ubuntu qualification remain
+pending. No production OS maintenance or reboot is enabled by this candidate.

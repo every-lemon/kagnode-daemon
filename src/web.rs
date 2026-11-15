@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{
     Form, Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
@@ -90,6 +90,12 @@ pub fn router(app: App) -> Router {
             post(service_apply),
         )
         .route("/api/v1/audit", get(audit))
+        .route("/api/v1/monitoring", get(monitoring))
+        .route("/api/v1/monitoring/history", get(metric_history))
+        .route(
+            "/api/v1/monitoring/retention",
+            get(retention).post(save_retention),
+        )
         .route("/api/v1/ha/plan", post(ha_plan))
         .route("/api/v1/ha/configuration", get(ha_get).post(ha_save))
         .route("/", get(page))
@@ -421,4 +427,81 @@ async fn service_history(
     Ok(Json(
         crate::broker::request(crate::broker::Request::History { product: id }).await?,
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricQuery {
+    name: String,
+    since: i64,
+    until: i64,
+}
+async fn monitoring(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::runtime::dispatch(&s.store, crate::runtime::Request::Overview)
+    })
+    .await
+    .map_err(|_| {
+        Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Monitoring unavailable".into(),
+        )
+    })??;
+    Ok(Json(result))
+}
+async fn metric_history(
+    State(s): State<App>,
+    h: HeaderMap,
+    Query(q): Query<MetricQuery>,
+) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::runtime::dispatch(
+            &s.store,
+            crate::runtime::Request::Metrics {
+                name: q.name,
+                since: q.since,
+                until: q.until,
+            },
+        )
+    })
+    .await
+    .map_err(|_| {
+        Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "History unavailable".into(),
+        )
+    })??;
+    Ok(Json(result))
+}
+async fn retention(State(s): State<App>, h: HeaderMap) -> Api<Json<Value>> {
+    user(&s, &h)?;
+    Ok(Json(crate::runtime::dispatch(
+        &s.store,
+        crate::runtime::Request::Retention,
+    )?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionChange {
+    revision: i64,
+    policy: crate::metrics::Policy,
+    confirm_trim: bool,
+}
+async fn save_retention(
+    State(s): State<App>,
+    h: HeaderMap,
+    Json(q): Json<RetentionChange>,
+) -> Api<Json<Value>> {
+    let u = mutation(&s, &h)?;
+    Ok(Json(crate::runtime::dispatch_as(
+        &s.store,
+        crate::runtime::Request::SetRetention {
+            revision: q.revision,
+            policy: q.policy,
+            confirm_trim: q.confirm_trim,
+        },
+        &u.email,
+    )?))
 }

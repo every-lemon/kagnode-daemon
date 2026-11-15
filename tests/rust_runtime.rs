@@ -266,6 +266,60 @@ async fn dashboard_requires_local_admin_and_protects_mutations() {
             .unwrap();
         assert_eq!(response.status(), expected);
     }
+    for route in [
+        "/api/v1/monitoring",
+        "/api/v1/monitoring/history?name=cpu.percent&since=0&until=10",
+        "/api/v1/monitoring/retention",
+    ] {
+        let denied = router
+            .clone()
+            .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let allowed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(route)
+                    .header(header::COOKIE, format!("kn_daemon={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+    let change=serde_json::json!({"revision":0,"policy":{"days":2,"budget_bytes":16777216},"confirm_trim":true}).to_string();
+    for (nonce, expected) in [
+        ("wrong", StatusCode::FORBIDDEN),
+        (csrf.as_str(), StatusCode::OK),
+        (csrf.as_str(), StatusCode::BAD_REQUEST),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/monitoring/retention")
+                    .header(header::COOKIE, format!("kn_daemon={token}"))
+                    .header(header::ORIGIN, "http://127.0.0.1:8750")
+                    .header("x-csrf-token", nonce)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(change.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert!(
+        store
+            .audit()
+            .unwrap()
+            .iter()
+            .any(|a| a.actor == "owner@fixture.invalid" && a.action == "configuration")
+    );
     for (nonce, expected) in [
         ("wrong", StatusCode::FORBIDDEN),
         (csrf.as_str(), StatusCode::NO_CONTENT),

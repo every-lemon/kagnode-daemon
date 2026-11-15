@@ -82,6 +82,23 @@ enum Command {
         origin: String,
     },
     Health,
+    /// Live monitoring from the persistent local daemon.
+    Monitor {
+        #[arg(long)]
+        metric: Option<String>,
+        #[arg(long, default_value_t = 3600)]
+        seconds: u32,
+    },
+    Retention {
+        #[arg(long)]
+        days: Option<u32>,
+        #[arg(long)]
+        budget_mib: Option<u64>,
+        #[arg(long)]
+        revision: Option<i64>,
+        #[arg(long)]
+        confirm_trim: bool,
+    },
     Backup {
         #[command(subcommand)]
         command: Backup,
@@ -412,6 +429,7 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                 ),
             };
+            let store_root_socket = store.root.join("run/control.sock");
             let run = store.root.join("run");
             std::fs::create_dir_all(&run)?;
             std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
@@ -429,30 +447,110 @@ async fn main() -> Result<()> {
             }
             let listener = tokio::net::UnixListener::bind(&socket)?;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            let mut terminal_api = tokio::spawn(kagnode_daemon::runtime::serve(store.clone()));
+            let collector = tokio::spawn(kagnode_daemon::runtime::collect(store.clone()));
             let local = web::router(app.clone());
-            let task = tokio::spawn(async move { axum::serve(listener, local).await });
-            if store.settings()?.web_enabled {
-                let listener = tokio::net::TcpListener::bind(listen).await?;
-                println!("Daemon dashboard listening on {listen}; origin {origin}");
-                axum::serve(
-                    listener,
-                    web::router(app).into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(async move {
-                    loop {
-                        if !store.settings().is_ok_and(|s| s.web_enabled) {
-                            break;
+            let mut task = tokio::spawn(async move { axum::serve(listener, local).await });
+            let web_store = store.clone();
+            let mut web_task = tokio::spawn(async move {
+                if web_store.settings()?.web_enabled {
+                    let listener = tokio::net::TcpListener::bind(listen).await?;
+                    println!("Daemon dashboard listening on {listen}; origin {origin}");
+                    axum::serve(
+                        listener,
+                        web::router(app).into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move {
+                        while web_store.settings().is_ok_and(|s| s.web_enabled) {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                })
-                .await?;
-            } else {
-                println!("Daemon running with dashboard disabled; private local socket available");
-            }
-            tokio::signal::ctrl_c().await?;
+                    })
+                    .await?;
+                } else {
+                    println!(
+                        "Daemon running with dashboard disabled; private local socket available"
+                    );
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut web_finished = false;
+            let result: Result<()> = loop {
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => break r.map_err(Into::into),
+                    _ = terminate.recv() => break Ok(()),
+                    r = &mut terminal_api => break Err(anyhow::anyhow!("Terminal API stopped: {r:?}")),
+                    r = &mut task => break Err(anyhow::anyhow!("Local health API stopped: {r:?}")),
+                    r = &mut web_task, if !web_finished => match r {
+                        Ok(Ok(())) => web_finished = true,
+                        other => break Err(anyhow::anyhow!("Dashboard listener failed: {other:?}")),
+                    },
+                }
+            };
+            web_task.abort();
             task.abort();
+            terminal_api.abort();
+            collector.abort();
+            let _ = std::fs::remove_file(store_root_socket);
             std::fs::remove_file(socket)?;
+            result?;
+        }
+        Some(Command::Monitor { metric, seconds }) => {
+            ensure!(
+                (10..=31_536_000).contains(&seconds),
+                "History window must be 10 seconds–365 days"
+            );
+            let now = kagnode_daemon::auth::now();
+            let query = match metric {
+                Some(name) => kagnode_daemon::runtime::Request::Metrics {
+                    name,
+                    since: now - i64::from(seconds),
+                    until: now,
+                },
+                None => kagnode_daemon::runtime::Request::Overview,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&kagnode_daemon::runtime::request(
+                    &store.root,
+                    &query
+                )?)?
+            );
+        }
+        Some(Command::Retention {
+            days,
+            budget_mib,
+            revision,
+            confirm_trim,
+        }) => {
+            use kagnode_daemon::{metrics::Policy, runtime};
+            let value = runtime::request(&store.root, &runtime::Request::Retention)?;
+            let result = if days.is_some() || budget_mib.is_some() {
+                let mut policy: Policy = serde_json::from_value(value["policy"].clone())?;
+                if let Some(days) = days {
+                    policy.days = days;
+                }
+                if let Some(mib) = budget_mib {
+                    policy.budget_bytes = mib
+                        .checked_mul(1024 * 1024)
+                        .ok_or_else(|| anyhow::anyhow!("Budget overflow"))?;
+                }
+                let revision = revision.ok_or_else(|| {
+                    anyhow::anyhow!("Read retention first and supply its --revision")
+                })?;
+                runtime::request(
+                    &store.root,
+                    &runtime::Request::SetRetention {
+                        revision,
+                        policy,
+                        confirm_trim,
+                    },
+                )?
+            } else {
+                value
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some(Command::Health) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
