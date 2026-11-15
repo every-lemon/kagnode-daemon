@@ -959,3 +959,35 @@ async fn residual_f6_revoked_and_expired_pending_certificates_rejected() -> Resu
     session_closed(&mut expired, Duration::from_secs(2)).await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn residual_f6_lock_wait_bounded_without_timing_out_server_processing() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = SessionFixture::new().await?;
+    f.approve("client")?;
+    let mut admitted = f.connect("client").await?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo = f.shared.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = repo.lock().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(16));
+    });
+    rx.recv()?;
+    let body = r#"{"node":"client","token":"invalid","proof":"invalid"}"#;
+    admitted.write_all(format!("POST /api/v1/backup-server/enroll HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
+    let mut new = f.connect("client").await?;
+    let bounded = session_closed(&mut new, Duration::from_secs(5)).await;
+    let mut response = Vec::new();
+    // Abrupt TLS EOF is allowed after a complete HTTP response; inspect the bytes.
+    let _ =
+        tokio::time::timeout(Duration::from_secs(20), admitted.read_to_end(&mut response)).await?;
+    holder.join().unwrap();
+    bounded?;
+    assert!(
+        response.starts_with(b"HTTP/1.1 403"),
+        "Server-side processing was incorrectly treated as client inactivity"
+    );
+    f.responds("client").await?;
+    Ok(())
+}

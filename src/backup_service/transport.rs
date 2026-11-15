@@ -90,6 +90,20 @@ pub fn tls(config: &Config) -> Result<Arc<rustls::ServerConfig>> {
 }
 #[derive(Clone)]
 pub struct PeerCertificate(pub String);
+#[derive(Clone, Default)]
+struct Activity(Arc<std::sync::atomic::AtomicU64>);
+struct Processing(Activity);
+impl Activity {
+    fn processing(&self) -> Processing {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Processing(self.clone())
+    }
+}
+impl Drop for Processing {
+    fn drop(&mut self) {
+        self.0.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeRequest {
@@ -160,9 +174,12 @@ pub fn dispatch(
 async fn node(
     State(state): State<Shared>,
     Extension(peer): Extension<PeerCertificate>,
+    Extension(activity): Extension<Activity>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Bytes/Json extraction has finished; the server now owns the wait.
+    let _processing = activity.processing();
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
         let node = field(&headers, "x-kagnode-node")?;
         let nonce = field(&headers, "x-kagnode-nonce")?;
@@ -193,8 +210,10 @@ async fn node(
 async fn enroll(
     State(state): State<Shared>,
     Extension(peer): Extension<PeerCertificate>,
+    Extension(activity): Extension<Activity>,
     Json(request): Json<Enrollment>,
 ) -> Response {
+    let _processing = activity.processing();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut repo = state
             .lock()
@@ -213,6 +232,9 @@ async fn enroll(
     }
 }
 pub fn router(state: Shared, peer: PeerCertificate) -> Router {
+    router_activity(state, peer, Activity::default())
+}
+fn router_activity(state: Shared, peer: PeerCertificate, activity: Activity) -> Router {
     Router::new()
         .route("/api/v1/backup-server/node", post(node))
         .route(
@@ -221,6 +243,7 @@ pub fn router(state: Shared, peer: PeerCertificate) -> Router {
         )
         .layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES + 2048))
         .layer(Extension(peer))
+        .layer(Extension(activity))
         .with_state(state)
 }
 pub async fn serve(
@@ -266,13 +289,21 @@ pub async fn serve(
             // Retain the handshake bounds while approval is checked. This avoids
             // unbounded tasks waiting for the repository and excludes merely
             // CA-issued, expired enrollment and revoked identities from sessions.
-            let repository = state.clone();
-            let identity = fingerprint.clone();
-            let approved = tokio::task::spawn_blocking(move || {
-                repository.lock().ok().is_some_and(|repo| {
-                    repo.approved_transport(&identity, auth::now())
-                        .unwrap_or(false)
-                })
+            let approved = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let verdict = match state.try_lock() {
+                        Ok(repo) => Some(
+                            repo.approved_transport(&fingerprint, auth::now())
+                                .unwrap_or(false),
+                        ),
+                        Err(std::sync::TryLockError::WouldBlock) => None,
+                        Err(_) => Some(false),
+                    };
+                    if let Some(approved) = verdict {
+                        break approved;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
             })
             .await;
             if !matches!(approved, Ok(true)) {
@@ -287,7 +318,8 @@ pub async fn serve(
             };
             drop(handshake);
             drop(source);
-            let app = router(state, PeerCertificate(fingerprint));
+            let activity = Activity::default();
+            let app = router_activity(state, PeerCertificate(fingerprint), activity.clone());
             let service = hyper_util::service::TowerToHyperService::new(app);
             let mut builder =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -296,8 +328,10 @@ pub async fn serve(
                 .http1()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(std::time::Duration::from_secs(12));
-            let connection =
-                builder.serve_connection(hyper_util::rt::TokioIo::new(IdleIo::new(tls)), service);
+            let connection = builder.serve_connection(
+                hyper_util::rt::TokioIo::new(IdleIo::new(tls, activity)),
+                service,
+            );
             let _ = tokio::time::timeout(std::time::Duration::from_secs(120), connection).await;
         });
     }
@@ -378,16 +412,28 @@ impl Drop for CertificateSlot {
 // separate absolute header deadline also stops one-byte header trickling.
 struct IdleIo<T> {
     inner: T,
+    phase: u64,
+    activity: Activity,
     deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
 }
 impl<T> IdleIo<T> {
-    fn new(inner: T) -> Self {
+    fn new(inner: T, activity: Activity) -> Self {
         Self {
             inner,
+            phase: 0,
+            activity,
             deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(12))),
         }
     }
     fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        let phase = self.activity.0.load(std::sync::atomic::Ordering::SeqCst);
+        if self.phase != phase || phase % 2 == 1 {
+            self.phase = phase;
+            self.activity();
+        }
+        if phase % 2 == 1 {
+            return false;
+        }
         std::future::Future::poll(self.deadline.as_mut(), cx).is_ready()
     }
     fn activity(&mut self) {

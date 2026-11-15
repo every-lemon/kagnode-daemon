@@ -216,3 +216,9 @@ and [Hyper connection serving](https://docs.rs/hyper-util/latest/hyper_util/serv
   with explicit service restart and independently verify the new identity.
 
 The backup format, age encryption and recovery implementation are unchanged.
+
+Approval waits for the repository lock are bounded to three seconds. The network
+inactivity timer is suspended only after the complete request body is extracted
+and while server-side handling is active; it resets before writing the response.
+The 120-second total cap remains. A busy repository may refuse new sessions;
+clients retry idempotently rather than holding handshake capacity indefinitely.
