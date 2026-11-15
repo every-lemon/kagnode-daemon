@@ -141,6 +141,15 @@ impl Agent {
     }
     /// Returns a ciphertext receipt. This is not evidence of plaintext recovery or an independent restore test.
     pub async fn push(&self, manifest: Manifest, objects: &Path) -> Result<Value> {
+        self.push_limited(manifest, objects, 0).await
+    }
+    /// Optional hard byte-rate ceiling; zero preserves the manual push behavior.
+    pub async fn push_limited(
+        &self,
+        manifest: Manifest,
+        objects: &Path,
+        bytes_per_second: u64,
+    ) -> Result<Value> {
         ensure!(
             manifest.node == self.node && manifest.site == self.target.site,
             "Snapshot identity mismatch"
@@ -188,7 +197,13 @@ impl Agent {
                     .await?;
                     renewed = std::time::Instant::now();
                 }
-                let end = (offset + 1024 * 1024).min(bytes.len());
+                let chunk = if bytes_per_second == 0 {
+                    1024 * 1024
+                } else {
+                    bytes_per_second.min(1024 * 1024) as usize
+                };
+                let end = (offset + chunk).min(bytes.len());
+                let started = std::time::Instant::now();
                 let reply = self
                     .call(&NodeRequest::Upload {
                         lease: lease.id.clone(),
@@ -201,6 +216,11 @@ impl Agent {
                     reply["offset"] == end as u64,
                     "Unexpected upload acknowledgment"
                 );
+                if bytes_per_second > 0 {
+                    let period =
+                        Duration::from_secs_f64((end - offset) as f64 / bytes_per_second as f64);
+                    tokio::time::sleep(period.saturating_sub(started.elapsed())).await;
+                }
                 offset = end;
             }
         }

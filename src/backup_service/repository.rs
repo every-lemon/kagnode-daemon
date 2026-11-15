@@ -48,7 +48,7 @@ pub struct Repository {
     pub(crate) admin_actor: String,
     _lock: fs::File,
 }
-fn private(root: &Path, create: bool) -> Result<()> {
+pub(crate) fn private(root: &Path, create: bool) -> Result<()> {
     ensure!(
         root.is_absolute() && !root.components().any(|p| matches!(p, Component::ParentDir)),
         "Use an absolute protected repository path"

@@ -217,6 +217,46 @@ and [Hyper connection serving](https://docs.rs/hyper-util/latest/hyper_util/serv
 
 The backup format, age encryption and recovery implementation are unchanged.
 
+
+## Durable outbound scheduler (source implementation)
+
+Daemon starts an optional Rust scheduler even when its dashboard is disabled.
+A private `<controller>/backup-agent.json` enables it. The JSON matches the
+`Schedule` type in `src/backup_service/scheduler.rs`: id, node, absolute signing_key
+(PKCS8 Ed25519), manifest, objects, readiness paths, targets, policy, next_run
+(Unix UTC seconds), paused and link_bytes_per_second. Targets use the existing
+Agent Target shape. Secrets remain in protected files; queue rows store paths,
+manifest metadata and receipts, never private/recovery key bytes.
+
+The producer must atomically publish an immutable v2 encrypted manifest and keep
+its ciphertext objects until every target finishes. This scheduler consumes that
+prepared snapshot; it does **not** copy a running database or implement missing
+application quiescence adapters. Readiness is a private local adapter report
+`{"state":"ready|busy|unsafe|unknown","observed_at":<Unix seconds>}` renewed
+within 90 seconds. Unknown/unsafe/stale reports fail closed. Busy sources defer
+until the policy threshold, then transfer at the configured ceiling. The hard
+ceiling is link_bytes_per_second multiplied by bandwidth_percent/100 for all
+scheduled transfers; it is an operator-provided budget, not a measured link rate.
+
+SQLite FULL/WAL and an exclusive worker lock persist due times, frozen inputs,
+each target's attempts/backoff, receipts and completion independently. Restart
+requeues interrupted work. Successful targets are not resent. At most one target
+runs locally at a time. Retry delays grow from one minute to one hour; ten failed
+attempts block that target for review. The history limit is 1024 jobs; exceeding
+it stops new jobs rather than silently deleting history. Pause/removal or loss of
+readiness cancels an active transfer at the next one-second check. A prepared-file
+failure does not discard queued work. Configuration changes affect new jobs;
+existing target/key-path/manifest choices stay frozen. Changing schedule identity
+while jobs remain requires review. Status is persisted in the controller's
+`backup-agent-status` document, including blocked/deferred/paused states.
+
+The existing server's acknowledged partial offset resumes interrupted transfers;
+repeating finish returns the original verified receipt. Lease admission, maximum
+age and progress-renewal limits remain enforced. An exhausted lease may require
+an explicitly prepared new snapshot identity; the scheduler does not evade those
+limits. No unattended recovery, point-in-time database safety, power-loss or
+production service qualification is claimed by these synthetic queue/TLS tests.
+
 Approval waits for the repository lock are bounded to three seconds. The network
 inactivity timer is suspended only after the complete request body is extracted
 and while server-side handling is active; it resets before writing the response.

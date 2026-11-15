@@ -961,6 +961,82 @@ async fn residual_f6_revoked_and_expired_pending_certificates_rejected() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduled_transfer_resumes_acknowledged_partial_and_reuses_receipt() -> Result<()> {
+    use kagnode_daemon::backup_service::repository::SignedSnapshot;
+    let f = SessionFixture::new().await?;
+    let target = Target {
+        site: "site".into(),
+        server: "server".into(),
+        endpoint: format!("https://{}", f.address),
+        ca: f.root.path().join("ca.pem"),
+        identity_pem: f.root.path().join("client-identity.pem"),
+    };
+    let agent = Agent::new("client", key(), target.clone())?;
+    let token = f.shared.lock().unwrap().approve_tls_node(
+        "client",
+        &agent.public_key(),
+        &fingerprint(&f.root.path().join("client.pem"))?,
+        kagnode_daemon::auth::now(),
+    )?;
+    agent.enroll(&token).await?;
+    let payload = vec![42; 2 * 1024 * 1024];
+    let objects = f.root.path().join("objects");
+    fs::create_dir(&objects)?;
+    let hash = digest(&payload);
+    fs::write(objects.join(&hash), &payload)?;
+    let manifest = Manifest {
+        format: "kagnode-dbackup/v2".into(),
+        site: "site".into(),
+        node: "client".into(),
+        snapshot: "resume".into(),
+        created_at: kagnode_daemon::auth::now(),
+        recipient_generation: "initial".into(),
+        catalog: kagnode_backup_format::Object {
+            sha256: hash.clone(),
+            bytes: payload.len() as u64,
+        },
+        objects: vec![],
+    };
+    let signed = SignedSnapshot {
+        signature: hex::encode(key().sign(&manifest.bytes()?).as_ref()),
+        manifest: manifest.clone(),
+    };
+    let id = {
+        let mut r = f.shared.lock().unwrap();
+        let l = r.begin(&signed, kagnode_daemon::auth::now())?;
+        r.upload(
+            "client",
+            &l.id,
+            &hash,
+            0,
+            &payload[..65536],
+            kagnode_daemon::auth::now(),
+        )?;
+        l.id
+    };
+    drop(agent); // New client process state; acknowledged offset stays at the server.
+    let restarted = Agent::new("client", key(), target)?;
+    assert_eq!(
+        f.shared
+            .lock()
+            .unwrap()
+            .offset("client", &id, &hash, kagnode_daemon::auth::now())?,
+        65536
+    );
+    let start = std::time::Instant::now();
+    let receipt = restarted
+        .push_limited(manifest.clone(), &objects, 1024 * 1024)
+        .await?;
+    assert!(
+        start.elapsed() >= Duration::from_millis(1900),
+        "Explicit bandwidth ceiling was bypassed"
+    );
+    assert_eq!(restarted.push(manifest, &objects).await?, receipt);
+    assert_eq!(f.shared.lock().unwrap().snapshots("client")?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn residual_f6_lock_wait_bounded_without_timing_out_server_processing() -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let f = SessionFixture::new().await?;

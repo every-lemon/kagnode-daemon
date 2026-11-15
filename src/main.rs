@@ -496,6 +496,9 @@ async fn main() -> Result<()> {
             let mut backup_server = tokio::spawn(
                 kagnode_daemon::backup_service::supervisor::supervise(store.clone()),
             );
+            let mut backup_agent = tokio::spawn(
+                kagnode_daemon::backup_service::scheduler::supervise(store.clone()),
+            );
             let local = web::router(app.clone());
             let mut task = tokio::spawn(async move { axum::serve(listener, local).await });
             let web_store = store.clone();
@@ -527,6 +530,7 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     r = tokio::signal::ctrl_c() => break r.map_err(Into::into),
                     _ = terminate.recv() => break Ok(()),
+                    r = &mut backup_agent => break Err(anyhow::anyhow!("Backup agent stopped: {r:?}")),
                     r = &mut backup_server => break Err(anyhow::anyhow!("Backup supervisor stopped: {r:?}")),
                     r = &mut terminal_api => break Err(anyhow::anyhow!("Terminal API stopped: {r:?}")),
                     r = &mut task => break Err(anyhow::anyhow!("Local health API stopped: {r:?}")),
@@ -541,6 +545,7 @@ async fn main() -> Result<()> {
             terminal_api.abort();
             collector.abort();
             backup_server.abort();
+            backup_agent.abort();
             let _ = std::fs::remove_file(store_root_socket);
             std::fs::remove_file(socket)?;
             result?;
