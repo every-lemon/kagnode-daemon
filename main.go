@@ -1,4 +1,4 @@
-// KagNode CLI: real application management and authorized account sign-in.
+// KagNode Daemon: real application management and authorized account sign-in.
 package main
 
 import (
@@ -462,7 +462,7 @@ func main() {
 		case "tui":
 			err = terminalUI()
 		case "--version", "version":
-			fmt.Println("KagNode CLI " + version)
+			fmt.Println("KagNode Daemon " + version)
 		case "login":
 			base, headless := "https://nebulacoder.com", false
 			for i := 1; i < len(args); i++ {
@@ -510,7 +510,7 @@ func main() {
 		case "demo":
 			err = errors.New("fictional demos were removed in 5.0.1; existing data was retained. Use kagnode setup to manage real applications")
 		case "help", "--help", "-h":
-			fmt.Println("KagNode CLI " + version + "\n\n  kagnode | tui                  Keyboard-only application workspace\n  kagnode setup                  Reviewed real application setup\n  kagnode apps --help            Scriptable installation/update manager\n  kagnode core --help            Verified shared UI manager\n  kagnode login                  Browser authorization with PKCE\n  kagnode login --headless       Explicit device-code fallback\n  kagnode whoami                 Check account online\n  kagnode account sync on|off    Control profile refresh\n  kagnode logout                 Revoke and clear credentials\n\nApplication setup requires an explicit reviewed plan. Native capabilities depend on each project and operating system.")
+			fmt.Println("KagNode Daemon " + version + "\n\n  kagnode | tui                  Keyboard-only application workspace\n  kagnode setup                  Reviewed real application setup\n  kagnode apps --help            Scriptable installation/update manager\n  kagnode core --help            Verified shared UI manager\n  kagnode login                  Browser authorization with PKCE\n  kagnode login --headless       Explicit device-code fallback\n  kagnode whoami                 Check account online\n  kagnode account sync on|off    Control profile refresh\n  kagnode logout                 Revoke and clear credentials\n\nApplication setup requires an explicit reviewed plan. Native capabilities depend on each project and operating system.")
 		default:
 			err = errors.New("unknown command; run kagnode help")
 		}

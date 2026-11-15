@@ -219,7 +219,7 @@ func tuiFrame(m *tuiModel, width, height int, color bool) string {
 	var b strings.Builder
 	b.WriteString("\x1b[?25l\x1b[H")
 	row := func(text string) { b.WriteString(text); b.WriteString("\x1b[K\r\n") }
-	row(blue(tuiClip("KagNode. CLI  "+version, width)))
+	row(blue(tuiClip("KagNode. Daemon  "+version, width)))
 	status := m.account + "  ·  Applications"
 	if m.busy {
 		spinner := []string{"◐", "◓", "◑", "◒"}
