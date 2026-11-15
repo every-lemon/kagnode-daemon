@@ -33,8 +33,10 @@ and re-executes with an empty environment. `NoNewPrivileges` is enforced in the
 worker too. See `packaging/kagnode-backup-server.service` for the restricted
 service template. No service is installed or enabled by this source change.
 Repository and controller state must be disjoint. The controller must not give
-the worker read access to its private state. Installer-wide role activation,
-custom-path sandbox generation and real systemd qualification remain unfinished.
+the worker read access to its private state. The reviewed role installer below
+writes an inactive unit with validated paths and numeric user/group bindings.
+Automatic account provisioning, existing-host adoption, service activation and
+real systemd qualification remain unfinished.
 
 Remote requests use mutual TLS plus separately signed, server/site-bound requests.
 Enrollment requires a short-lived, one-use administrator approval bound to the
@@ -47,8 +49,9 @@ They cannot call retention, deletion or restore-attestation methods. Administrat
 operations use an owner-only Unix socket. Daemon exposes status and action routes
 under `/api/v1/backup-server/`, protected by its local administrator session,
 origin/CSRF checks and recent authentication. The generic `/actions` passthrough
-is removed. Explicit POST routes are `approve`, `revoke`, `policy`, `pin`, `delete`
-and `garbage-collection`; read-only snapshots use `GET snapshots/:node`.
+is removed. Explicit POST routes are `approve`, `revoke`, `rotate-certificate`,
+`policy`, `pin`, `delete` and `garbage-collection`; read-only snapshots use
+`GET snapshots/:node`. The JSON contract below covers all current read routes.
 All mutations except adding a pin require a one-use server confirmation from
 `POST confirm` with a fresh local password. It expires after 60 seconds and is
 bound to the session and exact serialized operation; supply it as
@@ -61,13 +64,15 @@ new integrations must retain the control-plane authorization boundary.
 The outbound Rust agent verifies the configured CA/hostname, refuses redirects
 and plaintext URLs, signs requests and resumes partial uploads. Repeated completed
 uploads return the original ciphertext receipt. `push_all` reuses one immutable
-manifest for every configured server and records independent failures. It does
-not yet calculate K health or implement a durable transfer scheduler.
+manifest for every configured server and records independent failures. The separate
+durable scheduler below persists per-target jobs, backoff and receipts; neither
+helper computes qualified K health or proves native application recoverability.
 
 The readiness policy refuses unsafe or stale nodes, uses sustained busy/ready
 hysteresis and supports throttling after the selected deferral. Capacity estimates
 assume no compression or sharing savings. Policy setup must explicitly choose
-interval, recovery goal and retention; there is no automatic schedule.
+interval, recovery goal and retention. No schedule is enabled by default; a
+private agent configuration explicitly enables the durable scheduler.
 
 ## Checks
 
