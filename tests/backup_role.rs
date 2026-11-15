@@ -111,6 +111,14 @@ fn inactive_install_requires_valid_tls_and_preserves_existing_files() -> Result<
     let units = t.path().join("units");
     fs::create_dir(&units)?;
     let destination = controller.join("backup-server.json");
+    let alias_dir = t.path().join("alias");
+    fs::create_dir(&alias_dir)?;
+    let noncanonical_binary = alias_dir.join("../worker");
+    assert!(
+        role::installation_plan(&root, &source, &noncanonical_binary, &units, &destination)
+            .is_err(),
+        "unit paths must not contain parent components"
+    );
     let plan = role::installation_plan(&root, &source, &binary, &units, &destination)?;
     fs::write(&binary, b"changed binary")?;
     assert!(role::install(&plan).is_err());

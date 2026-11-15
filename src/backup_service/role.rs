@@ -327,29 +327,17 @@ fn build_install(
     // Fixed operations only. Installation leaves the unit disabled; activation
     // follows disposable native qualification and an owner's explicit action.
     let service_config = root.join("backup-server/config.json");
-    let unit = format!(
-        "[Unit]\nDescription=KagNode Backup Server\nAfter=network.target\n[Service]\nType=simple\nUser={}\nGroup={}\nExecStart={} serve --config {}\nRestart=on-failure\nRestartSec=5\nRuntimeDirectory=kagnode-backup\nRuntimeDirectoryMode=0750\nUMask=0077\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\nPrivateTmp=true\nPrivateDevices=true\nCapabilityBoundingSet=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nReadWritePaths={} /run/kagnode-backup\nInaccessiblePaths={}\n[Install]\nWantedBy=multi-user.target\n",
+    for path in [root, unit_directory] {
+        validate_unit_path(path)?;
+    }
+    let unit = service_unit(
         worker.uid(),
         controller_gid,
-        binary.display(),
-        service_config.display(),
-        config.repository.display(),
-        controller_dir.display()
-    );
-    for p in [
-        root,
-        unit_directory,
+        binary,
+        &service_config,
+        &config.repository,
         controller_dir,
-        config.repository.as_path(),
-    ] {
-        ensure!(
-            p.is_absolute()
-                && p.to_string_lossy()
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b)),
-            "Invalid service destination path"
-        );
-    }
+    )?;
     let mut plan = Installation {
         root: root.into(),
         config_source: source.into(),
@@ -486,4 +474,69 @@ pub fn install(plan: &Installation) -> Result<Value> {
     fs::rename(temporary, &receipt)?;
     fs::File::open(&dir)?.sync_all()?;
     Ok(r)
+}
+
+// Paths interpolated into a systemd unit must be checked before formatting:
+// quoting is intentionally not supported, nor are systemd specifiers/expansions.
+fn validate_unit_path(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_absolute()
+            && path
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "Invalid service destination path"
+    );
+    Ok(())
+}
+fn service_unit(
+    worker_uid: u32,
+    controller_gid: u32,
+    binary: &Path,
+    service_config: &Path,
+    repository: &Path,
+    controller_dir: &Path,
+) -> Result<String> {
+    for path in [binary, service_config, repository, controller_dir] {
+        validate_unit_path(path)?;
+    }
+    Ok(format!(
+        "[Unit]\nDescription=KagNode Backup Server\nAfter=network.target\n[Service]\nType=simple\nUser={}\nGroup={}\nExecStart={} serve --config {}\nRestart=on-failure\nRestartSec=5\nRuntimeDirectory=kagnode-backup\nRuntimeDirectoryMode=0750\nUMask=0077\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\nPrivateTmp=true\nPrivateDevices=true\nCapabilityBoundingSet=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nReadWritePaths={} /run/kagnode-backup\nInaccessiblePaths={}\n[Install]\nWantedBy=multi-user.target\n",
+        worker_uid,
+        controller_gid,
+        binary.display(),
+        service_config.display(),
+        repository.display(),
+        controller_dir.display()
+    ))
+}
+
+#[cfg(test)]
+mod unit_path_tests {
+    use super::*;
+    #[test]
+    fn worker_and_config_paths_are_validated_before_unit_rendering() {
+        let safe = Path::new("/srv/kagnode/backup-server");
+        for bad in [
+            "/srv/worker binary",
+            "/srv/worker\nExecStart=/bin/false",
+            "/srv/%n",
+            "/srv/$BIN",
+            "/srv/worker;evil",
+            "/srv/../worker",
+            "relative",
+            "/srv/é",
+        ] {
+            assert!(service_unit(1001, 1002, Path::new(bad), safe, safe, safe).is_err());
+            assert!(service_unit(1001, 1002, safe, Path::new(bad), safe, safe).is_err());
+        }
+        let unit =
+            service_unit(1001, 1002, safe, Path::new("/srv/config.json"), safe, safe).unwrap();
+        assert!(
+            unit.contains("ExecStart=/srv/kagnode/backup-server serve --config /srv/config.json\n")
+        );
+    }
 }
