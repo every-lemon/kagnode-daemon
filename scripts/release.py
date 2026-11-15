@@ -243,7 +243,7 @@ cp -a {root}/. %{{buildroot}}/
         shutil.copyfile(rpms[0], out / f"{package}_{version}_{arch}.rpm")
 
 
-def go_notices():
+def go_notices(arch):
     """Carry license/patent notices from the actual linked standard-library tree."""
     goroot = Path(
         subprocess.check_output(["go", "env", "GOROOT"], text=True).strip()
@@ -290,6 +290,7 @@ def build(out, native_cli=True):
         ["git", "status", "--porcelain", "--untracked-files=normal"],
         cwd=ROOT,
         text=True,
+        env={**os.environ, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": arch},
     ).strip():
         raise ValueError(
             "Release builds require a clean committed source tree; commit reviewed changes before creating provenance"
@@ -324,8 +325,8 @@ def build(out, native_cli=True):
         with tempfile.TemporaryDirectory(prefix="kagnode-cli-") as temporary:
             stage = Path(temporary)
             notices = stage / "THIRD-PARTY-NOTICES.txt"
-            notices.write_text(go_notices())
             for arch in ["amd64", "arm64"]:
+                notices.write_text(go_notices(arch))
                 binary = stage / "kagnode"
                 subprocess.run(
                     [
