@@ -65,6 +65,11 @@ with tempfile.TemporaryDirectory(prefix="kagnode-rust-tui-") as temporary:
             drain(0.5)
             assert process.poll() is None
             assert b"KagNode. Daemon" in output
+            os.write(master, b"\x10")
+            drain(0.3)
+            assert b"Commands" in output
+            os.write(master, b"\x1b")
+            drain(0.2)
             os.write(master, b"/netctl\r")
             drain(0.3)
             # Browse, scroll and cancel; service-changing keys are deliberately absent.
