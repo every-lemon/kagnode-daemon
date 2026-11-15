@@ -11,6 +11,8 @@ Existing commands, installation directories and service names keep working under
 those identifiers. The compatibility Python manager retains its existing product
 coverage; the Rust catalog includes Network.
 
+Canonical sources: [KagNode. Proxy](https://github.com/every-lemon/kagnode-proxy) and [KagNode. Network](https://github.com/every-lemon/kagnode-network). Catalog IDs remain `proxy-manager` (`pm` alias) and `netctl`; installed paths and service identities are unchanged. The compatibility manager accepts the previous Proxy identity only for its existing release manifests, while fetching releases from the new repository. Signature verification still uses the original bytes.
+
 ---
 
 <!-- Retained operational documentation; historical version labels refer to their original release. -->
