@@ -120,3 +120,68 @@ fn f1_node_slots_and_progress_limited_renewal() {
     assert!(r.renew("evil", &a.id, 801).is_err());
     assert!(r.renew("evil", &a.id, 86500).is_err());
 }
+
+#[test]
+fn f2_failed_uploads_do_not_charge_other_nodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut r = Repository::create(
+        &tmp.path().join("s"),
+        "site",
+        "server",
+        &policy(Some(4 * 1024 * 1024)),
+    )
+    .unwrap();
+    enroll(&mut r, "evil", 1);
+    enroll(&mut r, "victim", 2);
+    let good = blob("good", 1, 1024 * 1024);
+    let bad = blob("bad", 2, 1024 * 1024);
+    let a = r
+        .begin(&signed("evil", 1, "s1", 100, b"cat", &[good.clone()]), 100)
+        .unwrap();
+    for _ in 0..4 {
+        assert!(
+            r.upload("evil", &a.id, &digest(&good), 0, &bad, 100)
+                .is_err()
+        );
+    }
+    let b = r
+        .begin(
+            &signed("victim", 2, "s1", 100, b"cat", &[good.clone()]),
+            100,
+        )
+        .unwrap();
+    assert!(
+        r.upload("victim", &b.id, &digest(&good), 0, &good, 100)
+            .is_ok()
+    );
+}
+#[test]
+fn f3_abandoned_partials_are_collected_and_quota_is_enforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("s");
+    let mut r = Repository::create(&root, "site", "server", &policy(None)).unwrap();
+    enroll(&mut r, "n", 1);
+    let data = blob("data", 1, 1024 * 1024);
+    let a = r
+        .begin(&signed("n", 1, "s1", 100, b"cat", &[data.clone()]), 100)
+        .unwrap();
+    r.upload("n", &a.id, &digest(&data), 0, &data[..100], 100)
+        .unwrap();
+    r.gc(2000).unwrap();
+    assert_eq!(fs::read_dir(root.join("partial/n")).unwrap().count(), 0);
+    // Sparse synthetic partial charges the full durable size without writing 64 MiB.
+    let b = r
+        .begin(&signed("n", 1, "s2", 2000, b"cat", &[data.clone()]), 2000)
+        .unwrap();
+    let partial = root
+        .join("partial/n")
+        .join(format!("{}-{}", b.id, digest(&data)));
+    fs::File::create(&partial)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    assert!(
+        r.upload("n", &b.id, &digest(b"cat"), 0, b"cat", 2000)
+            .is_err()
+    );
+}

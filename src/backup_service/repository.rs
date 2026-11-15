@@ -483,6 +483,7 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
                 },
             });
         }
+        self.cleanup_partials(now)?;
         self.check_lease_slots(&m.node, "", now)?;
         let missing = self.missing(m)?;
         let needed = missing.iter().try_fold(0u64, |n, o| {
@@ -605,34 +606,91 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
         tx.commit()?;
         Ok((now + 900).min(started + 86400))
     }
-    fn account_bytes(&mut self, node: &str, bytes: u64, now: i64) -> Result<()> {
+    fn check_transfer_budget(&self, node: &str, bytes: u64, now: i64) -> Result<String> {
         let date = chrono::DateTime::from_timestamp(now, 0)
             .ok_or_else(|| anyhow::anyhow!("Invalid clock"))?;
         let month = date.format("%Y-%m").to_string();
         let p = self.policy()?;
-        let tx = self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let n: i64 = tx.query_row(
+        let n: i64 = self.db.query_row(
             "SELECT COALESCE(SUM(bytes),0) FROM usage WHERE month=?1 AND node=?2",
             params![month, node],
             |r| r.get(0),
         )?;
-        let all: i64 = tx.query_row(
+        let all: i64 = self.db.query_row(
             "SELECT COALESCE(SUM(bytes),0) FROM usage WHERE month=?1",
             [&month],
             |r| r.get(0),
         )?;
         ensure!(
             p.monthly_node_bytes
+                .or(p.monthly_server_bytes.map(|cap| cap / 2))
                 .is_none_or(|cap| (n as u64).saturating_add(bytes) <= cap)
                 && p.monthly_server_bytes
                     .is_none_or(|cap| (all as u64).saturating_add(bytes) <= cap),
             "Monthly transfer cap reached; administrator override required"
         );
-        tx.execute("INSERT INTO usage VALUES(?1,?2,?3) ON CONFLICT(month,node) DO UPDATE SET bytes=bytes+excluded.bytes",params![month,node,i64::try_from(bytes)?])?;
-        tx.commit()?;
+        Ok(month)
+    }
+    fn partial_bytes(&self, node: &str) -> Result<u64> {
+        let mut size = 0u64;
+        for entry in fs::read_dir(self.root.join("partial").join(node))? {
+            let m = entry?.path().symlink_metadata()?;
+            ensure!(
+                m.is_file() && !m.file_type().is_symlink() && m.nlink() == 1,
+                "Unsafe partial object"
+            );
+            size = size
+                .checked_add(m.len())
+                .ok_or_else(|| anyhow::anyhow!("Partial size overflow"))?;
+        }
+        Ok(size)
+    }
+    /// Fixed conservative limits until administrator-configured storage quotas are qualified.
+    fn check_node_storage(&self, node: &str, more: u64) -> Result<()> {
+        let partial = self.partial_bytes(node)?;
+        ensure!(
+            partial.saturating_add(more) <= 64 * 1024 * 1024,
+            "Node partial-upload quota reached"
+        );
+        let stored: i64 = self.db.query_row(
+            "SELECT COALESCE(SUM(bytes),0) FROM objects WHERE node=?1",
+            [node],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            (stored as u64).saturating_add(partial).saturating_add(more) <= 1024u64.pow(4),
+            "Node storage quota reached"
+        );
         Ok(())
+    }
+    fn cleanup_partials(&self, now: i64) -> Result<usize> {
+        let mut removed = 0;
+        for dir in fs::read_dir(self.root.join("partial"))? {
+            let dir = dir?;
+            let node = dir.file_name().to_string_lossy().into_owned();
+            ensure!(
+                identifier(&node) && dir.file_type()?.is_dir(),
+                "Unsafe partial node directory"
+            );
+            for entry in fs::read_dir(dir.path())? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // IDs are hexadecimal, but use the rightmost delimiter for compatibility.
+                let Some((lease, object)) = name.rsplit_once('-') else {
+                    continue;
+                };
+                if !identifier(lease) || !hash(object) {
+                    continue;
+                }
+                let active: i64 = self.db.query_row("SELECT COUNT(*) FROM leases WHERE id=?1 AND node=?2 AND finished=0 AND expires>=?3", params![lease,node,now], |r|r.get(0))?;
+                if active == 0 {
+                    ensure!(entry.file_type()?.is_file(), "Unsafe partial entry");
+                    fs::remove_file(entry.path())?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
     pub fn offset(&self, node: &str, lease: &str, object: &str, now: i64) -> Result<u64> {
         let s = self.lease(node, lease, now)?;
@@ -685,7 +743,9 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             avail.saturating_sub(self.policy()?.reserve(total)) >= data.len() as u64,
             "Storage reserve reached"
         );
-        self.account_bytes(node, data.len() as u64, now)?;
+        self.check_node_storage(node, data.len() as u64)?;
+        // Provisional chunks consume storage quota, not accepted-transfer budget.
+        let month = self.check_transfer_budget(node, o.bytes, now)?;
         let path = self
             .root
             .join("partial")
@@ -702,8 +762,11 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             file.metadata()?.len() == offset && file.metadata()?.nlink() == 1,
             "Partial upload changed"
         );
-        file.write_all(data)?;
-        file.sync_all()?;
+        if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+            file.set_len(offset)?;
+            file.sync_all()?;
+            return Err(error.into());
+        }
         let size = offset + data.len() as u64;
         drop(file);
         if size == o.bytes {
@@ -720,10 +783,15 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
                 fs::rename(path, &dest)?;
                 fs::File::open(dest.parent().unwrap())?.sync_all()?;
             }
-            self.db.execute(
+            let tx = self.db.transaction()?;
+            let added = tx.execute(
                 "INSERT OR IGNORE INTO objects VALUES(?1,?2,?3,?4)",
                 params![node, object, i64::try_from(size)?, now],
             )?;
+            if added != 0 {
+                tx.execute("INSERT INTO usage VALUES(?1,?2,?3) ON CONFLICT(month,node) DO UPDATE SET bytes=bytes+excluded.bytes", params![month,node,i64::try_from(size)?])?;
+            }
+            tx.commit()?;
         }
         self.db.execute(
             "UPDATE lease_progress SET bytes=bytes+?1 WHERE id=?2",
@@ -951,6 +1019,7 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
     }
     pub fn gc(&mut self, now: i64) -> Result<usize> {
         self.check_volume()?;
+        self.cleanup_partials(now)?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
