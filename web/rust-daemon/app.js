@@ -9,13 +9,17 @@
     if (cls) n.className = cls;
     return n;
   };
-  async function api(path, body) {
+  async function api(path, body, extra = {}) {
     const r = await fetch("/api/v1/" + path, {
       method: body === undefined ? "GET" : "POST",
       headers:
         body === undefined
           ? {}
-          : { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+          : {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": csrf,
+              ...extra,
+            },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (r.status === 401) {
@@ -45,6 +49,825 @@
     row.append(input);
     form.append(row);
     return input;
+  }
+  /* ---------- Backups: local administrator pages over the JSON contract in
+     docs/BACKUP-SERVER.md. Nothing here restores data or claims a restore test. */
+  const BACKUP = "backup-server/";
+  const NAME = /^[A-Za-z0-9_-]{1,64}$/;
+  const HASH = /^[0-9a-f]{64}$/;
+  const SAFE = (n) => Number.isSafeInteger(n) && n >= 0;
+  function bytes(n) {
+    if (!Number.isFinite(n)) return "—";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let v = n,
+      i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return (i ? v.toFixed(v >= 100 ? 0 : 1) : String(v)) + " " + units[i];
+  }
+  function seconds(n) {
+    if (!Number.isFinite(n)) return "—";
+    if (n < 60) return n + " s";
+    const parts = [];
+    for (const [unit, size] of [
+      ["d", 86400],
+      ["h", 3600],
+      ["min", 60],
+    ]) {
+      if (n >= size) {
+        parts.push(Math.floor(n / size) + " " + unit);
+        n %= size;
+      }
+    }
+    return parts.slice(0, 2).join(" ");
+  }
+  function when(t) {
+    if (!Number.isFinite(t) || t <= 0) return "—";
+    const d = new Date(t * 1000),
+      n = el("time", d.toLocaleString());
+    n.dateTime = d.toISOString();
+    n.title = d.toISOString();
+    return n;
+  }
+  function badge(text, tone) {
+    return el("span", text, "badge" + (tone ? " " + tone : ""));
+  }
+  function table(caption, headers, rows, actions) {
+    const wrap = el("div", undefined, "table-wrap"),
+      t = el(
+        "table",
+        undefined,
+        "data-table" + (actions ? " has-actions" : ""),
+      ),
+      head = el("tr");
+    t.append(el("caption", caption));
+    for (const h of headers) {
+      const th = el("th", h);
+      th.scope = "col";
+      head.append(th);
+    }
+    const thead = el("thead"),
+      body = el("tbody");
+    thead.append(head);
+    for (const cells of rows) {
+      const tr = el("tr");
+      for (const c of cells) {
+        const td = el("td");
+        td.append(c instanceof Node ? c : document.createTextNode(String(c)));
+        tr.append(td);
+      }
+      body.append(tr);
+    }
+    t.append(thead, body);
+    wrap.append(t);
+    return wrap;
+  }
+  function facts(pairs) {
+    const dl = el("dl", undefined, "facts");
+    for (const [k, v] of pairs) {
+      const row = el("div");
+      row.append(el("dt", k));
+      const dd = el("dd");
+      dd.append(v instanceof Node ? v : document.createTextNode(String(v)));
+      row.append(dd);
+      dl.append(row);
+    }
+    return dl;
+  }
+  /* Pages rebuild their panels after every action, which destroys the button
+     that opened a dialog; remember it and restore focus to its equivalent. */
+  let returnTo = null;
+  function rememberOpener() {
+    const b = document.activeElement;
+    returnTo =
+      b && b !== document.body
+        ? {
+            key: b.getAttribute("aria-label") || b.textContent.trim(),
+            section: b.closest("section")?.querySelector("h2")?.textContent,
+          }
+        : null;
+  }
+  function restoreFocus(root) {
+    const r = returnTo;
+    returnTo = null;
+    if (!r) return;
+    const match = [...root.querySelectorAll("button, select")].find(
+      (n) => (n.getAttribute("aria-label") || n.textContent.trim()) === r.key,
+    );
+    const target =
+      match ||
+      [...root.querySelectorAll("h2")].find((h) => h.textContent === r.section);
+    if (!target) return;
+    if (!target.matches("button, select")) target.tabIndex = -1;
+    target.focus();
+  }
+  /* A modal form. onSubmit may throw to show an error and keep the dialog open.
+     Typed values are cleared from the DOM whenever the dialog closes. */
+  function formDialog({ title, intro, fields, submit, danger, onSubmit }) {
+    return new Promise((resolve) => {
+      const dialog = el("dialog"),
+        form = el("form", undefined, "stack"),
+        inputs = {},
+        alert = el("p", undefined, "form-error"),
+        actions = el("div", undefined, "actions"),
+        cancel = el("button", "Cancel", "button"),
+        ok = el("button", submit, "button " + (danger ? "danger" : "primary"));
+      let done = false;
+      rememberOpener();
+      dialog.setAttribute("aria-label", title);
+      alert.setAttribute("role", "alert");
+      cancel.type = "button";
+      form.append(el("h2", title));
+      if (intro) form.append(el("p", intro, "muted"));
+      for (const f of fields) {
+        const row = el("label", f.label),
+          input = el("input");
+        input.name = f.name;
+        input.type = f.type || "text";
+        input.required = f.required !== false;
+        input.autocomplete = f.autocomplete || "off";
+        if (f.pattern) input.pattern = f.pattern;
+        if (f.placeholder) input.placeholder = f.placeholder;
+        if (f.spellcheck === false) input.spellcheck = false;
+        row.append(input);
+        if (f.hint) row.append(el("small", f.hint));
+        form.append(row);
+        inputs[f.name] = input;
+      }
+      actions.append(cancel, ok);
+      form.append(alert, actions);
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        ok.disabled = true;
+        alert.textContent = "";
+        try {
+          const values = {};
+          for (const f of fields) values[f.name] = inputs[f.name].value;
+          await onSubmit(values);
+          done = true;
+          dialog.close();
+        } catch (error) {
+          alert.textContent = error.message;
+        } finally {
+          ok.disabled = false;
+        }
+      };
+      cancel.onclick = () => dialog.close();
+      dialog.addEventListener(
+        "close",
+        () => {
+          for (const input of Object.values(inputs)) input.value = "";
+          dialog.remove();
+          resolve(done);
+        },
+        { once: true },
+      );
+      dialog.append(form);
+      document.body.append(dialog);
+      dialog.showModal();
+      Object.values(inputs)[0]?.focus();
+    });
+  }
+  /* Password confirmation, then the identical typed request with the one-use
+     confirmation header. Network failures are reported as uncertain, never retried. */
+  async function confirmed({
+    route,
+    request,
+    title,
+    intro,
+    submit,
+    danger,
+    extra = [],
+    after,
+  }) {
+    let result,
+      uncertain = false;
+    const done = await formDialog({
+      title,
+      intro,
+      submit,
+      danger,
+      fields: [
+        ...extra,
+        {
+          name: "password",
+          label: "Your Daemon password",
+          type: "password",
+          autocomplete: "current-password",
+          hint: "Entered locally to confirm this action. It is not stored.",
+        },
+      ],
+      onSubmit: async (v) => {
+        const req = typeof request === "function" ? request(v) : request;
+        try {
+          const c = await api(BACKUP + "confirm", {
+            password: v.password,
+            request: req,
+          });
+          result = await api(BACKUP + route, req, {
+            "x-backup-confirmation": c.confirmation,
+          });
+        } catch (error) {
+          if (error instanceof TypeError) {
+            uncertain = true;
+            throw Error(
+              "The connection failed. The action may or may not have completed. Check the current status before trying again.",
+            );
+          }
+          throw error;
+        }
+        if (after) await after(result, req);
+      },
+    });
+    return { done, result, uncertain };
+  }
+  function actionButton(label, context, onclick, danger) {
+    const b = el("button", label, "button small" + (danger ? " danger" : ""));
+    b.type = "button";
+    b.setAttribute("aria-label", label + " " + context);
+    b.onclick = onclick;
+    return b;
+  }
+  const AGENT = {
+    not_observed:
+      "No backup agent status has been recorded on this host yet. This page shows the last worker observation, not a new probe.",
+    disabled:
+      "This host is not set up to send backups. Create the private backup-agent.json described in the backup documentation to enable scheduled transfers.",
+    paused: "Scheduled transfers are paused in the local configuration.",
+    deferred:
+      "Transfers are waiting because the host is busy, stale or not ready. They continue automatically when readiness returns.",
+    transferring: "A snapshot is being sent to a backup server.",
+    scheduled: "The next snapshot is scheduled. Nothing is transferring now.",
+    source_blocked:
+      "The prepared snapshot or its configuration needs attention before the next job can be queued.",
+    blocked:
+      "The agent configuration or queue needs review. Check the private agent configuration and the queue below.",
+  };
+  const POLICY_FIELDS = [
+    ["interval_seconds", "Backup interval", "seconds", false],
+    ["recovery_point_seconds", "Recovery point goal", "seconds", false],
+    ["keep_snapshots", "Snapshots to keep", "count", false],
+    ["reserve_bytes", "Reserve space", "bytes", false],
+    ["max_deferral_seconds", "Longest allowed deferral", "seconds", false],
+    ["bandwidth_percent", "Bandwidth share", "percent", false],
+    ["monthly_node_bytes", "Monthly limit per node", "bytes", true],
+    ["monthly_server_bytes", "Monthly limit for the server", "bytes", true],
+    ["required_copies", "Required copies", "count", false],
+  ];
+  function hintFor(unit, v) {
+    if (v === null || v === undefined || v === "") return "";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "";
+    return unit === "seconds"
+      ? "= " + seconds(n)
+      : unit === "bytes"
+        ? "= " + bytes(n)
+        : unit === "percent"
+          ? "= " + n + " % of the available link"
+          : "";
+  }
+  async function backupPage() {
+    document.querySelector("h1").textContent = "Backups";
+    const root = el("div", undefined, "stack");
+    content.append(root);
+    let selected = "";
+    const notify = (text) => (status.textContent = text);
+    async function refresh() {
+      try {
+        await load();
+      } finally {
+        restoreFocus(root);
+      }
+    }
+    async function load() {
+      let server, agent;
+      try {
+        [server, agent] = await Promise.all([
+          api(BACKUP + "status"),
+          api("backup-agent/status"),
+        ]);
+      } catch (error) {
+        notify(error.message);
+        return;
+      }
+      root.replaceChildren(summary(server), agentPanel(agent));
+      if (server.enabled === false) return;
+      try {
+        const [nodes, policy] = await Promise.all([
+          api(BACKUP + "nodes"),
+          api(BACKUP + "policy"),
+        ]);
+        if (!nodes.nodes.some((n) => n.node === selected))
+          selected = nodes.nodes[0]?.node || "";
+        root.append(
+          nodesPanel(nodes.nodes),
+          await snapshotsPanel(nodes.nodes),
+          policyPanel(policy.policy),
+        );
+      } catch (error) {
+        notify(error.message);
+      }
+    }
+    function summary(s) {
+      const p = el("section", undefined, "panel stack");
+      p.append(el("h2", "Backup server"));
+      if (s.enabled === false) {
+        p.append(
+          el(
+            "p",
+            "This host is not configured as a backup server. Nothing is being stored here.",
+          ),
+          el(
+            "p",
+            "Setup is done locally by the administrator (see the backup server documentation); this page then shows its status, nodes and snapshots.",
+            "muted",
+          ),
+        );
+        return p;
+      }
+      const total = Number(s.storage_total_bytes),
+        free = Number(s.storage_available_bytes),
+        used = total - free;
+      const meter = el("progress");
+      meter.max = total || 1;
+      meter.value = Number.isFinite(used) ? used : 0;
+      meter.setAttribute("aria-label", "Backup storage used");
+      p.append(
+        facts([
+          ["Site", s.site],
+          ["Server", s.server],
+          ["Process", s.process_id],
+          ["Storage", bytes(free) + " free of " + bytes(total)],
+        ]),
+        meter,
+      );
+      if (total && free / total < 0.1)
+        p.append(
+          badge("Low free space", "warn"),
+          el(
+            "p",
+            "Less than 10% of the backup volume is free. Review retention before new snapshots are refused.",
+            "muted",
+          ),
+        );
+      p.append(
+        el(
+          "p",
+          (s.verification ? String(s.verification) + " " : "") +
+            "A ciphertext receipt proves the stored copy matches what was sent. It is not a restore test.",
+          "muted",
+        ),
+      );
+      return p;
+    }
+    function agentPanel(a) {
+      const p = el("section", undefined, "panel stack"),
+        st = a.status || {},
+        state = st.state || "not_observed";
+      p.append(el("h2", "Sending from this host"));
+      const tone =
+        state === "blocked" || state === "source_blocked"
+          ? "bad"
+          : state === "deferred" || state === "paused"
+            ? "warn"
+            : state === "transferring" || state === "scheduled"
+              ? "ok"
+              : "";
+      p.append(badge(state.replace("_", " "), tone));
+      p.append(el("p", AGENT[state] || "Unknown state: " + state));
+      if (st.error) p.append(el("p", String(st.error), "form-error"));
+      const queue = (st.queue && st.queue.transfers) || [];
+      if (queue.length)
+        p.append(
+          table(
+            "Latest transfers (most recent 64)",
+            [
+              "Snapshot",
+              "State",
+              "Attempts",
+              "Next attempt",
+              "Receipt",
+              "Notes",
+            ],
+            queue.map((t) => [
+              t.snapshot,
+              badge(
+                t.state,
+                t.state === "completed"
+                  ? "ok"
+                  : t.state === "blocked"
+                    ? "bad"
+                    : "",
+              ),
+              t.attempts,
+              t.state === "pending" ? when(t.next_attempt) : "—",
+              t.receipt
+                ? el(
+                    "span",
+                    "Ciphertext verified " +
+                      new Date(t.receipt.verified_at * 1000).toLocaleString() +
+                      " · not a restore test",
+                  )
+                : "—",
+              t.error || "",
+            ]),
+          ),
+        );
+      p.append(
+        el(
+          "p",
+          "Last recorded worker observation; this page does not probe remote servers.",
+          "muted",
+        ),
+      );
+      return p;
+    }
+    function nodesPanel(nodes) {
+      const p = el("section", undefined, "panel stack");
+      p.append(el("h2", "Nodes"));
+      if (!nodes.length) p.append(el("p", "No nodes have been approved yet."));
+      else
+        p.append(
+          table(
+            "Nodes allowed to send backups",
+            ["Node", "Certificate", "State", "Actions"],
+            nodes.map((n) => {
+              const cert = el("code", n.certificate_sha256.slice(0, 16) + "…");
+              cert.title = n.certificate_sha256;
+              const act = el("div", undefined, "actions");
+              if (!n.revoked) {
+                act.append(
+                  actionButton("Rotate certificate", n.node, () => rotate(n)),
+                  actionButton("Revoke", n.node, () => revoke(n), true),
+                );
+              }
+              return [
+                n.node,
+                cert,
+                n.revoked
+                  ? badge("Revoked", "bad")
+                  : n.enrolled
+                    ? badge("Enrolled", "ok")
+                    : badge("Waiting for enrollment", "warn"),
+                act,
+              ];
+            }),
+            true,
+          ),
+        );
+      const add = el("button", "Approve a node", "button primary");
+      add.type = "button";
+      add.onclick = approve;
+      p.append(add);
+      return p;
+    }
+    async function approve() {
+      let token;
+      const { done } = await confirmed({
+        route: "approve",
+        title: "Approve a node",
+        intro:
+          "The node sends you its public key and certificate fingerprint. Approving creates a one-use enrollment token that expires in 10 minutes.",
+        submit: "Approve node",
+        extra: [
+          {
+            name: "node",
+            label: "Node name",
+            pattern: "[A-Za-z0-9_\\-]{1,64}",
+            hint: "Letters, numbers, - and _ (up to 64).",
+          },
+          {
+            name: "public_key",
+            label: "Node signing public key",
+            pattern: "[0-9a-f]{64}",
+            spellcheck: false,
+            hint: "64 lowercase hexadecimal characters.",
+          },
+          {
+            name: "certificate_sha256",
+            label: "Node certificate fingerprint (SHA-256)",
+            pattern: "[0-9a-f]{64}",
+            spellcheck: false,
+            hint: "64 lowercase hexadecimal characters.",
+          },
+        ],
+        request: (v) => {
+          if (!NAME.test(v.node)) throw Error("Use a valid node name.");
+          if (!HASH.test(v.public_key) || !HASH.test(v.certificate_sha256))
+            throw Error(
+              "Keys and fingerprints are 64 lowercase hex characters.",
+            );
+          return {
+            action: "approve",
+            node: v.node,
+            public_key: v.public_key,
+            certificate_sha256: v.certificate_sha256,
+          };
+        },
+        after: (r) => (token = r),
+      });
+      if (done && token) await showToken(token);
+      await refresh();
+    }
+    function showToken(result) {
+      return new Promise((resolve) => {
+        const dialog = el("dialog"),
+          box = el("div", undefined, "stack"),
+          field = el("input"),
+          close = el("button", "I have copied it", "button primary");
+        dialog.setAttribute("aria-label", "Enrollment token");
+        field.readOnly = true;
+        field.value = result.token;
+        field.setAttribute("aria-label", "One-use enrollment token");
+        field.onfocus = () => field.select();
+        close.onclick = () => dialog.close();
+        box.append(
+          el("h2", "Enrollment token for " + result.node),
+          el(
+            "p",
+            "Give this one-use token to the node administrator privately. It is shown only now and expires in " +
+              Math.round(result.expires_in / 60) +
+              " minutes.",
+          ),
+          field,
+          close,
+        );
+        dialog.append(box);
+        document.body.append(dialog);
+        dialog.addEventListener(
+          "close",
+          () => {
+            field.value = "";
+            dialog.remove();
+            resolve();
+          },
+          { once: true },
+        );
+        dialog.showModal();
+        field.focus();
+      });
+    }
+    async function revoke(n) {
+      const r = await confirmed({
+        route: "revoke",
+        title: "Revoke " + n.node,
+        intro:
+          "The node's certificate stops working immediately. Existing snapshots are kept.",
+        submit: "Revoke node",
+        danger: true,
+        request: { action: "revoke", node: n.node },
+      });
+      if (r.done) notify("Revoked " + n.node + ".");
+      await refresh();
+    }
+    async function rotate(n) {
+      const r = await confirmed({
+        route: "rotate-certificate",
+        title: "Rotate certificate for " + n.node,
+        intro:
+          "Switch this node to its new certificate. The old certificate stops working and can never be approved again.",
+        submit: "Rotate certificate",
+        extra: [
+          {
+            name: "certificate_sha256",
+            label: "New certificate fingerprint (SHA-256)",
+            pattern: "[0-9a-f]{64}",
+            spellcheck: false,
+            hint:
+              "Current: " +
+              n.certificate_sha256.slice(0, 16) +
+              "… · 64 lowercase hexadecimal characters.",
+          },
+        ],
+        request: (v) => {
+          if (!HASH.test(v.certificate_sha256))
+            throw Error("The fingerprint is 64 lowercase hex characters.");
+          return {
+            action: "rotate_certificate",
+            node: n.node,
+            expected_sha256: n.certificate_sha256,
+            certificate_sha256: v.certificate_sha256,
+          };
+        },
+      });
+      if (r.done) notify("Certificate rotated for " + n.node + ".");
+      await refresh();
+    }
+    async function snapshotsPanel(nodes) {
+      const p = el("section", undefined, "panel stack");
+      p.append(el("h2", "Snapshots"));
+      if (!nodes.length) {
+        p.append(el("p", "Snapshots appear here once a node has sent one."));
+        return p;
+      }
+      const pick = el("select");
+      pick.setAttribute("aria-label", "Node");
+      for (const n of nodes) {
+        const o = el("option", n.node);
+        o.value = n.node;
+        pick.append(o);
+      }
+      pick.value = selected;
+      pick.onchange = () => {
+        selected = pick.value;
+        refresh();
+      };
+      p.append(pick);
+      let data;
+      try {
+        data = await api(BACKUP + "snapshots/" + encodeURIComponent(selected));
+      } catch (error) {
+        p.append(el("p", error.message, "form-error"));
+        return p;
+      }
+      const protectedIds = new Set(data.protected || []);
+      if (!data.snapshots.length)
+        p.append(el("p", "This node has not sent a snapshot yet."));
+      else
+        p.append(
+          table(
+            "Snapshots for " + selected + " (newest received first)",
+            ["Snapshot", "Received", "Claimed creation", "Status", "Actions"],
+            data.snapshots.map((s) => {
+              const state = el("div", undefined, "badges"),
+                act = el("div", undefined, "actions");
+              if (s.pinned) state.append(badge("Pinned", "ok"));
+              if (protectedIds.has(s.id)) state.append(badge("Protected"));
+              state.append(
+                s.restore_tested
+                  ? badge("Restore tested", "ok")
+                  : badge("Not restore tested", "warn"),
+              );
+              act.append(
+                actionButton(s.pinned ? "Unpin" : "Pin", s.id, () =>
+                  pin(selected, s),
+                ),
+              );
+              if (!protectedIds.has(s.id) && !s.pinned)
+                act.append(
+                  actionButton("Delete", s.id, () => remove(selected, s), true),
+                );
+              return [s.id, when(s.received_at), when(s.created), state, act];
+            }),
+            true,
+          ),
+        );
+      const gc = el("button", "Remove unreferenced data", "button");
+      gc.type = "button";
+      gc.onclick = collect;
+      p.append(
+        gc,
+        el(
+          "small",
+          "Frees storage no snapshot refers to. This is not a restore test.",
+        ),
+      );
+      return p;
+    }
+    async function pin(node, s) {
+      const want = !s.pinned;
+      try {
+        if (want)
+          await api(BACKUP + "pin", {
+            action: "pin",
+            node,
+            snapshot: s.id,
+            pinned: true,
+          });
+        else
+          await confirmed({
+            route: "pin",
+            title: "Unpin " + s.id,
+            intro: "An unpinned snapshot can be removed by retention.",
+            submit: "Unpin",
+            request: { action: "pin", node, snapshot: s.id, pinned: false },
+          });
+      } catch (error) {
+        notify(error.message);
+      }
+      await refresh();
+    }
+    async function remove(node, s) {
+      const phrase = "delete " + node + "/" + s.id;
+      const r = await confirmed({
+        route: "delete",
+        title: "Delete " + s.id,
+        intro:
+          "This permanently removes the snapshot from this backup server. Protected snapshots are refused.",
+        submit: "Delete snapshot",
+        danger: true,
+        extra: [
+          {
+            name: "confirm",
+            label: "Type “" + phrase + "” to confirm",
+            hint: "Exactly as shown.",
+          },
+        ],
+        request: (v) => {
+          if (v.confirm !== phrase)
+            throw Error("The confirmation text does not match.");
+          return { action: "delete", node, snapshot: s.id, confirm: phrase };
+        },
+      });
+      if (r.done) notify("Deleted " + s.id + ".");
+      await refresh();
+    }
+    async function collect() {
+      let removed;
+      const r = await confirmed({
+        route: "garbage-collection",
+        title: "Remove unreferenced data",
+        intro:
+          "Deletes stored objects that no snapshot uses. Snapshots are not changed.",
+        submit: "Remove data",
+        request: { action: "collect_garbage", confirm: true },
+        after: (res) => (removed = res.objects_removed),
+      });
+      if (r.done) notify(String(removed) + " unreferenced objects removed.");
+      await refresh();
+    }
+    function policyPanel(policy) {
+      const p = el("section", undefined, "panel stack"),
+        f = el("form", undefined, "stack"),
+        inputs = {};
+      const grid = el("div", undefined, "form-grid");
+      p.append(el("h2", "Policy"), f);
+      f.append(
+        el(
+          "p",
+          "How often nodes should send, how many snapshots are kept and how much of the link and storage they may use. A policy does not start a schedule by itself.",
+          "muted",
+        ),
+      );
+      let editable = true;
+      for (const [key, label, unit, nullable] of POLICY_FIELDS) {
+        const row = el("label", label),
+          input = el("input"),
+          hint = el("small");
+        input.type = "number";
+        input.name = key;
+        input.min = "0";
+        input.step = "1";
+        input.inputMode = "numeric";
+        input.required = !nullable;
+        const v = policy[key];
+        if (v !== null && v !== undefined && !SAFE(v)) editable = false;
+        input.value = v === null || v === undefined ? "" : String(v);
+        hint.textContent = hintFor(unit, input.value);
+        input.oninput = () => (hint.textContent = hintFor(unit, input.value));
+        row.append(input, hint);
+        if (nullable)
+          row.append(el("small", "Leave empty for no limit.", "muted"));
+        grid.append(row);
+        inputs[key] = input;
+      }
+      const save = el("button", "Review and save", "button primary");
+      f.append(grid, save);
+      if (!editable) {
+        for (const i of Object.values(inputs)) i.disabled = true;
+        save.disabled = true;
+        f.append(
+          el(
+            "p",
+            "A value is larger than this page can edit exactly. Use the command line to change it.",
+            "form-error",
+          ),
+        );
+      }
+      f.onsubmit = async (e) => {
+        e.preventDefault();
+        const next = { revision: policy.revision + 1 };
+        for (const [key, , , nullable] of POLICY_FIELDS) {
+          const raw = inputs[key].value.trim();
+          if (raw === "" && nullable) next[key] = null;
+          else {
+            const n = Number(raw);
+            if (!SAFE(n)) {
+              notify("Use whole numbers of zero or more for every field.");
+              inputs[key].focus();
+              return;
+            }
+            next[key] = n;
+          }
+        }
+        const r = await confirmed({
+          route: "policy",
+          title: "Save backup policy",
+          intro:
+            "Saves revision " +
+            next.revision +
+            ". If another administrator changed the policy meanwhile, you will be asked to review it first.",
+          submit: "Save policy",
+          request: { action: "set_policy", policy: next },
+        });
+        if (r.done) notify("Policy saved as revision " + next.revision + ".");
+        await refresh();
+      };
+      return p;
+    }
+    await refresh();
   }
   async function render() {
     if (!content) return;
@@ -102,6 +925,8 @@
         const appearance = el("section", undefined, "panel");
         appearance.dataset.corePreferencesHost = "";
         content.append(appearance);
+      } else if (path === "/backup") {
+        await backupPage();
       } else if (path === "/audit") {
         document.querySelector("h1").textContent = "Activity";
         const data = await api("audit");
