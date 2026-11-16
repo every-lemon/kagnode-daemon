@@ -45,12 +45,20 @@ fn cookie<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
         })
 }
 fn user(s: &App, h: &HeaderMap) -> Api<Session> {
-    s.store
+    let principal = s
+        .store
         .session(cookie(h, "kn_daemon").unwrap_or(""))?
         .ok_or(Error(
             StatusCode::UNAUTHORIZED,
             "Sign in as a local administrator".into(),
-        ))
+        ))?;
+    s.store.require_web_admin().map_err(|_| {
+        Error(
+            StatusCode::FORBIDDEN,
+            "Web administration is disabled; use authenticated local control".into(),
+        )
+    })?;
+    Ok(principal)
 }
 fn mutation(s: &App, h: &HeaderMap) -> Api<Session> {
     let u = user(s, h)?;
