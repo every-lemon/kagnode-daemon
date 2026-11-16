@@ -181,3 +181,25 @@ fn owner_mode_signs_in_without_a_password_and_cannot_manage_users() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn operator_turns_web_administration_on_and_off() -> Result<()> {
+    let (_t, root) = protected()?;
+    let mut op = Client::new(root);
+    op.login("boss@fixture.invalid", PASSWORD)?;
+    let before = op.security()?;
+    assert_eq!(before["admin_enabled"], false);
+    let revision = before["revision"].as_i64().unwrap();
+    // Wrong password changes nothing; the right one flips it.
+    assert!(
+        op.set_admin_enabled(revision, true, "not-my-password")
+            .is_err()
+    );
+    assert_eq!(op.security()?["admin_enabled"], false);
+    op.set_admin_enabled(revision, true, PASSWORD)?;
+    let after = op.security()?;
+    assert_eq!(after["admin_enabled"], true);
+    // A stale revision is refused.
+    assert!(op.set_admin_enabled(revision, false, PASSWORD).is_err());
+    Ok(())
+}
