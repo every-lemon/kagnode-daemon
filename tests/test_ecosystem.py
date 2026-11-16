@@ -144,6 +144,47 @@ class EcosystemTests(unittest.TestCase):
             with self.assertRaisesRegex(eco.ManagerError, "changed since review"):
                 self.manager.install("passwords", "preview", 41)
 
+    def test_proxy_renamed_repository_keeps_signed_release_identity(self):
+        fetch, manifest, release = self.fixtures(preview=False)
+        old_asset = next(iter(manifest["assets"]))
+        asset = "kagnode-pm_5.0.3_linux_amd64.tar.gz"
+        manifest["assets"] = {asset: manifest["assets"][old_asset]}
+        manifest["version"] = "5.0.3"
+        prefix = (
+            "https://github.com/every-lemon/kagnode-proxy/releases/download/v5.0.3/"
+        )
+        release["assets"] = [
+            {"name": name, "browser_download_url": prefix + name}
+            for name in ["release-manifest.json", "release-manifest.sig", asset]
+        ]
+        requested = []
+
+        def request(url, limit=0):
+            requested.append(url)
+            if url.endswith("release-manifest.sig"):
+                return b"synthetic-signature"
+            return fetch(url, limit)
+
+        for identity in ["kagnode-pm", "kagnode-proxy"]:
+            manifest["repository"] = "every-lemon/" + identity
+            with (
+                patch.object(eco, "request", request),
+                patch.object(eco.platform, "machine", return_value="x86_64"),
+                patch.object(self.manager, "verify_release") as verify,
+            ):
+                result = self.manager.check("pm", "stable")
+                self.assertTrue(result["signature_verified"])
+                self.assertEqual(result["repository"], manifest["repository"])
+                verify.assert_called_once_with(
+                    json.dumps(manifest).encode(), b"synthetic-signature"
+                )
+        self.assertTrue(all("/every-lemon/kagnode-proxy/" in url for url in requested))
+        for identity in ["other/kagnode-pm", "every-lemon/kagnode-mail"]:
+            manifest["repository"] = identity
+            with patch.object(eco, "request", request):
+                with self.assertRaisesRegex(eco.ManagerError, "identity"):
+                    self.manager.check("pm", "stable")
+
     def test_wrong_manifest_identity_cannot_install(self):
         fetch, manifest, _ = self.fixtures()
         manifest["repository"] = "other/repo"

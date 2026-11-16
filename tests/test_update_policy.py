@@ -74,4 +74,4 @@ class Policies(unittest.TestCase):
     def test_pm_catalog_preserves_technical_identifier(self):
         manager = self.fixture()
         self.assertEqual(manager.project("pm")[0], "proxy-manager")
-        self.assertEqual(m.CATALOG["proxy-manager"]["repo"], "kagnode-pm")
+        self.assertEqual(m.CATALOG["proxy-manager"]["repo"], "kagnode-proxy")
