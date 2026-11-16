@@ -92,6 +92,7 @@
   "src/runtime.rs",
   "src/store.rs",
   "src/tui.rs",
+  "src/tui_backup.rs",
   "src/web.rs",
   "tests/backup-qa.Containerfile",
   "tests/backup_pages_browser.py",
