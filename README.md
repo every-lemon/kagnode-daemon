@@ -6,6 +6,34 @@
 
 An administrator workspace for KagNode applications, with a shared Core dashboard and a Rust terminal interface. The repository was renamed from `kagnode-cli`; existing releases, account credentials, native data and the `kagnode` command remain compatible.
 
+### What it looks like
+
+All screenshots use a temporary test installation with fictional accounts. No real server, account or data appears.
+
+**Terminal.** `kagnode` asks who you are first, then shows the screens your role allows.
+
+| Sign in                                                                                                     | Workspace                                                                                                      |
+| ----------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| ![The terminal sign-in box asking for an account and password](docs/images/terminal-1-signin.png)           | ![The Operator's workspace with applications, node health and key hints](docs/images/terminal-2-workspace.png) |
+| ![The Users screen listing accounts with their role, services and status](docs/images/terminal-3-users.png) | ![The new-user form with Operator, Manager and Viewer roles](docs/images/terminal-4-new-user.png)              |
+
+**Web administration.** An Operator manages accounts; a Manager sees only the services they were given.
+
+| Operator: Users                                                                                  | Manager: Services                                                                                                         |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| ![The Administration page with the Users table and New user button](docs/images/admin-users.png) | ![A Manager's Services tab listing Proxy at view level and Mail at operate level](docs/images/admin-manager-services.png) |
+
+### How accounts and roles work (in review, not released)
+
+The roles described here are open pull requests (#34, #36, #37, #40 and #43). Check [Release status](#release-status) and the changelog before relying on them.
+
+1. **First account.** Setup asks whether to protect the Daemon with an Operator password. Yes: that first account is the **Operator**. No: only the machine's owner can use the terminal, with no account, and the Daemon shows a visible "unprotected" marker.
+2. **Three roles.** An **Operator** can do everything, including managing users. A **Manager** gets chosen services, each at a level: _view_ (status and health), _operate_ (plus logs and reviewed start/stop) or _manage_ (plus boot and Core updates). A **Viewer** sees read-only server analytics only.
+3. **The Daemon decides.** The terminal and the browser are clients. They send your session to the Daemon, which checks your role on every request, so hiding a button is never the only protection.
+4. **Risky changes ask again.** Creating users, changing roles, resetting passwords and changing settings each ask for your own password, bound to that exact change, and a result that could not be read is reported as uncertain instead of retried.
+5. **Web administration is off by default.** While off, the web page cannot change users or settings. An Operator turns it on from the terminal (`a`). Managed applications are never affected either way.
+6. **Limits.** Native product controls (logs, boot, Core updates, backup management) are not switched on yet. People who share the machine's operating-system account are not separated from each other; the security notes explain the boundary.
+
 ## Release status
 
 **5.0.3** is the coordinated stable compatibility command release. The **5.0.3 Rust Daemon candidate** adds local administration, Core presentation, terminal folder navigation, reviewed native service operations, encrypted control-database backups and fresh-install profiles. Qualification and migration work is tracked in [the Rust migration matrix](docs/RUST-MIGRATION.md).
