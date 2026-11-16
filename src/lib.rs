@@ -16,3 +16,5 @@ pub mod web;
 pub mod maintenance;
 
 pub mod backup_service;
+
+pub mod web_roles;
