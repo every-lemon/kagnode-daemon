@@ -15,38 +15,77 @@ with tempfile.TemporaryDirectory(prefix="monitor-lifecycle-") as folder:
     def wire(payload, session=None, confirmation=None):
         global request_counter
         request_counter += 1
-        request = dict(version=1, request_id=f"fixture-{request_counter}", session=session,
-                       confirmation=confirmation, payload=payload)
-        return json.loads(subprocess.check_output(
-            [str(binary), "--root", str(root), "user", "request"],
-            input=json.dumps(request), text=True, stderr=subprocess.PIPE,
-        ))
+        request = dict(
+            version=1,
+            request_id=f"fixture-{request_counter}",
+            session=session,
+            confirmation=confirmation,
+            payload=payload,
+        )
+        return json.loads(
+            subprocess.check_output(
+                [str(binary), "--root", str(root), "user", "request"],
+                input=json.dumps(request),
+                text=True,
+                stderr=subprocess.PIPE,
+            )
+        )
 
     def rpc(payload, confirm=False):
         global token
         if token is None:
-            token = wire(dict(action="login", account="monitor@example.invalid",
-                              password="fixture-monitor-lifecycle-password"))["token"]
+            token = wire(
+                dict(
+                    action="login",
+                    account="monitor@example.invalid",
+                    password="fixture-monitor-lifecycle-password",
+                )
+            )["token"]
         confirmation = None
         if confirm:
-            confirmation = wire(dict(action="reauthenticate", password="fixture-monitor-lifecycle-password",
-                                     target=payload), token)["confirmation"]
+            confirmation = wire(
+                dict(
+                    action="reauthenticate",
+                    password="fixture-monitor-lifecycle-password",
+                    target=payload,
+                ),
+                token,
+            )["confirmation"]
         return wire(payload, token, confirmation)
 
     def run(*args):
         if args[0] == "monitor":
-            payload = dict(action="overview") if len(args) == 1 else dict(
-                action="metrics", name=args[2], since=int(time.time())-3600, until=int(time.time()))
+            payload = (
+                dict(action="overview")
+                if len(args) == 1
+                else dict(
+                    action="metrics",
+                    name=args[2],
+                    since=int(time.time()) - 3600,
+                    until=int(time.time()),
+                )
+            )
             return json.dumps(rpc(payload))
         if args[0] == "retention":
             current = rpc(dict(action="retention"))
             if len(args) == 1:
                 return json.dumps(current)
             policy = dict(current["policy"])
-            policy["days"] = int(args[args.index("--days")+1])
-            return json.dumps(rpc(dict(action="set_retention", revision=int(args[args.index("--revision")+1]),
-                                       policy=policy, confirm_trim="--confirm-trim" in args), confirm=True))
-        return subprocess.check_output([str(binary), "--root", str(root), *args], text=True)
+            policy["days"] = int(args[args.index("--days") + 1])
+            return json.dumps(
+                rpc(
+                    dict(
+                        action="set_retention",
+                        revision=int(args[args.index("--revision") + 1]),
+                        policy=policy,
+                        confirm_trim="--confirm-trim" in args,
+                    ),
+                    confirm=True,
+                )
+            )
+        return subprocess.check_output(
+            [str(binary), "--root", str(root), *args], text=True
+        )
 
     run("init", "--email", "monitor@example.invalid", "--password-file", str(password))
 
@@ -79,7 +118,9 @@ with tempfile.TemporaryDirectory(prefix="monitor-lifecycle-") as folder:
             run("retention", "--days", "2", "--revision", "0")
             raise AssertionError("trim accepted without explicit review")
         except subprocess.CalledProcessError as error:
-            assert "Reducing retention requires explicit trim confirmation" in error.stderr
+            assert (
+                "Reducing retention requires explicit trim confirmation" in error.stderr
+            )
         run("retention", "--days", "2", "--revision", "0", "--confirm-trim")
         time.sleep(11)
         second = json.loads(run("monitor"))
