@@ -24,6 +24,20 @@ from installer_protocol import (
 )
 
 
+class BackupRoleTests(unittest.TestCase):
+    def test_reserved_role_blocks_source_and_native_installers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "managed"
+            root.mkdir()
+            manager = eco.Manager(root, False)
+            (root / ".kagnode-role.json").write_text('{"role":"backup-server"}')
+            with self.assertRaises(eco.ManagerError):
+                manager.install("mail")
+            with self.assertRaises(eco.ManagerError):
+                installer.operate(manager, "mail", "plan")
+            self.assertFalse((root / "mail").exists())
+
+
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

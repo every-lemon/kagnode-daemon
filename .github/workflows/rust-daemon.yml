@@ -11,9 +11,9 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup component add rustfmt clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
       - run: cargo build --locked && python3 tests/rust_tui_pty.py && KAGNODE_RUST_BINARY=target/debug/kagnode python3 tests/monitor_lifecycle.py
   compatibility:
     name: Rust daemon 1.88 compatibility
@@ -23,7 +23,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.88.0 --profile minimal
-      - run: cargo +1.88.0 test --locked
+      - run: cargo +1.88.0 test --workspace --locked
   arm:
     name: Rust daemon ARM64 checks
     runs-on: ubuntu-24.04-arm
@@ -31,4 +31,4 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - run: cargo test --locked
+      - run: cargo test --workspace --locked

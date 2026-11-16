@@ -103,6 +103,28 @@ enum Command {
         #[command(subcommand)]
         command: Backup,
     },
+    BackupInstall {
+        #[arg(long)]
+        managed_root: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        worker_binary: PathBuf,
+        #[arg(long)]
+        controller_config: PathBuf,
+        #[arg(long)]
+        apply_plan: Option<PathBuf>,
+    },
+    BackupRole {
+        #[arg(long)]
+        managed_root: PathBuf,
+        #[arg(long)]
+        apply_plan: Option<PathBuf>,
+    },
+    BackupServer {
+        #[command(subcommand)]
+        command: BackupServer,
+    },
     Broker {
         #[arg(long, default_value = "/var/lib/kagnode-daemon")]
         state: PathBuf,
@@ -112,6 +134,55 @@ enum Command {
     Services {
         #[command(subcommand)]
         command: Services,
+    },
+}
+#[derive(Subcommand)]
+enum BackupServer {
+    Status,
+    Nodes,
+    RotateCertificate {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        expected_sha256: String,
+        #[arg(long)]
+        certificate_sha256: String,
+    },
+    Approve {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        public_key: String,
+        #[arg(long)]
+        certificate_sha256: String,
+    },
+    Revoke {
+        #[arg(long)]
+        node: String,
+    },
+    Snapshots {
+        #[arg(long)]
+        node: String,
+    },
+    Policy {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Pin {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        unpin: bool,
+    },
+    Delete {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        confirm: String,
     },
 }
 #[derive(Subcommand)]
@@ -219,6 +290,57 @@ fn prompt(message: &str) -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::BackupInstall {
+        managed_root,
+        config,
+        worker_binary,
+        controller_config,
+        apply_plan,
+    }) = &args.command
+    {
+        use kagnode_daemon::backup_service::{role, transport};
+        let result = if let Some(path) = apply_plan {
+            let plan: role::Installation =
+                serde_json::from_slice(&transport::read_file(path, true)?)?;
+            ensure!(
+                plan.root == *managed_root
+                    && plan.unit_directory == std::path::Path::new("/etc/systemd/system"),
+                "Installation root mismatch"
+            );
+            role::install(&plan)?
+        } else {
+            serde_json::to_value(role::installation_plan(
+                managed_root,
+                config,
+                worker_binary,
+                std::path::Path::new("/etc/systemd/system"),
+                controller_config,
+            )?)?
+        };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if let Some(Command::BackupRole {
+        managed_root,
+        apply_plan,
+    }) = &args.command
+    {
+        ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "Role reservation requires root"
+        );
+        use kagnode_daemon::backup_service::{role, transport};
+        let result = if let Some(path) = apply_plan {
+            role::apply(
+                managed_root,
+                &serde_json::from_slice(&transport::read_file(path, true)?)?,
+            )?
+        } else {
+            serde_json::to_value(role::plan(managed_root)?)?
+        };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     if let Some(Command::Install {
         email,
         password_file,
@@ -449,6 +571,12 @@ async fn main() -> Result<()> {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
             let mut terminal_api = tokio::spawn(kagnode_daemon::runtime::serve(store.clone()));
             let collector = tokio::spawn(kagnode_daemon::runtime::collect(store.clone()));
+            let mut backup_server = tokio::spawn(
+                kagnode_daemon::backup_service::supervisor::supervise(store.clone()),
+            );
+            let mut backup_agent = tokio::spawn(
+                kagnode_daemon::backup_service::scheduler::supervise(store.clone()),
+            );
             let local = web::router(app.clone());
             let mut task = tokio::spawn(async move { axum::serve(listener, local).await });
             let web_store = store.clone();
@@ -480,6 +608,8 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     r = tokio::signal::ctrl_c() => break r.map_err(Into::into),
                     _ = terminate.recv() => break Ok(()),
+                    r = &mut backup_agent => break Err(anyhow::anyhow!("Backup agent stopped: {r:?}")),
+                    r = &mut backup_server => break Err(anyhow::anyhow!("Backup supervisor stopped: {r:?}")),
                     r = &mut terminal_api => break Err(anyhow::anyhow!("Terminal API stopped: {r:?}")),
                     r = &mut task => break Err(anyhow::anyhow!("Local health API stopped: {r:?}")),
                     r = &mut web_task, if !web_finished => match r {
@@ -492,6 +622,8 @@ async fn main() -> Result<()> {
             task.abort();
             terminal_api.abort();
             collector.abort();
+            backup_server.abort();
+            backup_agent.abort();
             let _ = std::fs::remove_file(store_root_socket);
             std::fs::remove_file(socket)?;
             result?;
@@ -552,6 +684,60 @@ async fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Some(Command::BackupServer { command }) => {
+            use kagnode_daemon::backup_service::{control::AdminRequest, transport};
+            let request = match command {
+                BackupServer::Status => AdminRequest::Status,
+                BackupServer::Nodes => AdminRequest::Nodes,
+                BackupServer::RotateCertificate {
+                    node,
+                    expected_sha256,
+                    certificate_sha256,
+                } => AdminRequest::RotateCertificate {
+                    node,
+                    expected_sha256,
+                    certificate_sha256,
+                },
+                BackupServer::Approve {
+                    node,
+                    public_key,
+                    certificate_sha256,
+                } => AdminRequest::Approve {
+                    node,
+                    public_key,
+                    certificate_sha256,
+                },
+                BackupServer::Revoke { node } => AdminRequest::Revoke { node },
+                BackupServer::Snapshots { node } => AdminRequest::Snapshots { node },
+                BackupServer::Policy { file } => AdminRequest::SetPolicy {
+                    policy: serde_json::from_slice(&transport::read_file(&file, true)?)?,
+                },
+                BackupServer::Pin {
+                    node,
+                    snapshot,
+                    unpin,
+                } => AdminRequest::Pin {
+                    node,
+                    snapshot,
+                    pinned: !unpin,
+                },
+                BackupServer::Delete {
+                    node,
+                    snapshot,
+                    confirm,
+                } => AdminRequest::Delete {
+                    node,
+                    snapshot,
+                    confirm,
+                },
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &kagnode_daemon::backup_service::supervisor::request(&store, &request).await?
+                )?
+            );
+        }
         Some(Command::Health) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut socket =
@@ -574,6 +760,8 @@ async fn main() -> Result<()> {
         Some(
             Command::Broker { .. }
             | Command::Services { .. }
+            | Command::BackupInstall { .. }
+            | Command::BackupRole { .. }
             | Command::Install { .. }
             | Command::Backup { .. },
         ) => unreachable!(),
