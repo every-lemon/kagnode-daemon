@@ -95,9 +95,9 @@ def call(state, payload, session=None, confirmation=None):
 
 
 def create_user(state, account, role, grants):
-    token = call(
-        state, {"action": "login", "account": OPERATOR, "password": PASSWORD}
-    )["token"]
+    token = call(state, {"action": "login", "account": OPERATOR, "password": PASSWORD})[
+        "token"
+    ]
     spec = {
         "action": "user_create",
         "account": account,
@@ -226,7 +226,9 @@ with tempfile.TemporaryDirectory(prefix="kagnode-rust-tui-") as temporary:
             mark = t.mark()
             t.send(b"u", 0.6)
             shown = t.since(mark)
-            assert b"Users" in shown and b"viewer@fixture.invalid" in shown, shown[-400:]
+            assert b"Users" in shown and b"viewer@fixture.invalid" in shown, shown[
+                -400:
+            ]
             assert b"Reset password" in shown and b"manager@fixture.invalid" in shown
             t.send(b"\x1b", 0.4)  # back to the workspace
             mark = t.mark()
