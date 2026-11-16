@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod ha;
 pub mod install;
 pub mod metrics;
+pub mod roles;
 pub mod runtime;
 pub mod store;
 pub mod tui;

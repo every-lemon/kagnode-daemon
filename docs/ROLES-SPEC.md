@@ -76,3 +76,28 @@ admin_enabled is separate and defaults false on both fresh setup and migrated st
 ## Validation/review gates
 
 Before security-ready: migration and repeat migration, all roles×actions and grant levels, denied unknown inputs, no implicit escalation, changed-role invalidation, forged actor/session, uid binding, expiration/replay/restart, rate limits, concurrent last-Operator changes, owner mode/add-password/root recovery, admin gate separate from dashboard, broker receipt identity, legacy web/broker bypass checks. Disposable synthetic fixtures only. Rustfmt, Clippy-Dwarnings, cargo test--workspace, inventory and protected CI. Claude independently reviews both spec and implementation. Existing UI cannot be called secure with roles until its client integration removes direct store access and passes end-to-end tests. Product native controls phase4 remain deferred until this gate is reviewed and disposable native qualification exists.
+
+## Implementation review notes (2026-11-16, phases1–3)
+
+The exact wire contract is now in ROLES-API.md. Explicit review refinements:
+
+- Root recovery uses SO_PEERCRED on the running private daemon, rather than opening
+  a service-owned SQLite file as root and potentially creating root-owned journals.
+  There is no offline root-reset tool yet.
+- The shared local socket rejects the old unauthenticated protocol. No compatibility
+  fallback grants protected terminal access. Claude must adapt the old TUI; direct
+  Store access is still a host-owner interface outside logical-user isolation.
+- Legacy web auth stays Operator-only with the independent default-off admin gate.
+  Manager/Viewer web clients remain blocked until separately implemented/reviewed.
+- Concrete backend actions cover account/security management, analytics, bounded
+  monitoring retention, product identity and persisted backup-agent status. The
+  future intent matrix is tested, but native/log/Core/backup-server mutations are
+  deliberately not advertised or executed before independent phase1–3 review.
+- New local security receipts bind logical actor and request using a private HMAC
+  key. They are not retroactive actor signatures for old native broker receipts.
+  Authenticated broker integration remains phase4; no native controls were added.
+- Setup selection/prompt/banner is Claude-owned. Backend provides explicit protected
+  initialization and init-owner; it never guesses an unprotected mode.
+- Audit/receipt retention, installation-key rotation, separate service-UID/socket
+  group provisioning and complete client qualification remain review blockers for
+  shipping multi-user access. Root/service-account compromise is not in the model.

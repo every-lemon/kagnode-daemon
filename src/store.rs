@@ -82,7 +82,7 @@ impl Store {
                 "Unsafe database file"
             );
         }
-        let db = Connection::open(&path)?;
+        let mut db = Connection::open(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;
@@ -93,12 +93,13 @@ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, email TEXT NOT 
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts(identity TEXT PRIMARY KEY, start INTEGER NOT NULL, count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT NULL, value TEXT NOT NULL);")?;
+        crate::roles::migrate(&mut db, info.uid())?;
         Ok(Self {
             root: root.into(),
             db: Arc::new(Mutex::new(db)),
         })
     }
-    fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    pub(crate) fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.db
             .lock()
             .map_err(|_| anyhow::anyhow!("Database unavailable"))
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
             tx.query_row("SELECT COUNT(*) FROM admins", [], |r| r.get::<_, i64>(0))? == 0,
             "Existing administrators retained; initialization cannot reset accounts"
         );
+        crate::roles::initialized_user(&tx, &email, &hash)?;
         tx.execute("INSERT INTO admins VALUES(?1,?2)", params![email, hash])?;
         tx.execute(
             "INSERT INTO settings VALUES(1,?1)",
@@ -188,7 +190,7 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
             )?;
             ensure!(count <= 12, "Too many sign-in attempts; wait five minutes");
             db.query_row(
-                "SELECT password_hash FROM admins WHERE email=?1",
+                "SELECT a.password_hash FROM admins a JOIN users u ON u.email=a.email WHERE a.email=?1 AND u.role='operator' AND u.disabled=0 AND (SELECT mode FROM security_config)='protected'",
                 [&email],
                 |r| r.get::<_, String>(0),
             )
@@ -199,9 +201,12 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
         ensure!(hash.is_some() && valid, "Email or password is incorrect");
         let token = auth::random()?;
         let csrf = auth::random()?;
-        let db = self.db()?;
-        db.execute("DELETE FROM sessions WHERE expires<?1", [auth::now()])?;
-        db.execute(
+        let mut db = self.db()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current:Option<String> = tx.query_row("SELECT a.password_hash FROM admins a JOIN users u ON u.email=a.email WHERE a.email=?1 AND u.role='operator' AND u.disabled=0 AND (SELECT mode FROM security_config)='protected'",[&email],|r|r.get(0)).optional()?;
+        ensure!(current == hash, "Email or password is incorrect");
+        tx.execute("DELETE FROM sessions WHERE expires<?1", [auth::now()])?;
+        tx.execute(
             "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5)",
             params![
                 auth::digest(&token),
@@ -211,14 +216,28 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
                 auth::now() + 3600 * 8
             ],
         )?;
-        db.execute("DELETE FROM attempts WHERE identity=?1", [&identity])?;
+        tx.execute("DELETE FROM attempts WHERE identity=?1", [&identity])?;
+        tx.commit()?;
         Ok(token)
     }
     // This dashboard has local administrators only. Recheck membership on every
     // request, including sessions retained after an administrator is removed.
     pub fn session(&self, token: &str) -> Result<Option<Session>> {
         ensure!(token.len() <= 128, "Invalid session");
-        Ok(self.db()?.query_row("SELECT s.email,s.csrf,s.authenticated_at FROM sessions s JOIN admins a ON a.email=s.email WHERE s.token_hash=?1 AND s.expires>?2", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
+        Ok(self.db()?.query_row("SELECT s.email,s.csrf,s.authenticated_at FROM sessions s JOIN admins a ON a.email=s.email JOIN users u ON u.email=s.email WHERE s.token_hash=?1 AND s.expires>?2 AND u.role='operator' AND u.disabled=0 AND (SELECT mode FROM security_config)='protected'", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
+    }
+    /// Legacy web presentation is Operator-only until Claude integrates roles.
+    /// Dashboard availability and administration permission are separate gates.
+    pub fn require_web_admin(&self) -> Result<()> {
+        ensure!(
+            self.db()?.query_row(
+                "SELECT admin_enabled=1 AND mode='protected' FROM security_config WHERE id=1",
+                [],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "Web administration is disabled; enable through authenticated local control"
+        );
+        Ok(())
     }
     pub fn confirm_backup_action(
         &self,
