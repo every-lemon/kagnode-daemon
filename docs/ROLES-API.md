@@ -198,3 +198,32 @@ browser transport identity and global budget; this conservative shared browser
 limit may temporarily restrict all browser sign-ins after repeated bad passwords.
 A trusted-proxy-aware per-source throttle is not implemented by inventing trust in
 forwarded headers. No cookies or credentials belong in URLs.
+
+## Password-work scheduling and concurrent authorization
+
+Role-protocol password verification and new-password hashing run outside the
+shared Store database mutex. Each Store has at most two admitted password workers;
+excess work returns `Password workers busy; retry later` before hashing. Password
+work retains a snapshot of the security configuration revision, actor revision
+and stored hash. It rechecks that snapshot, current session/permissions and the
+persistent failure budgets before using the result. A changed snapshot returns
+`Authorization changed; retry after signing in` (or a generic authentication
+refusal for a changed hash); it cannot issue an old-privilege session or mutation.
+A password-work refusal is not proof of any native side effect: no native controls
+are added here. Browser errors retain the existing JSON envelope/HTTP400 mapping.
+
+Success/failure accounting remains serialized and account-success clearing does
+not reset UID/global failure totals. When concurrent admitted password checks
+finish after another has filled a failure bucket, the later completion is denied.
+The worker permit lasts through application/recheck and releases on all errors.
+This bounds work, not the number of separate host-owner processes: root/service
+account remain outside the trust boundary and must not be assigned to users.
+
+Reviewed confirmation expiry, request digest, session UID/audience, account
+revision and target revision checks are still enforced after preparation. New
+hash errors are carried to the existing mutation path so a submitted one-use
+confirmation is consumed before a failed mutation, as before. Read-only requests,
+metrics and collector work do not wait for the Argon2 computation to release the
+shared database mutex. This does not move every historical compatibility password
+routine into this scheduler; those host-owner routines and native deployment
+remain separate qualification work.

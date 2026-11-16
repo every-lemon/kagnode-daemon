@@ -382,7 +382,7 @@ fn audit(
     Ok(())
 }
 // Check before costly password work; charge only failures. The store mutex
-// serializes checks/verification/accounting across concurrent requests.
+// serializes checks/accounting; password work happens outside it and is bounded.
 fn rate(db: &Connection, uid: u32, account: &str, purpose: &str, failed: bool) -> Result<()> {
     let now = auth::now();
     db.execute("DELETE FROM security_attempts WHERE start<=?1", [now - 900])?;
@@ -416,18 +416,203 @@ fn rate(db: &Connection, uid: u32, account: &str, purpose: &str, failed: bool) -
     }
     Ok(())
 }
+// Password CPU work never owns the shared DB guard. Recheck the snapshot and
+// failure budgets after it completes; this is a private server object, not input.
+#[derive(Default)]
+struct Prepared {
+    check: Option<PasswordCheck>,
+    new_hash: Option<Result<Zeroizing<String>, String>>,
+    security_revision: Option<i64>,
+    principal: Option<(String, i64)>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+struct PasswordCheck {
+    account: String,
+    purpose: &'static str,
+    hash: Zeroizing<String>,
+    valid: bool,
+}
+impl Prepared {
+    fn new_hash(&self) -> Result<&str> {
+        match &self.new_hash {
+            Some(Ok(hash)) => Ok(hash.as_str()),
+            Some(Err(error)) => bail!("{error}"),
+            None => bail!("Password preparation missing"),
+        }
+    }
+    fn recheck(&self, db: &Connection) -> Result<()> {
+        if let Some(revision) = self.security_revision {
+            ensure!(
+                db.query_row("SELECT revision FROM security_config", [], |r| r
+                    .get::<_, i64>(0))?
+                    == revision,
+                "Authorization changed; retry after signing in"
+            );
+        }
+        if let Some((id, revision)) = &self.principal {
+            let p = principal(db, id)?;
+            ensure!(
+                !p.disabled && p.auth_revision == *revision,
+                "Authorization changed; retry after signing in"
+            );
+        }
+        if let Some(check) = &self.check {
+            let current: Option<Option<String>> = db
+                .query_row(
+                    "SELECT password_hash FROM users WHERE email=?1 AND disabled=0",
+                    [&check.account],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            ensure!(
+                current.flatten().as_deref().unwrap_or(DUMMY) == check.hash.as_str(),
+                "Authentication refused"
+            );
+        }
+        Ok(())
+    }
+}
+fn prepare_work(
+    store: &Store,
+    uid: u32,
+    e: &Envelope,
+    verify: impl FnOnce(&str, &str) -> bool,
+    hash: impl FnOnce(&str) -> Result<String>,
+) -> Result<Prepared> {
+    let (old_password, new_password) = match &e.payload {
+        Action::Login { password, .. } | Action::Reauthenticate { password, .. } => {
+            (Some(password.as_str()), None)
+        }
+        Action::ChangePassword {
+            current_password,
+            password,
+        } => (Some(current_password.as_str()), Some(password.as_str())),
+        Action::RootRecover { password, .. }
+        | Action::UserCreate { password, .. }
+        | Action::UserResetPassword { password, .. }
+        | Action::EnableProtection { password, .. } => (None, Some(password.as_str())),
+        _ => return Ok(Prepared::default()),
+    };
+    let mut prepared = Prepared {
+        _permit: Some(store.password_worker()?),
+        ..Prepared::default()
+    };
+    {
+        let db = store.db()?;
+        let m = mode(&db)?;
+        web_gate(&db, uid, e, &m)?;
+        prepared.security_revision =
+            Some(db.query_row("SELECT revision FROM security_config", [], |r| r.get(0))?);
+        let (account, purpose) = match &e.payload {
+            Action::Login { account, .. } => {
+                ensure!(
+                    e.session.is_none() && e.confirmation.is_none() && m == "protected",
+                    "Authentication refused"
+                );
+                let account = auth::email(account).unwrap_or_default();
+                prepared.principal = db
+                    .query_row(
+                        "SELECT id,auth_revision FROM users WHERE email=?1 AND disabled=0",
+                        [&account],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                (account, "login")
+            }
+            Action::RootRecover { .. } => {
+                ensure!(
+                    uid == 0 && e.session.is_none() && e.confirmation.is_none(),
+                    "Root recovery requires root peer credentials"
+                );
+                (String::new(), "reauth")
+            }
+            action => {
+                let token = e
+                    .session
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Sign in again"))?;
+                let p = identify(&db, uid, token)?;
+                prepared.principal = Some((p.id.clone(), p.auth_revision));
+                if let Action::Reauthenticate { target, .. } = action {
+                    ensure!(
+                        allowed(&p, target)
+                            && target.risky()
+                            && m == "protected"
+                            && e.confirmation.is_none(),
+                        "Confirmation refused"
+                    );
+                } else {
+                    ensure!(allowed(&p, action), "Action not permitted");
+                    if action.risky() {
+                        ensure!(m == "protected", "Enable password protection first");
+                        ensure!(db.query_row("SELECT EXISTS(SELECT 1 FROM terminal_confirmations WHERE hash=?1 AND session_hash=?2 AND auth_revision=?3 AND request_hash=?4 AND expires>?5)",params![auth::digest(e.confirmation.as_deref().unwrap_or("")),auth::digest(token),p.auth_revision,digest(&db,action)?,auth::now()],|r|r.get::<_,bool>(0))?,"Fresh confirmation required");
+                    }
+                    if matches!(action, Action::EnableProtection { .. }) {
+                        let owner: u32 =
+                            db.query_row("SELECT owner_uid FROM security_config", [], |r| {
+                                r.get(0)
+                            })?;
+                        ensure!(m == "owner" && uid == owner, "Owner transition refused");
+                    } else {
+                        ensure!(m == "protected", "Enable password protection first");
+                    }
+                }
+                (p.account, "reauth")
+            }
+        };
+        if old_password.is_some() {
+            rate(&db, uid, &account, purpose, false)?;
+            let stored: Option<Option<String>> = db
+                .query_row(
+                    "SELECT password_hash FROM users WHERE email=?1 AND disabled=0",
+                    [&account],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            prepared.check = Some(PasswordCheck {
+                account,
+                purpose,
+                hash: Zeroizing::new(stored.flatten().unwrap_or_else(|| DUMMY.into())),
+                valid: false,
+            });
+        }
+    }
+    if let (Some(password), Some(check)) = (old_password, prepared.check.as_mut()) {
+        check.valid = verify(password, &check.hash);
+    }
+    // Preserve confirmation consumption on validation failure: carry hash errors
+    // into execute(), where the reviewed one-use token is consumed first.
+    if let Some(password) = new_password {
+        if prepared.check.as_ref().is_none_or(|c| c.valid) {
+            prepared.new_hash = Some(
+                hash(password)
+                    .map(Zeroizing::new)
+                    .map_err(|e| e.to_string()),
+            );
+        }
+    }
+    Ok(prepared)
+}
 fn password_check(
     db: &Connection,
     uid: u32,
     account: &str,
     purpose: &str,
-    password: &str,
     hash: &str,
+    prepared: &Prepared,
 ) -> Result<()> {
+    let check = prepared
+        .check
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Password preparation missing"))?;
+    ensure!(
+        check.account == account && check.purpose == purpose && check.hash.as_str() == hash,
+        "Authentication refused"
+    );
     rate(db, uid, account, purpose, false)?;
-    if !auth::verify(password, hash) {
+    if !check.valid {
         rate(db, uid, account, purpose, true)?;
-        anyhow::bail!("Authentication refused");
+        bail!("Authentication refused");
     }
     db.execute(
         "DELETE FROM security_attempts WHERE identity IN (?1,?2)",
@@ -622,6 +807,7 @@ fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "Invalid request envelope"
     );
+    let prepared = prepare_work(store, uid, e, auth::verify, auth::hash_password);
     let mut db = store.db()?;
     let m = mode(&db)?;
     let actor = e
@@ -637,7 +823,10 @@ fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
             }
         });
     let action = e.payload.name();
-    let result = execute(&mut db, uid, e, &m);
+    let result = prepared.and_then(|p| {
+        p.recheck(&db)?;
+        execute(&mut db, uid, e, &m, &p)
+    });
     // Audit refused authentication/authorization too, without echoing identities,
     // request bodies, passwords, tokens or arbitrary error strings.
     if result.is_err() {
@@ -645,7 +834,7 @@ fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
     }
     result
 }
-fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value> {
+fn web_gate(db: &Connection, uid: u32, e: &Envelope, m: &str) -> Result<()> {
     if uid == WEB_UID {
         ensure!(
             m == "protected",
@@ -660,8 +849,18 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
         }
     }
 
+    Ok(())
+}
+fn execute(
+    db: &mut Connection,
+    uid: u32,
+    e: &Envelope,
+    m: &str,
+    prepared: &Prepared,
+) -> Result<Value> {
+    web_gate(db, uid, e, m)?;
     match &e.payload {
-        Action::Login { account, password } => {
+        Action::Login { account, .. } => {
             ensure!(
                 e.session.is_none() && e.confirmation.is_none() && m == "protected",
                 "Authentication refused"
@@ -680,8 +879,8 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
                 uid,
                 &account,
                 "login",
-                password,
                 row.as_ref().and_then(|r| r.1.as_deref()).unwrap_or(DUMMY),
+                prepared,
             )?;
             ensure!(row.is_some(), "Authentication refused");
             let (id, verified_hash) = row.unwrap();
@@ -725,13 +924,13 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             )?;
             return session(db, &p, uid);
         }
-        Action::RootRecover { account, password } => {
+        Action::RootRecover { account, .. } => {
             ensure!(
                 uid == 0 && e.session.is_none() && e.confirmation.is_none(),
                 "Root recovery requires root peer credentials"
             );
             let account = auth::email(account)?;
-            let hash = auth::hash_password(password)?;
+            let hash = prepared.new_hash()?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let id = tx
                 .query_row("SELECT id FROM users WHERE email=?1", [&account], |r| {
@@ -762,7 +961,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Sign in again"))?;
     let p = identify(db, uid, token)?;
-    if let Action::Reauthenticate { password, target } = &e.payload {
+    if let Action::Reauthenticate { target, .. } = &e.payload {
         ensure!(
             allowed(&p, target) && target.risky() && m == "protected" && e.confirmation.is_none(),
             "Confirmation refused"
@@ -778,8 +977,8 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             uid,
             &p.account,
             "reauth",
-            password,
             hash.as_deref().unwrap_or(DUMMY),
+            prepared,
         )?;
         let confirmation = auth::random()?;
         db.execute(
@@ -812,10 +1011,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
         return Ok(json!({"confirmation":confirmation,"expires_in":90}));
     }
     ensure!(allowed(&p, &e.payload), "Action not permitted");
-    if let Action::ChangePassword {
-        current_password, ..
-    } = &e.payload
-    {
+    if let Action::ChangePassword { .. } = &e.payload {
         ensure!(m == "protected", "Use enable_protection in owner mode");
         let hash: Option<String> = db.query_row(
             "SELECT password_hash FROM users WHERE id=?1",
@@ -827,8 +1023,8 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             uid,
             &p.account,
             "reauth",
-            current_password,
             hash.as_deref().unwrap_or(DUMMY),
+            prepared,
         )?;
     }
     if e.payload.risky() {
@@ -868,13 +1064,13 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
         }
         Action::UserCreate {
             account,
-            password,
             role,
             grants: gs,
+            ..
         } => {
             grants(*role, gs)?;
             let account = auth::email(account)?;
-            let hash = Zeroizing::new(auth::hash_password(password)?);
+            let hash = prepared.new_hash()?;
             let id = auth::random()?;
             ensure!(
                 tx.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))? < 1000,
@@ -882,7 +1078,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             );
             tx.execute(
                 "INSERT INTO users VALUES(?1,?2,?3,?4,0,?5,?6,1)",
-                params![id, account, hash.as_str(), role.text(), auth::now(), p.id],
+                params![id, account, hash, role.text(), auth::now(), p.id],
             )?;
             set_grants(&tx, &id, gs)?;
             mirror_admin(&tx, &id)?;
@@ -924,21 +1120,21 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
         Action::UserResetPassword {
             id,
             expected_revision,
-            password,
+            ..
         } => {
             let old = principal(&tx, id)?;
             ensure!(
                 old.auth_revision == *expected_revision,
                 "User changed; reload"
             );
-            password_change(&tx, id, password)?;
+            password_change(&tx, id, prepared.new_hash()?)?;
             json!({"fresh_login_required":true})
         }
-        Action::ChangePassword { password, .. } => {
-            password_change(&tx, &p.id, password)?;
+        Action::ChangePassword { .. } => {
+            password_change(&tx, &p.id, prepared.new_hash()?)?;
             json!({"fresh_login_required":true})
         }
-        Action::EnableProtection { account, password } => {
+        Action::EnableProtection { account, .. } => {
             let (owner, id): (u32, Option<String>) =
                 tx.query_row("SELECT owner_uid,owner_id FROM security_config", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
@@ -953,7 +1149,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
                 "UPDATE users SET email=?2 WHERE id=?1",
                 params![p.id, account],
             )?;
-            password_change(&tx, &p.id, password)?;
+            password_change(&tx, &p.id, prepared.new_hash()?)?;
             tx.execute("UPDATE security_config SET mode='protected',owner_id=NULL,revision=revision+1 WHERE id=1",[])?;
             json!({"protection":"protected","fresh_login_required":true})
         }
@@ -1060,12 +1256,11 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
     tx.commit()?;
     Ok(value)
 }
-fn password_change(db: &Connection, id: &str, password: &str) -> Result<()> {
-    let hash = Zeroizing::new(auth::hash_password(password)?);
+fn password_change(db: &Connection, id: &str, hash: &str) -> Result<()> {
     invalidate(db, id)?;
     db.execute(
         "UPDATE users SET password_hash=?2,auth_revision=auth_revision+1 WHERE id=?1",
-        params![id, hash.as_str()],
+        params![id, hash],
     )?;
     mirror_admin(db, id)?;
     Ok(())
@@ -1130,4 +1325,144 @@ pub fn init_owner(store: &Store, uid: u32, profile: crate::store::Profile) -> Re
     audit(&tx, &id, uid, "owner", "initialize", "", "accepted")?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod password_work_tests {
+    use super::*;
+    use crate::store::Profile;
+
+    fn fixture() -> Result<(tempfile::TempDir, Store)> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&temp.path().join("state"))?;
+        store.init(
+            "owner@fixture.invalid",
+            "fixture-password-long",
+            Profile::Light,
+            false,
+        )?;
+        Ok((temp, store))
+    }
+    fn login_request() -> Envelope {
+        serde_json::from_value(json!({"version":1,"request_id":"password-work","session":null,"confirmation":null,"payload":{"action":"login","account":"owner@fixture.invalid","password":"fixture-password-long"}})).unwrap()
+    }
+    #[test]
+    fn password_verification_does_not_hold_store_mutex() -> Result<()> {
+        let (_temp, store) = fixture()?;
+        let request = login_request();
+        let prepared = prepare_work(
+            &store,
+            42,
+            &request,
+            |password, hash| {
+                // This would deadlock if Argon2 were called with the database guard held.
+                assert!(store.settings().is_ok());
+                auth::verify(password, hash)
+            },
+            auth::hash_password,
+        )?;
+        let mut db = store.db()?;
+        prepared.recheck(&db)?;
+        assert!(execute(&mut db, 42, &request, "protected", &prepared).is_ok());
+        Ok(())
+    }
+    #[test]
+    fn changed_password_or_revision_during_verification_cannot_authenticate() -> Result<()> {
+        let (_temp, store) = fixture()?;
+        let request = login_request();
+        let prepared = prepare_work(
+            &store,
+            42,
+            &request,
+            |password, hash| {
+                assert!(auth::verify(password, hash));
+                store
+                    .db()
+                    .unwrap()
+                    .execute("UPDATE users SET auth_revision=auth_revision+1", [])
+                    .unwrap();
+                true
+            },
+            auth::hash_password,
+        )?;
+        assert!(prepared.recheck(&*store.db()?).is_err());
+        let prepared = prepare_work(
+            &store,
+            42,
+            &request,
+            |_password, _hash| {
+                store
+                    .db()
+                    .unwrap()
+                    .execute("UPDATE users SET password_hash='replaced'", [])
+                    .unwrap();
+                true
+            },
+            auth::hash_password,
+        )?;
+        assert!(prepared.recheck(&*store.db()?).is_err());
+        assert_eq!(
+            store
+                .db()?
+                .query_row("SELECT COUNT(*) FROM terminal_sessions", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+    #[test]
+    fn limited_workers_and_rechecked_failure_budget_prevent_concurrent_bypass() -> Result<()> {
+        let (_temp, store) = fixture()?;
+        let request = login_request();
+        let first = prepare_work(&store, 42, &request, |_, _| false, auth::hash_password)?;
+        let second = prepare_work(&store, 42, &request, |_, _| false, auth::hash_password)?;
+        assert!(
+            prepare_work(&store, 42, &request, |_, _| true, auth::hash_password)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("busy")
+        );
+        // Another already-completed check can fill the budget while these two
+        // workers were running. Neither completion may issue a session.
+        let mut db = store.db()?;
+        for _ in 0..5 {
+            rate(&db, 42, "owner@fixture.invalid", "login", true)?;
+        }
+        assert!(execute(&mut db, 42, &request, "protected", &first).is_err());
+        assert!(execute(&mut db, 42, &request, "protected", &second).is_err());
+        drop(db);
+        drop(first);
+        drop(second);
+        assert!(store.password_worker().is_ok());
+        Ok(())
+    }
+    #[test]
+    fn password_hashing_is_off_lock_and_rechecks_authority() -> Result<()> {
+        let (_temp, store) = fixture()?;
+        let login = handle(&store, 42, &login_request())?;
+        let token = login["token"].as_str().unwrap();
+        let target = json!({"action":"user_create","account":"new@fixture.invalid","password":"fixture-password-long","role":"viewer","grants":{}});
+        let confirm: Envelope = serde_json::from_value(
+            json!({"version":1,"request_id":"confirm","session":token,"confirmation":null,"payload":{"action":"reauthenticate","password":"fixture-password-long","target":target}}),
+        )?;
+        let proof = handle(&store, 42, &confirm)?;
+        let request: Envelope = serde_json::from_value(
+            json!({"version":1,"request_id":"create","session":token,"confirmation":proof["confirmation"],"payload":target}),
+        )?;
+        let prepared = prepare_work(&store, 42, &request, auth::verify, |password| {
+            store
+                .db()?
+                .execute("UPDATE users SET auth_revision=auth_revision+1", [])?;
+            auth::hash_password(password)
+        })?;
+        assert!(prepared.recheck(&*store.db()?).is_err());
+        assert_eq!(
+            store
+                .db()?
+                .query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
 }
