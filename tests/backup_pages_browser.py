@@ -693,7 +693,12 @@ def main():
                 # and actions bind to the node that was rendered (same snapshot ID on both).
                 fx.hold.add("/api/v1/backup-server/snapshots/beta")
                 sel().select_option("beta")
-                eventually(page, "true")
+                for _ in range(
+                    50
+                ):  # the held beta request must have reached the fixture
+                    if len(fx.held) == 1:
+                        break
+                    page.wait_for_timeout(100)
                 sel().select_option("alpha")
                 check(
                     "R1 latest selection renders",
