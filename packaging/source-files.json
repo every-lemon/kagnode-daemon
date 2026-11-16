@@ -39,6 +39,7 @@
   "crates/backup-format/src/lib.rs",
   "crates/backup-format/tests/roundtrip.rs",
   "docs/ACCOUNT-SYNC.md",
+  "docs/AUDIT-RETENTION.md",
   "docs/BACKUP-SERVER.md",
   "docs/CLI-AUTHORIZATION.md",
   "docs/CORE.md",
