@@ -14,6 +14,7 @@ use kagnode_daemon::{
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+static TEST_SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn request(
     r: &Router,
     method: &str,
@@ -22,9 +23,23 @@ async fn request(
     csrf: &str,
     body: Value,
 ) -> Result<Response> {
+    request_at(r, method, path, cookie, csrf, body, "192.0.2.1:3456").await
+}
+async fn request_at(
+    r: &Router,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    csrf: &str,
+    body: Value,
+    peer: &str,
+) -> Result<Response> {
     Ok(r.clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    peer.parse::<std::net::SocketAddr>()?,
+                ))
                 .method(method)
                 .uri(path)
                 .header("origin", "http://localhost")
@@ -81,6 +96,7 @@ async fn login(r: &Router, account: &str) -> Result<(String, String)> {
 }
 #[tokio::test]
 async fn web_roles_enforce_scope_csrf_audience_confirmation_and_revocation() -> Result<()> {
+    let _server = TEST_SERVER.lock().await;
     let dir = tempfile::tempdir()?;
     let s = Store::open(&dir.path().join("state"))?;
     s.init(
@@ -310,5 +326,168 @@ async fn web_roles_enforce_scope_csrf_audience_confirmation_and_revocation() -> 
         .status(),
         StatusCode::OK
     );
+    Ok(())
+}
+
+async fn password_login_at(
+    r: &Router,
+    peer: &str,
+    account: &str,
+    password: &str,
+) -> Result<Response> {
+    let challenge = request(r, "GET", "/api/v1/roles/auth", "", "", Value::Null).await?;
+    let cookie = challenge.headers()["set-cookie"]
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let csrf = value(challenge).await?["csrf"].as_str().unwrap().to_owned();
+    request_at(
+        r,
+        "POST",
+        "/api/v1/roles/login",
+        &cookie,
+        &csrf,
+        body(
+            json!({"action":"login","account":account,"password":password}),
+            None,
+        ),
+        peer,
+    )
+    .await
+}
+fn web_fixture() -> Result<(tempfile::TempDir, Store, Router)> {
+    let dir = tempfile::tempdir()?;
+    let s = Store::open(&dir.path().join("state"))?;
+    s.init(
+        "owner@fixture.invalid",
+        "fixture-password-long",
+        Profile::Light,
+        false,
+    )?;
+    let r = web::router(App {
+        store: s.clone(),
+        origin: "http://localhost".into(),
+        core: std::sync::Arc::new(
+            kagnode_core::Core::new(s.root.join("core"), "daemon")
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ),
+    });
+    Ok((dir, s, r))
+}
+#[tokio::test]
+async fn made_up_web_accounts_never_lock_other_accounts_or_terminal_global_budget() -> Result<()> {
+    let _server = TEST_SERVER.lock().await;
+    let (_dir, s, r) = web_fixture()?;
+    for n in 0..60 {
+        assert_eq!(
+            password_login_at(
+                &r,
+                "192.0.2.1:1234",
+                &format!("madeup{n}@fixture.invalid"),
+                "wrong"
+            )
+            .await?
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // Same peer/different account and different peer/different account both work.
+    assert_eq!(
+        password_login_at(
+            &r,
+            "192.0.2.1:1234",
+            "owner@fixture.invalid",
+            "fixture-password-long"
+        )
+        .await?
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        password_login_at(
+            &r,
+            "192.0.2.2:9876",
+            "owner@fixture.invalid",
+            "fixture-password-long"
+        )
+        .await?
+        .status(),
+        StatusCode::OK
+    );
+    let db = Connection::open(s.root.join("daemon.sqlite"))?;
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM security_attempts WHERE identity='global' OR identity='uid:4294967295'",[],|r|r.get::<_,i64>(0))?,0);
+    for _ in 0..5 {
+        assert_eq!(
+            password_login_at(&r, "192.0.2.1:1234", "owner@fixture.invalid", "wrong")
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        password_login_at(
+            &r,
+            "192.0.2.1:1234",
+            "owner@fixture.invalid",
+            "fixture-password-long"
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Keep the real-account bucket across peers; a forwarded IP is not a bypass.
+    assert_eq!(
+        password_login_at(
+            &r,
+            "192.0.2.3:9876",
+            "owner@fixture.invalid",
+            "fixture-password-long"
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let e: Envelope = serde_json::from_value(
+        json!({"version":1,"request_id":"terminal-after-web","session":null,"confirmation":null,"payload":{"action":"login","account":"owner@fixture.invalid","password":"fixture-password-long"}}),
+    )?;
+    assert!(roles::handle(&s, 42, &e).is_ok());
+    Ok(())
+}
+#[tokio::test]
+async fn nonexistent_user_errors_are_generic_and_oversized_role_bodies_are_rejected() -> Result<()>
+{
+    let _server = TEST_SERVER.lock().await;
+    let (_dir, s, r) = web_fixture()?;
+    Connection::open(s.root.join("daemon.sqlite"))?
+        .execute("UPDATE security_config SET admin_enabled=1", [])?;
+    let (cookie, csrf) = login(&r, "owner@fixture.invalid").await?;
+    let target = json!({"action":"user_update","id":"does-not-exist","expected_revision":1,"role":"viewer","grants":{},"disabled":false});
+    let proof=value(request(&r,"POST","/api/v1/roles/confirm",&cookie,&csrf,body(json!({"action":"reauthenticate","password":"fixture-password-long","target":target}),None)).await?).await?;
+    let response = request(
+        &r,
+        "POST",
+        "/api/v1/roles/users-update",
+        &cookie,
+        &csrf,
+        body(target, proof["confirmation"].as_str()),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        value(response).await?,
+        json!({"error":"Request unavailable"})
+    );
+    let response = request(
+        &r,
+        "POST",
+        "/api/v1/roles/login",
+        "",
+        "",
+        json!({"padding":"x".repeat(20000)}),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     Ok(())
 }

@@ -7,7 +7,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -61,6 +61,7 @@ pub fn routes() -> Router<App> {
         .route("/api/v1/roles/login", post(login))
         .route("/api/v1/roles/products/{product}", get(product))
         .route("/api/v1/roles/{action}", get(read).post(write))
+        .layer(DefaultBodyLimit::max(16384))
 }
 async fn challenge(State(app): State<App>) -> Response {
     match auth::random() {
@@ -72,7 +73,12 @@ async fn challenge(State(app): State<App>) -> Response {
         Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "Sign-in unavailable"),
     }
 }
-async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Request>) -> Response {
+async fn login(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    h: HeaderMap,
+    Json(body): Json<Request>,
+) -> Response {
     if h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(app.origin.as_str())
         || h.get("x-csrf-token")
             .and_then(|v| v.to_str().ok())
@@ -92,7 +98,7 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Request>) 
         confirmation: None,
         payload: body.payload,
     };
-    match execute(&app, e).await {
+    match execute(&app, e, Some(peer.ip())).await {
         Ok(mut value) => {
             let token = value
                 .as_object_mut()
@@ -103,26 +109,45 @@ async fn login(State(app): State<App>, h: HeaderMap, Json(body): Json<Request>) 
             set_cookie(&mut r, &app, COOKIE, &token, 28800);
             r
         }
+        Err(e)
+            if e.to_string() == "Authentication workers busy"
+                || e.to_string() == "Password workers busy; retry later" =>
+        {
+            failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authentication busy; retry later",
+            )
+        }
         Err(_) => failure(
             StatusCode::UNAUTHORIZED,
             "Sign-in failed or is temporarily limited",
         ),
     }
 }
-async fn execute(app: &App, e: Envelope) -> anyhow::Result<Value> {
+async fn execute(app: &App, e: Envelope, peer: Option<std::net::IpAddr>) -> anyhow::Result<Value> {
     let permit = WORKERS
         .try_acquire()
         .map_err(|_| anyhow::anyhow!("Authentication workers busy"))?;
     let store = app.store.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        roles::handle_web(&store, &e)
-            .and_then(|v| runtime::complete_analytics(&store, &e.payload, v))
+        roles::handle_web(
+            &store,
+            &e,
+            peer.ok_or_else(|| anyhow::anyhow!("Browser peer unavailable"))?,
+        )
+        .and_then(|v| runtime::complete_analytics(&store, &e.payload, v))
     })
     .await
     .map_err(|_| anyhow::anyhow!("Request unavailable"))?
 }
-async fn dispatch(app: App, h: HeaderMap, request: Request, mutate: bool) -> Response {
+async fn dispatch(
+    app: App,
+    h: HeaderMap,
+    request: Request,
+    mutate: bool,
+    peer: std::net::IpAddr,
+) -> Response {
     let token = cookie(&h, COOKIE).unwrap_or("");
     let csrf = match roles::web_session(&app.store, token) {
         Ok(v) => v,
@@ -145,7 +170,7 @@ async fn dispatch(app: App, h: HeaderMap, request: Request, mutate: bool) -> Res
         confirmation: request.confirmation,
         payload: request.payload,
     };
-    match execute(&app, e).await {
+    match execute(&app, e, Some(peer)).await {
         Ok(value) => {
             let mut r = Json(value).into_response();
             if logout {
@@ -153,20 +178,46 @@ async fn dispatch(app: App, h: HeaderMap, request: Request, mutate: bool) -> Res
             }
             r
         }
-        Err(e) => {
-            let m = e.to_string();
-            let status = if m.contains("changed; reload") {
-                StatusCode::CONFLICT
-            } else if m == "Sign in again" {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::FORBIDDEN
-            };
-            failure(status, &m)
-        }
+        Err(e) => public_error(&e.to_string()),
     }
 }
-async fn read(State(app): State<App>, Path(action): Path<String>, h: HeaderMap) -> Response {
+fn public_error(message: &str) -> Response {
+    let status = match message {
+        "Sign in again" => StatusCode::UNAUTHORIZED,
+        "Authentication workers busy" | "Password workers busy; retry later" => {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authentication busy; retry later",
+            );
+        }
+        "User changed; reload"
+        | "Security settings changed; reload"
+        | "Retention changed; reload" => StatusCode::CONFLICT,
+        "Action not permitted"
+        | "Web administration is disabled"
+        | "Fresh confirmation required"
+        | "Confirmation refused"
+        | "Unexpected confirmation"
+        | "Authentication refused"
+        | "Authentication refused; retry later"
+        | "Unknown product"
+        | "Viewer cannot have product grants"
+        | "Only Managers have product grants"
+        | "User limit reached"
+        | "Cannot remove the last enabled Operator"
+        | "Use a password between 12 and 1024 bytes"
+        | "Enter a valid administrator email"
+        | "Authorization changed; retry after signing in" => StatusCode::FORBIDDEN,
+        _ => return failure(StatusCode::INTERNAL_SERVER_ERROR, "Request unavailable"),
+    };
+    failure(status, message)
+}
+async fn read(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Path(action): Path<String>,
+    h: HeaderMap,
+) -> Response {
     let payload = match action.as_str() {
         "whoami" => Action::Whoami,
         "capabilities" => Action::Capabilities,
@@ -187,10 +238,16 @@ async fn read(State(app): State<App>, Path(action): Path<String>, h: HeaderMap) 
             payload,
         },
         false,
+        peer.ip(),
     )
     .await
 }
-async fn product(State(app): State<App>, Path(product): Path<String>, h: HeaderMap) -> Response {
+async fn product(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Path(product): Path<String>,
+    h: HeaderMap,
+) -> Response {
     dispatch(
         app,
         h,
@@ -200,11 +257,13 @@ async fn product(State(app): State<App>, Path(product): Path<String>, h: HeaderM
             payload: Action::ProductStatus { product },
         },
         false,
+        peer.ip(),
     )
     .await
 }
 async fn write(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Path(action): Path<String>,
     h: HeaderMap,
     Json(body): Json<Request>,
@@ -225,5 +284,5 @@ async fn write(
     if !valid {
         return failure(StatusCode::NOT_FOUND, "Unknown or mismatched action");
     }
-    dispatch(app, h, body, true).await
+    dispatch(app, h, body, true, peer.ip()).await
 }
