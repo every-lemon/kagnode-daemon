@@ -4,13 +4,41 @@
 
 ## Overview
 
-An administrator workspace for KagNode applications, with a shared Core dashboard and a Rust terminal interface. The repository was renamed from `kagnode-cli`; existing releases, account credentials, native data and the `kagnode` command remain compatible.
+An administrator workspace for KagNode applications, with a shared Core dashboard and a Rust terminal interface. The repository was renamed from `kagnode-cli`; retained compatibility releases preserve their existing account and native-data behavior and the `kagnode` command. Adoption by the Rust candidate requires separate migration and installation qualification.
+
+### What it looks like
+
+All screenshots are examples from reviewed feature-source fixtures with fictional accounts. No real server, account or data appears. The captured web fixture used Core 5.0.11; the integrated source now pins Core 5.0.17, so shared navigation appearance can differ. Screenshots illustrate source capabilities, not a released Rust binary, production deployment or native-service qualification.
+
+**Terminal.** `kagnode` asks who you are first, then shows the screens your role allows.
+
+| Sign in                                                                                                     | Workspace                                                                                                      |
+| ----------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| ![The terminal sign-in box asking for an account and password](docs/images/terminal-1-signin.png)           | ![The Operator's workspace with applications, node health and key hints](docs/images/terminal-2-workspace.png) |
+| ![The Users screen listing accounts with their role, services and status](docs/images/terminal-3-users.png) | ![The new-user form with Operator, Manager and Viewer roles](docs/images/terminal-4-new-user.png)              |
+
+**Web administration.** An Operator manages accounts; a Manager sees only the services they were given.
+
+| Operator: Users                                                                                  | Manager: Services                                                                                                         |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| ![The Administration page with the Users table and New user button](docs/images/admin-users.png) | ![A Manager's Services tab listing Proxy at view level and Mail at operate level](docs/images/admin-manager-services.png) |
+
+### How accounts and roles work (merged source, not released)
+
+The reviewed roles and authenticated clients are integrated in current source. They have not been published as a new Rust runtime release or deployed over a legacy installation. Check [Release status](#release-status), [migration limits](docs/RUST-MIGRATION.md) and the changelog before relying on them.
+
+1. **First account.** Setup asks whether to protect the Daemon with an Operator password. The protected path creates the first **Operator**. Declining currently stops before provisioning because service-user support for unprotected installation is unfinished. Explicit `init-owner` supports an empty local development store with one implicit Operator and an "unprotected" marker; it cannot downgrade an existing protected store and is not a qualified production installation.
+2. **Three roles.** An **Operator** can do everything, including managing users. A **Manager** gets chosen services, each at a level: _view_, _operate_ or _manage_. These levels bound authorization; native health/log/start/stop/boot/Core actions remain unavailable until their adapters are implemented and qualified. A **Viewer** sees read-only server analytics only.
+3. **The Daemon decides.** The terminal and the browser are clients. They send your session to the Daemon, which checks your role on every request, so hiding a button is never the only protection.
+4. **Risky changes ask again.** Creating users, changing roles, resetting passwords and changing settings each ask for your own password, bound to that exact change, and a result that could not be read is reported as uncertain instead of retried.
+5. **Web administration is off by default.** While off, the web page cannot change users or settings. An Operator turns it on from the terminal (`a`). Managed applications are never affected either way.
+6. **Limits.** Native product controls (logs, boot, Core updates, backup management) are not switched on yet. Separate-UID admission and lossless security-audit retention remain designs, not deployed controls. People who share the machine's operating-system account are not separated from each other; the security notes explain the boundary.
 
 ## Release status
 
-**5.0.3** is the coordinated stable compatibility command release. The **5.0.3 Rust Daemon candidate** adds local administration, Core presentation, terminal folder navigation, reviewed native service operations, encrypted control-database backups and fresh-install profiles. Qualification and migration work is tracked in [the Rust migration matrix](docs/RUST-MIGRATION.md).
+**5.0.3** is the coordinated stable compatibility command release. The **5.0.3 Rust Daemon candidate** adds local administration, Core presentation, terminal folder navigation, reviewed native-operation scaffolding (authenticated product controls remain disabled), encrypted control-database backups and fresh-install profiles. Qualification and migration work is tracked in [the Rust migration matrix](docs/RUST-MIGRATION.md).
 
-The Rust candidate does not replace an existing CLI installation until compatibility is qualified. Remote node management, live networking, automatic HA and Core Server Offloading remain gated. Saving a cluster declaration is not HA activation. Existing application runtimes and data stay in place.
+No new Rust candidate release or production deployment is established by these source merges. The Rust candidate does not replace an existing CLI installation until compatibility is qualified. Remote node management, live networking, automatic HA and Core Server Offloading remain gated. Saving a cluster declaration is not HA activation. Existing application runtimes and data stay in place.
 
 ## Features
 
@@ -18,7 +46,7 @@ The Rust candidate does not replace an existing CLI installation until compatibi
 - Canonical Core login, sidebar, folder navigation, search, account controls and preferences.
 - Keyboard/mouse terminal browsing and scriptable JSON inspection.
 - Root-enrolled service bindings, reviewed definition/state hashes, request idempotency and uncertain-operation recovery.
-- Fresh Light/Production install profiles; optional web dashboard with private local administration retained.
+- Light/Production install-profile source and optional web dashboard; owner-mode service installation and existing-runtime adoption remain unqualified.
 - Consistent encrypted Daemon database snapshots with restore checks; application data retains separate backup ownership.
 - Typed HA declarations and fail-closed promotion preconditions; live cluster activation remains unqualified.
 - Retained compatibility CLI source and existing account/installer/update flows during staged Rust replacement.
@@ -38,7 +66,7 @@ Download from [GitHub Releases](https://github.com/every-lemon/kagnode-daemon/re
 | Complete source / artwork | `.tar.xz`, `.tar.gz`, `.zip`                 | Named top-level directory; manual setup     |
 | Source                    | `.deb`                                       | Source only; does not provision a service   |
 | Source                    | `.rpm`                                       | Rocky Linux 10 source payload; manual build |
-| Linux CLI binaries        | `.deb`, `.rpm`, `.tar.xz`, `.tar.gz`, `.zip` | amd64 and arm64                             |
+| Retained compatibility CLI binaries | `.deb`, `.rpm`, `.tar.xz`, `.tar.gz`, `.zip` | amd64 and arm64                             |
 
 Linux arm64 binaries are cross-built; disposable package lifecycle checks run on amd64. Physical/native service qualification remains separate.
 
@@ -70,6 +98,9 @@ Use HTTPS and least-privilege accounts for hosted services. Keep secrets and use
 ## Development and testing
 
 ```sh
+cargo fmt --all --check
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --workspace --locked
 go test ./...
 go vet ./...
 python3 -m unittest discover -s tests -p 'test_*.py'
