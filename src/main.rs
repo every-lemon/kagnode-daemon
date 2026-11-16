@@ -58,14 +58,17 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:8750")]
         origin: String,
     },
+    /// Host-owner compatibility interface (root or service account); not a logical-role client.
     Status {
         #[arg(long)]
         json: bool,
     },
+    /// Host-owner compatibility interface (root or service account); not a logical-role client.
     Settings {
         #[command(subcommand)]
         command: Setting,
     },
+    /// Host-owner compatibility interface (root or service account); not a logical-role client.
     Ha {
         #[command(subcommand)]
         command: Ha,
@@ -93,13 +96,14 @@ enum Command {
         origin: String,
     },
     Health,
-    /// Live monitoring from the persistent local daemon.
+    /// Host-owner monitoring read from durable local history. Logical users use `user request`.
     Monitor {
         #[arg(long)]
         metric: Option<String>,
         #[arg(long, default_value_t = 3600)]
         seconds: u32,
     },
+    /// Host-owner compatibility interface (root or service account); not a logical-role client.
     Retention {
         #[arg(long)]
         days: Option<u32>,
@@ -132,6 +136,7 @@ enum Command {
         #[arg(long)]
         apply_plan: Option<PathBuf>,
     },
+    /// Host-owner compatibility interface (root or service account); not a logical-role client.
     BackupServer {
         #[command(subcommand)]
         command: BackupServer,
@@ -142,6 +147,7 @@ enum Command {
         #[arg(long)]
         allowed_uid: u32,
     },
+    /// Host-owner privileged broker client; not available to logical Managers or Viewers.
     Services {
         #[command(subcommand)]
         command: Services,
@@ -512,6 +518,20 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
+    if matches!(
+        args.command,
+        Some(
+            Command::Status { .. }
+                | Command::Settings { .. }
+                | Command::Ha { .. }
+                | Command::Monitor { .. }
+                | Command::Retention { .. }
+                | Command::BackupServer { .. }
+                | Command::Health
+        )
+    ) {
+        require_host_owner(&args.root)?;
+    }
     // Use the runtime owner for its database, even from a root terminal; avoid
     // creating root-owned SQLite journal files that strand the service account.
     if unsafe { libc::geteuid() } == 0 && args.root.exists() {
@@ -697,9 +717,10 @@ async fn main() -> Result<()> {
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&kagnode_daemon::runtime::request(
-                    &store.root,
-                    &query
+                serde_json::to_string_pretty(&kagnode_daemon::runtime::dispatch_as(
+                    &store,
+                    query,
+                    "host-owner-cli"
                 )?)?
             );
         }
@@ -710,7 +731,8 @@ async fn main() -> Result<()> {
             confirm_trim,
         }) => {
             use kagnode_daemon::{metrics::Policy, runtime};
-            let value = runtime::request(&store.root, &runtime::Request::Retention)?;
+            let value =
+                runtime::dispatch_as(&store, runtime::Request::Retention, "host-owner-cli")?;
             let result = if days.is_some() || budget_mib.is_some() {
                 let mut policy: Policy = serde_json::from_value(value["policy"].clone())?;
                 if let Some(days) = days {
@@ -724,13 +746,14 @@ async fn main() -> Result<()> {
                 let revision = revision.ok_or_else(|| {
                     anyhow::anyhow!("Read retention first and supply its --revision")
                 })?;
-                runtime::request(
-                    &store.root,
-                    &runtime::Request::SetRetention {
+                runtime::dispatch_as(
+                    &store,
+                    runtime::Request::SetRetention {
                         revision,
                         policy,
                         confirm_trim,
                     },
+                    "host-owner-cli",
                 )?
             } else {
                 value
@@ -822,5 +845,16 @@ async fn main() -> Result<()> {
         Some(Command::Tui { no_mouse }) => kagnode_daemon::tui::run(&store, !no_mouse)?,
         None => kagnode_daemon::tui::run(&store, true)?,
     }
+    Ok(())
+}
+
+fn require_host_owner(root: &std::path::Path) -> Result<()> {
+    let m = root.symlink_metadata().map_err(|_| anyhow::anyhow!("Host-owner command requires an existing installation; logical users use kagnode user request"))?;
+    ensure!(
+        m.is_dir()
+            && !m.file_type().is_symlink()
+            && (unsafe { libc::geteuid() } == 0 || m.uid() == unsafe { libc::geteuid() }),
+        "Host-owner command requires root or the runtime account; logical users use kagnode user request"
+    );
     Ok(())
 }
