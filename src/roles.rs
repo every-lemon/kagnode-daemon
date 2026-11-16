@@ -10,6 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DUMMY: &str = "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$LVpD9X5K/RWgyqzbMvnOjVApq+S+ZJ+8sAc7vPgXlZI";
 pub const BACKUP_PRODUCT: &str = "backup";
+const WEB_UID: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -274,6 +275,7 @@ CREATE TABLE IF NOT EXISTS security_attempts(identity TEXT PRIMARY KEY,start INT
 CREATE TABLE IF NOT EXISTS security_receipts(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,uid INTEGER NOT NULL,mode TEXT NOT NULL,action TEXT NOT NULL,request_hash TEXT NOT NULL,outcome TEXT NOT NULL,at INTEGER NOT NULL,receipt_mac TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS security_key(id INTEGER PRIMARY KEY CHECK(id=1),key_hex TEXT NOT NULL);")?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS web_session_revisions(session_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,auth_revision INTEGER NOT NULL);")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS web_role_sessions(hash TEXT PRIMARY KEY REFERENCES terminal_sessions(hash) ON DELETE CASCADE,csrf TEXT NOT NULL);")?;
     tx.execute(
         "INSERT OR IGNORE INTO security_key VALUES(1,?1)",
         [auth::random()?],
@@ -414,6 +416,72 @@ fn rate(db: &Connection, uid: u32, account: &str, purpose: &str, failed: bool) -
     }
     Ok(())
 }
+fn web_rate(
+    db: &Connection,
+    peer: std::net::IpAddr,
+    account: &str,
+    purpose: &str,
+    failed: bool,
+) -> Result<()> {
+    let now = auth::now();
+    db.execute("DELETE FROM security_attempts WHERE start<=?1", [now - 900])?;
+    let account = auth::digest(account);
+    let peer = auth::digest(&peer.to_canonical().to_string());
+    for (key, limit, charge) in [
+        (format!("web:id:{account}"), 5, purpose == "login"),
+        (format!("web:reauth:{account}"), 20, purpose == "reauth"),
+        (
+            format!("web:peer:{peer}:{account}:login"),
+            5,
+            purpose == "login",
+        ),
+        (
+            format!("web:peer:{peer}:{account}:reauth"),
+            20,
+            purpose == "reauth",
+        ),
+    ] {
+        if purpose != "reauth" && (key.ends_with(":reauth") || key.starts_with("web:reauth:")) {
+            continue;
+        }
+        if failed && charge {
+            db.execute("INSERT INTO security_attempts VALUES(?1,?2,1) ON CONFLICT(identity) DO UPDATE SET count=count+1",params![key,now])?;
+        }
+        let count = db
+            .query_row(
+                "SELECT count FROM security_attempts WHERE identity=?1",
+                [key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        ensure!(
+            failed || count < limit,
+            "Authentication refused; retry later"
+        );
+    }
+    Ok(())
+}
+fn password_rate(
+    db: &Connection,
+    uid: u32,
+    account: &str,
+    purpose: &str,
+    failed: bool,
+    peer: Option<std::net::IpAddr>,
+) -> Result<()> {
+    if uid == WEB_UID {
+        web_rate(
+            db,
+            peer.ok_or_else(|| anyhow::anyhow!("Browser peer unavailable"))?,
+            account,
+            purpose,
+            failed,
+        )
+    } else {
+        rate(db, uid, account, purpose, failed)
+    }
+}
 fn password_check(
     db: &Connection,
     uid: u32,
@@ -421,11 +489,26 @@ fn password_check(
     purpose: &str,
     password: &str,
     hash: &str,
+    peer: Option<std::net::IpAddr>,
 ) -> Result<()> {
-    rate(db, uid, account, purpose, false)?;
+    password_rate(db, uid, account, purpose, false, peer)?;
     if !auth::verify(password, hash) {
-        rate(db, uid, account, purpose, true)?;
+        password_rate(db, uid, account, purpose, true, peer)?;
         anyhow::bail!("Authentication refused");
+    }
+    if uid == WEB_UID {
+        let account = auth::digest(account);
+        let peer = auth::digest(&peer.unwrap().to_canonical().to_string());
+        db.execute(
+            "DELETE FROM security_attempts WHERE identity IN (?1,?2,?3,?4)",
+            params![
+                format!("web:id:{account}"),
+                format!("web:peer:{peer}:{account}:login"),
+                format!("web:peer:{peer}:{account}:reauth"),
+                format!("web:reauth:{account}")
+            ],
+        )?;
+        return Ok(());
     }
     db.execute(
         "DELETE FROM security_attempts WHERE identity IN (?1,?2)",
@@ -496,7 +579,17 @@ fn session(db: &Connection, p: &Principal, uid: u32) -> Result<Value> {
             now + 28800
         ],
     )?;
-    Ok(json!({"token":token,"expires_at":now+28800,"whoami":whoami(db,p)?}))
+    let csrf = if uid == WEB_UID {
+        let csrf = auth::random()?;
+        db.execute(
+            "INSERT INTO web_role_sessions VALUES(?1,?2)",
+            params![auth::digest(&token), csrf],
+        )?;
+        Some(csrf)
+    } else {
+        None
+    };
+    Ok(json!({"token":token,"csrf":csrf,"expires_at":now+28800,"whoami":whoami(db,p)?}))
 }
 fn capabilities(p: &Principal, m: &str) -> Value {
     let global = [
@@ -563,6 +656,50 @@ fn digest(db: &Connection, a: &Action) -> Result<String> {
 }
 
 pub fn handle(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
+    ensure!(uid != WEB_UID, "Invalid local peer UID");
+    handle_inner(store, uid, e, None)
+}
+/// Browser transport owns the cookie; callers cannot supply actor/session fields.
+pub fn handle_web(store: &Store, e: &Envelope, peer: std::net::IpAddr) -> Result<Value> {
+    ensure!(
+        !matches!(
+            e.payload,
+            Action::OwnerSession | Action::RootRecover { .. } | Action::EnableProtection { .. }
+        ),
+        "Local control required"
+    );
+    handle_inner(store, WEB_UID, e, Some(peer))
+}
+pub fn web_session(store: &Store, token: &str) -> Result<String> {
+    let db = store.db()?;
+    identify(&db, WEB_UID, token)?;
+    db.query_row(
+        "SELECT csrf FROM web_role_sessions WHERE hash=?1",
+        [auth::digest(token)],
+        |r| r.get(0),
+    )
+    .map_err(|_| anyhow::anyhow!("Sign in again"))
+}
+fn web_admin_action(a: &Action) -> bool {
+    match a {
+        Action::Reauthenticate { target, .. } => web_admin_action(target),
+        Action::UserList
+        | Action::UserCreate { .. }
+        | Action::UserUpdate { .. }
+        | Action::UserResetPassword { .. }
+        | Action::SecuritySet { .. }
+        | Action::Audit
+        | Action::ReceiptGet { .. }
+        | Action::SetRetention { .. } => true,
+        _ => false,
+    }
+}
+fn handle_inner(
+    store: &Store,
+    uid: u32,
+    e: &Envelope,
+    peer: Option<std::net::IpAddr>,
+) -> Result<Value> {
     ensure!(
         e.version == 1
             && (1..=64).contains(&e.request_id.len())
@@ -586,7 +723,7 @@ pub fn handle(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
             }
         });
     let action = e.payload.name();
-    let result = execute(&mut db, uid, e, &m);
+    let result = execute(&mut db, uid, e, &m, peer);
     // Audit refused authentication/authorization too, without echoing identities,
     // request bodies, passwords, tokens or arbitrary error strings.
     if result.is_err() {
@@ -594,7 +731,27 @@ pub fn handle(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
     }
     result
 }
-fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value> {
+fn execute(
+    db: &mut Connection,
+    uid: u32,
+    e: &Envelope,
+    m: &str,
+    peer: Option<std::net::IpAddr>,
+) -> Result<Value> {
+    if uid == WEB_UID {
+        ensure!(
+            m == "protected",
+            "Browser sign-in requires password protection"
+        );
+        if web_admin_action(&e.payload) {
+            ensure!(
+                db.query_row("SELECT admin_enabled FROM security_config", [], |r| r
+                    .get::<_, bool>(0))?,
+                "Web administration is disabled"
+            );
+        }
+    }
+
     match &e.payload {
         Action::Login { account, password } => {
             ensure!(
@@ -617,6 +774,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
                 "login",
                 password,
                 row.as_ref().and_then(|r| r.1.as_deref()).unwrap_or(DUMMY),
+                peer,
             )?;
             ensure!(row.is_some(), "Authentication refused");
             let (id, verified_hash) = row.unwrap();
@@ -715,6 +873,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             "reauth",
             password,
             hash.as_deref().unwrap_or(DUMMY),
+            peer,
         )?;
         let confirmation = auth::random()?;
         db.execute(
@@ -764,6 +923,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             "reauth",
             current_password,
             hash.as_deref().unwrap_or(DUMMY),
+            peer,
         )?;
     }
     if e.payload.risky() {

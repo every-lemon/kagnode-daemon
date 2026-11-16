@@ -80,6 +80,7 @@ fn mutation(s: &App, h: &HeaderMap) -> Api<Session> {
 }
 pub fn router(app: App) -> Router {
     Router::new()
+        .merge(crate::web_roles::routes())
         .route("/healthz", get(health))
         .route("/login", get(login).post(login_post))
         .route("/logout", post(logout))
