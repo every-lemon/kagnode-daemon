@@ -306,6 +306,8 @@ pub fn render_login(f: &mut Frame, area: Rect, form: &LoginForm) {
 // ---------------------------------------------------------- user management
 #[derive(Clone, Debug)]
 pub struct UserRow {
+    pub id: String,
+    pub revision: i64,
     pub account: String,
     pub role: Role,
     pub disabled: bool,
@@ -901,12 +903,16 @@ mod tests {
     fn users_screens_show_roles_services_and_hide_passwords() {
         let rows = vec![
             UserRow {
+                id: String::new(),
+                revision: 1,
                 account: "owner@example.invalid".into(),
                 role: Role::Operator,
                 disabled: false,
                 grants: vec![],
             },
             UserRow {
+                id: String::new(),
+                revision: 1,
                 account: "ops@example.invalid".into(),
                 role: Role::Manager,
                 disabled: false,
@@ -916,6 +922,8 @@ mod tests {
                 }],
             },
             UserRow {
+                id: String::new(),
+                revision: 1,
                 account: "watch@example.invalid".into(),
                 role: Role::Viewer,
                 disabled: true,
@@ -1012,12 +1020,16 @@ mod tests {
         });
         let rows = vec![
             UserRow {
+                id: String::new(),
+                revision: 1,
                 account: "owner@example.invalid".into(),
                 role: Role::Operator,
                 disabled: false,
                 grants: vec![],
             },
             UserRow {
+                id: String::new(),
+                revision: 1,
                 account: "ops@example.invalid".into(),
                 role: Role::Manager,
                 disabled: false,
@@ -1033,6 +1045,8 @@ mod tests {
                 ],
             },
             UserRow {
+                id: String::new(),
+                revision: 1,
                 account: "watch@example.invalid".into(),
                 role: Role::Viewer,
                 disabled: true,
@@ -1064,6 +1078,8 @@ mod tests {
     fn tiny_terminals_do_not_panic() {
         let form = LoginForm::default();
         let users = Users::new(vec![UserRow {
+            id: String::new(),
+            revision: 1,
             account: "a".into(),
             role: Role::Viewer,
             disabled: false,
