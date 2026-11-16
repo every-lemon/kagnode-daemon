@@ -526,6 +526,11 @@ async fn main() -> Result<()> {
             );
         }
     }
+    if matches!(args.command, Some(Command::Tui { .. }) | None) {
+        // Sign in first: the terminal opens the local store only for Operators.
+        let mouse = !matches!(args.command, Some(Command::Tui { no_mouse: true }));
+        return kagnode_daemon::tui_gate::entry(&args.root, mouse);
+    }
     let store = Store::open(&args.root)?;
     match args.command {
         Some(Command::InitOwner { profile }) => {
@@ -819,8 +824,7 @@ async fn main() -> Result<()> {
             | Command::Install { .. }
             | Command::Backup { .. },
         ) => unreachable!(),
-        Some(Command::Tui { no_mouse }) => kagnode_daemon::tui::run(&store, !no_mouse)?,
-        None => kagnode_daemon::tui::run(&store, true)?,
+        Some(Command::Tui { .. }) | None => unreachable!("handled before the store opens"),
     }
     Ok(())
 }
