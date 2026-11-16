@@ -55,19 +55,60 @@ html[data-kn-core] [data-core-panel][hidden] {
   display: none !important;
 }
 html[data-kn-core] .kn-core-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
   box-sizing: border-box;
   width: min(540px, calc(100% - 32px));
   max-height: calc(100svh - 32px);
   overflow: auto;
   border: 1px solid var(--kn-line);
   border-radius: 12px;
-  padding: 24px;
+  padding: 0 24px 24px;
   color: var(--kn-text);
-  background: var(--kn-bg);
+  background: var(--kn-panel);
 }
 html[data-kn-core] .kn-core-dialog::backdrop {
   background: #0007;
   backdrop-filter: blur(3px);
+}
+html[data-kn-core] .kn-core-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 0 -24px 20px;
+  padding: 12px 16px 12px 24px;
+  border-bottom: 1px solid var(--kn-line);
+  background: var(--kn-panel);
+  cursor: move;
+  touch-action: none;
+}
+html[data-kn-core] .kn-core-dialog-header :is(h1, h2, h3) {
+  margin: 0;
+}
+html[data-kn-core] .kn-core-dialog-close {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--kn-line);
+  background: var(--kn-panel);
+  color: var(--kn-text);
+  font: inherit;
+  font-size: 24px;
+  cursor: pointer;
+}
+@media (max-width: 699px) {
+  html[data-kn-core] .kn-core-dialog-header {
+    cursor: default;
+    touch-action: auto;
+  }
 }
 html[data-kn-core] [data-core-avatar],
 html[data-kn-core] .avatar,
@@ -97,4 +138,149 @@ html[data-kn-core] [data-core-account-trigger] {
   html[data-kn-core] .kn-core-segment-indicator {
     transition: none;
   }
+}
+
+html[data-kn-core] .kn-core-dialog-resize {
+  position: sticky;
+  display: block;
+  bottom: -20px;
+  /* Overlap the bottom padding instead of adding an empty band below content.
+     Kept within the 20px corner inset so it never covers footer buttons. */
+  margin: -12px -20px -20px auto;
+  width: 18px;
+  height: 18px;
+  padding: 2px;
+  border: 0;
+  background: var(--kn-panel);
+  color: var(--kn-muted);
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 3;
+}
+.kn-core-dialog-resize svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+}
+html[data-kn-core] .kn-core-dialog-close {
+  background: transparent;
+  border-color: transparent;
+  font-weight: 400;
+}
+html[data-kn-core] .kn-core-dialog-close:hover {
+  background: var(--kn-bg);
+}
+/* Dialog content: stacked fields with consistent rhythm. A field nested in
+   its label keeps a small gap so focus rings never touch the label text. */
+html[data-kn-core] .kn-core-dialog form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+html[data-kn-core] .kn-core-dialog label {
+  display: block;
+  color: var(--kn-text);
+  font-size: 13px;
+  font-weight: 500;
+}
+html[data-kn-core]
+  .kn-core-dialog
+  label
+  > :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 6px;
+}
+/* Action row. Apps' page-footer styles must not leak into a dialog footer, so
+   the row resets borders/padding and owns its spacing. Buttons never touch and
+   wrap cleanly on narrow screens; the primary action stays last (right). */
+html[data-kn-core]
+  .kn-core-dialog
+  :is(
+    footer,
+    menu,
+    .dialog-actions,
+    .form-actions,
+    [data-core-dialog-actions]
+  ) {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 0;
+  padding: 16px 0 0;
+  border: 0;
+  border-top: 1px solid var(--kn-line);
+  background: none;
+  min-height: 0;
+  list-style: none;
+}
+html[data-kn-core]
+  .kn-core-dialog
+  :is(footer, menu, .dialog-actions, .form-actions, [data-core-dialog-actions])
+  > :is(button, .button, a.button) {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--kn-line);
+  border-radius: var(--kn-radius-control);
+  background: var(--kn-bg);
+  color: var(--kn-text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+html[data-kn-core]
+  .kn-core-dialog
+  :is(footer, menu, .dialog-actions, .form-actions, [data-core-dialog-actions])
+  > :is(button, .button):is(
+    :last-child,
+    .primary,
+    [data-primary],
+    [type="submit"]:only-of-type
+  ):not([value="cancel"], .secondary) {
+  border-color: var(--kn-accent);
+  background: var(--kn-accent);
+  color: #fff;
+}
+html[data-kn-core]
+  .kn-core-dialog
+  :is(footer, menu, .dialog-actions, .form-actions, [data-core-dialog-actions])
+  > :is(button, .button):focus-visible {
+  outline: 2px solid var(--kn-focus);
+  outline-offset: 2px;
+}
+@media (forced-colors: active) {
+  html[data-kn-core]
+    .kn-core-dialog
+    :is(
+      footer,
+      menu,
+      .dialog-actions,
+      .form-actions,
+      [data-core-dialog-actions]
+    )
+    > :is(button, .button) {
+    border: 1px solid ButtonText;
+    background: ButtonFace;
+    color: ButtonText;
+  }
+}
+@media (max-width: 699px), (pointer: coarse) {
+  html[data-kn-core] .kn-core-dialog-resize {
+    display: none;
+  }
+}
+html[data-kn-core]
+  .kn-core-dialog
+  :is([data-core-dialog-body], .kn-core-dialog-content) {
+  min-width: 0;
 }
