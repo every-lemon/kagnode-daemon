@@ -1,5 +1,6 @@
 [
   ".github/workflows/account-link.yml",
+  ".github/workflows/backup-pages.yml",
   ".github/workflows/ci.yml",
   ".github/workflows/packaging.yml",
   ".github/workflows/rust-daemon.yml",
@@ -93,6 +94,7 @@
   "src/tui.rs",
   "src/web.rs",
   "tests/backup-qa.Containerfile",
+  "tests/backup_pages_browser.py",
   "tests/backup_repository.rs",
   "tests/backup_review.rs",
   "tests/backup_role.rs",
