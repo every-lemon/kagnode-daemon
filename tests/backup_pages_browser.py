@@ -647,14 +647,14 @@ def main():
                 d.get_by_role("button", name="Cancel").click()
                 check(
                     "after a conflict the form shows the current values",
+                    # The form refresh and the notice are separate steps; wait for both.
                     eventually(
                         page,
-                        "document.querySelector('input[name=required_copies]').value === '2'",
-                    )
-                    and page.locator("#page-status")
-                    .filter(has_text="policy changed while you were editing")
-                    .count()
-                    == 1,
+                        "document.querySelector('input[name=required_copies]').value === '2'"
+                        " && (document.querySelector('#page-status')?.textContent || '')"
+                        ".includes('policy changed while you were editing')",
+                        seconds=10.0,
+                    ),
                 )
                 # uncertain outcome
                 page.get_by_role("button", name="Revoke alpha").click()
