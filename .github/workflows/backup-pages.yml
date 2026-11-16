@@ -28,3 +28,7 @@ jobs:
         env:
           KAGNODE_BROWSER_ENGINE: ${{ matrix.engine }}
           KAGNODE_RUST_BINARY: target/debug/kagnode
+      - run: python tests/admin_pages_browser.py
+        env:
+          KAGNODE_BROWSER_ENGINE: ${{ matrix.engine }}
+          KAGNODE_RUST_BINARY: target/debug/kagnode
