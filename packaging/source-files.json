@@ -54,6 +54,7 @@
   "docs/ROLES-SPEC.md",
   "docs/RUST-MIGRATION.md",
   "docs/SECURITY.md",
+  "docs/SEPARATE-UID-ADMISSION.md",
   "docs/STRUCTURE.md",
   "docs/VERIFICATION.md",
   "docs/images/admin-manager-services.png",
