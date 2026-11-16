@@ -287,6 +287,48 @@ class Fixture:
         return err("Unsupported", 404)
 
 
+def control(root, payload, session=None, confirmation=None):
+    """One request on the Daemon's private authenticated socket."""
+    link = socket.socket(socket.AF_UNIX)
+    link.settimeout(30)
+    link.connect(str(root / "run" / "control.sock"))
+    request = {
+        "version": 1,
+        "request_id": os.urandom(12).hex(),
+        "session": session,
+        "confirmation": confirmation,
+        "payload": payload,
+    }
+    link.sendall(json.dumps(request).encode() + b"\n")
+    data = b""
+    while chunk := link.recv(65536):
+        data += chunk
+    link.close()
+    reply = json.loads(data)
+    assert reply["ok"], reply
+    return reply["value"]
+
+
+def enable_web_admin(root):
+    """Web administration is off by default; an Operator turns it on locally."""
+    token = control(
+        root,
+        {"action": "login", "account": "owner@fixture.invalid", "password": PASSWORD},
+    )["token"]
+    revision = control(root, {"action": "security_get"}, session=token)["revision"]
+    target = {
+        "action": "security_set",
+        "expected_revision": revision,
+        "admin_enabled": True,
+    }
+    proof = control(
+        root,
+        {"action": "reauthenticate", "password": PASSWORD, "target": target},
+        session=token,
+    )
+    control(root, target, session=token, confirmation=proof["confirmation"])
+
+
 def start_server(tmp):
     pw = tmp / "password"
     pw.write_text(PASSWORD)
@@ -323,9 +365,12 @@ def start_server(tmp):
     for _ in range(100):
         try:
             socket.create_connection(("127.0.0.1", port), 0.2).close()
-            return proc, port
+            if (tmp / "root" / "run" / "control.sock").exists():
+                enable_web_admin(tmp / "root")
+                return proc, port
         except OSError:
-            time.sleep(0.1)
+            pass
+        time.sleep(0.1)
     proc.kill()
     raise SystemExit("Daemon dashboard did not start")
 
