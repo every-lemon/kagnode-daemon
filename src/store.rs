@@ -12,6 +12,7 @@ use std::{
 pub struct Store {
     pub root: PathBuf,
     db: Arc<Mutex<Connection>>,
+    password_workers: Arc<tokio::sync::Semaphore>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -97,12 +98,19 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
         Ok(Self {
             root: root.into(),
             db: Arc::new(Mutex::new(db)),
+            password_workers: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
     pub(crate) fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.db
             .lock()
             .map_err(|_| anyhow::anyhow!("Database unavailable"))
+    }
+    pub(crate) fn password_worker(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.password_workers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("Password workers busy; retry later"))
     }
     pub fn managed_root(&self) -> &Path {
         if self.root.file_name().is_some_and(|n| n == "controller") {
