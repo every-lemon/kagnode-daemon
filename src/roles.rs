@@ -582,14 +582,14 @@ fn prepare_work(
     }
     // Preserve confirmation consumption on validation failure: carry hash errors
     // into execute(), where the reviewed one-use token is consumed first.
-    if let Some(password) = new_password {
-        if prepared.check.as_ref().is_none_or(|c| c.valid) {
-            prepared.new_hash = Some(
-                hash(password)
-                    .map(Zeroizing::new)
-                    .map_err(|e| e.to_string()),
-            );
-        }
+    if let Some(password) = new_password
+        && prepared.check.as_ref().is_none_or(|c| c.valid)
+    {
+        prepared.new_hash = Some(
+            hash(password)
+                .map(Zeroizing::new)
+                .map_err(|e| e.to_string()),
+        );
     }
     Ok(prepared)
 }
