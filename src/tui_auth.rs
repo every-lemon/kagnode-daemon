@@ -323,6 +323,8 @@ pub struct CreateForm {
     pub focus: usize,
     pub grant_row: usize,
     pub error: Option<String>,
+    /// Set when changing an existing user's role and services.
+    pub editing: Option<UserRow>,
 }
 const FIELD_ACCOUNT: usize = 0;
 const FIELD_PASSWORD: usize = 1;
@@ -345,6 +347,7 @@ impl Default for CreateForm {
             focus: 0,
             grant_row: 0,
             error: None,
+            editing: None,
         }
     }
 }
@@ -364,6 +367,27 @@ pub enum CreateOutcome {
     Submit(NewUser),
 }
 impl CreateForm {
+    /// Change role and services of an existing user; account and password stay.
+    pub fn editing(row: &UserRow) -> Self {
+        let mut form = Self {
+            account: row.account.clone(),
+            role: row.role,
+            focus: FIELD_ROLE,
+            editing: Some(row.clone()),
+            ..Self::default()
+        };
+        for g in &row.grants {
+            form.grants.insert(g.product.clone(), Some(g.level));
+        }
+        form
+    }
+    fn first_field(&self) -> usize {
+        if self.editing.is_some() {
+            FIELD_ROLE
+        } else {
+            FIELD_ACCOUNT
+        }
+    }
     fn last_field(&self) -> usize {
         if self.role == Role::Manager {
             FIELD_GRANTS
@@ -373,15 +397,16 @@ impl CreateForm {
     }
     fn validate(&self) -> Result<NewUser, String> {
         let account = self.account.trim().to_owned();
-        if account.is_empty() || account.chars().count() > 254 {
+        let editing = self.editing.is_some();
+        if !editing && account.is_empty() || account.chars().count() > 254 {
             return Err("Enter an account name (up to 254 characters).".into());
         }
-        if self.password.chars().count() < MIN_PASSWORD {
+        if !editing && self.password.chars().count() < MIN_PASSWORD {
             return Err(format!(
                 "Use a password of at least {MIN_PASSWORD} characters."
             ));
         }
-        if *self.password != *self.confirm {
+        if !editing && *self.password != *self.confirm {
             return Err("The two passwords do not match.".into());
         }
         let grants: Vec<(String, Level)> = self
@@ -413,7 +438,9 @@ impl CreateForm {
             }
             KeyCode::Up if self.focus == FIELD_GRANTS && self.grant_row > 0 => self.grant_row -= 1,
             KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1).min(self.last_field()),
-            KeyCode::BackTab | KeyCode::Up => self.focus = self.focus.saturating_sub(1),
+            KeyCode::BackTab | KeyCode::Up => {
+                self.focus = self.focus.saturating_sub(1).max(self.first_field())
+            }
             KeyCode::Left | KeyCode::Right if self.focus == FIELD_ROLE => {
                 let at = Role::ALL.iter().position(|r| *r == self.role).unwrap_or(0);
                 let next = if key.code == KeyCode::Right {
@@ -471,6 +498,7 @@ impl CreateForm {
         CreateOutcome::None
     }
 }
+#[allow(clippy::large_enum_variant)]
 pub enum UsersMode {
     List,
     Create(CreateForm),
@@ -574,6 +602,8 @@ pub fn render_users(f: &mut Frame, area: Rect, users: &Users, you: &str) {
         Span::styled(" Disable/enable   ", Style::default().fg(MUTED)),
         Span::styled("p", Style::default().fg(ACCENT).bold()),
         Span::styled(" Reset password   ", Style::default().fg(MUTED)),
+        Span::styled("e", Style::default().fg(ACCENT).bold()),
+        Span::styled(" Edit role   ", Style::default().fg(MUTED)),
         Span::styled("Esc", Style::default().fg(ACCENT).bold()),
         Span::styled(" Back", Style::default().fg(MUTED)),
     ])];
@@ -587,17 +617,31 @@ pub fn render_users(f: &mut Frame, area: Rect, users: &Users, you: &str) {
 }
 fn render_create(f: &mut Frame, area: Rect, form: &CreateForm) {
     let mut lines = vec![
-        Line::from(Span::styled("New user", Style::default().bold())),
+        Line::from(Span::styled(
+            if form.editing.is_some() {
+                "Change role and services"
+            } else {
+                "New user"
+            },
+            Style::default().bold(),
+        )),
         Line::from(""),
         field("Account", &form.account, form.focus == FIELD_ACCOUNT, false),
-        field(
+    ];
+    if form.editing.is_none() {
+        lines.push(field(
             "Password",
             &form.password,
             form.focus == FIELD_PASSWORD,
             true,
-        ),
-        field("Confirm", &form.confirm, form.focus == FIELD_CONFIRM, true),
-    ];
+        ));
+        lines.push(field(
+            "Confirm",
+            &form.confirm,
+            form.focus == FIELD_CONFIRM,
+            true,
+        ));
+    }
     let mut roles = vec![Span::styled(
         format!("{:<10}", "Role"),
         Style::default().fg(if form.focus == FIELD_ROLE {
@@ -666,7 +710,14 @@ fn render_create(f: &mut Frame, area: Rect, form: &CreateForm) {
     }
     lines.push(Line::from(vec![
         Span::styled("Enter", Style::default().fg(ACCENT).bold()),
-        Span::styled(" next / create   ", Style::default().fg(MUTED)),
+        Span::styled(
+            if form.editing.is_some() {
+                " next / save   "
+            } else {
+                " next / create   "
+            },
+            Style::default().fg(MUTED),
+        ),
         Span::styled("Esc", Style::default().fg(ACCENT).bold()),
         Span::styled(" cancel", Style::default().fg(MUTED)),
     ]));
@@ -1244,5 +1295,38 @@ mod tests {
         assert!(prompt.values.iter().all(|v| v.is_empty()));
         assert_eq!(prompt.focus, 0);
         assert_eq!(prompt.key(press(KeyCode::Esc)), PromptOutcome::Cancel);
+    }
+
+    #[test]
+    fn editing_form_changes_role_and_services_without_asking_for_passwords() {
+        let row = UserRow {
+            id: "u1".into(),
+            revision: 3,
+            account: "mgr@example.invalid".into(),
+            role: Role::Manager,
+            disabled: false,
+            grants: vec![Grant {
+                product: "mail".into(),
+                level: Level::View,
+            }],
+        };
+        let mut form = CreateForm::editing(&row);
+        assert_eq!(form.focus, FIELD_ROLE);
+        let text = screen(100, 30, |f| render_create(f, f.area(), &form));
+        assert!(text.contains("Change role and services") && text.contains("mgr@example.invalid"));
+        assert!(!text.contains("Password") && !text.contains("Confirm"));
+        // Up never reaches the account or password fields.
+        form.key(press(KeyCode::Up));
+        form.key(press(KeyCode::Up));
+        assert_eq!(form.focus, FIELD_ROLE);
+        // Prefilled grant survives; raise it with Right on the grants row.
+        form.key(press(KeyCode::Down));
+        let CreateOutcome::Submit(user) = form.key(press(KeyCode::Enter)) else {
+            panic!("expected a submit");
+        };
+        assert_eq!(user.role, Role::Manager);
+        assert_eq!(user.grants.len(), 1);
+        assert_eq!(user.grants[0].1, Level::View);
+        assert!(user.password.is_empty());
     }
 }

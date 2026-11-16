@@ -145,6 +145,7 @@ pub fn sign_in(terminal: &mut DefaultTerminal, root: &Path) -> Result<Entry> {
 // ------------------------------------------------------------ Users screen
 enum Pending {
     Create(NewUser),
+    Edit(UserRow, NewUser),
     Toggle(UserRow),
     Reset(UserRow),
 }
@@ -159,6 +160,10 @@ fn run_pending(client: &Client, pending: &Pending, prompt: &PasswordPrompt) -> R
         Pending::Create(new) => {
             client.create_user(new, &prompt.values[0])?;
             Ok(format!("Created {}.", new.account))
+        }
+        Pending::Edit(row, new) => {
+            client.update_user(row, new.role, &new.grants, row.disabled, &prompt.values[0])?;
+            Ok(format!("Updated {}.", row.account))
         }
         Pending::Toggle(row) => {
             client.update_user(
@@ -248,17 +253,24 @@ pub fn users(terminal: &mut DefaultTerminal, client: &Client, me: &Identity) -> 
             continue;
         }
         if let UsersMode::Create(form) = &mut state.mode {
+            let editing = form.editing.clone();
             match form.key(key) {
                 CreateOutcome::Cancel => state.mode = UsersMode::List,
                 CreateOutcome::None => {}
                 CreateOutcome::Submit(new) => {
+                    let verb = if editing.is_some() {
+                        "Change"
+                    } else {
+                        "Create"
+                    };
+                    let explain = format!("{verb} {} as {}.", new.account, new.role.label());
+                    let pending = match editing {
+                        Some(row) => Pending::Edit(row, new),
+                        None => Pending::Create(new),
+                    };
                     prompt = Some((
-                        PasswordPrompt::new(
-                            "Confirm with your password",
-                            &format!("Create {} as {}.", new.account, new.role.label()),
-                            &["Password"],
-                        ),
-                        Pending::Create(new),
+                        PasswordPrompt::new("Confirm with your password", &explain, &["Password"]),
+                        pending,
                     ));
                 }
             }
@@ -274,6 +286,12 @@ pub fn users(terminal: &mut DefaultTerminal, client: &Client, me: &Identity) -> 
             KeyCode::Char('n') => {
                 state.message = None;
                 state.mode = UsersMode::Create(CreateForm::default());
+            }
+            KeyCode::Char('e') => {
+                if let Some(row) = row {
+                    state.message = None;
+                    state.mode = UsersMode::Create(CreateForm::editing(&row));
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(row) = row {

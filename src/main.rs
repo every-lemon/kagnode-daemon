@@ -411,6 +411,25 @@ async fn main() -> Result<()> {
         if *print_plan {
             return Ok(());
         }
+        // Supplying an account on the command line means a protected install.
+        let protect = email.is_some()
+            || password_file.is_some()
+            || !prompt(
+                "Protect the Daemon with an Operator password?\n  Yes: every terminal and dashboard action is tied to a signed-in account.\n  No:  only this machine's owner can use the terminal, with no account, and the\n       Daemon is shown as unprotected. You can add a password later.\n[Y/n] ",
+            )?
+            .eq_ignore_ascii_case("n");
+        if !protect {
+            ensure!(
+                prompt("Type owner to confirm an unprotected install: ")? == "owner",
+                "Installation cancelled before provisioning"
+            );
+            anyhow::bail!(
+                "Unprotected installation needs the installer's service-user support, which is not available yet. No changes were made; run again and choose a password."
+            );
+        }
+        println!(
+            "Operator: the first account. It manages everything and can add Managers (chosen services and levels) and Viewers (read-only analytics) from the terminal Users screen."
+        );
         let email = if let Some(v) = email {
             v.clone()
         } else {

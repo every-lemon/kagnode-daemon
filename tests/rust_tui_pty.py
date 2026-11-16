@@ -230,6 +230,11 @@ with tempfile.TemporaryDirectory(prefix="kagnode-rust-tui-") as temporary:
                 -400:
             ]
             assert b"Reset password" in shown and b"manager@fixture.invalid" in shown
+            mark = t.mark()
+            t.send(b"e", 0.5)  # change role and services of the first account
+            assert b"Change role and services" in t.since(mark)
+            assert b"manager@fixture.invalid" in t.since(mark)
+            t.send(b"\x1b", 0.4)  # cancel the edit, still on the Users screen
             t.send(b"\x1b", 0.4)  # back to the workspace
             mark = t.mark()
             t.send(b"o", 0.8)  # sign out
