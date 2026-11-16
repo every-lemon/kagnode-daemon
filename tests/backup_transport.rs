@@ -355,6 +355,9 @@ async fn dashboard_backup_actions_need_session_and_csrf() -> Result<()> {
         Profile::Light,
         true,
     )?;
+    // Explicit synthetic Operator-web opt-in; production default remains off.
+    rusqlite::Connection::open(store.root.join("daemon.sqlite"))?
+        .execute("UPDATE security_config SET admin_enabled=1", [])?;
     let token = store.login("owner@fixture.invalid", "fixture-password-long", "test")?;
     let csrf = store.session(&token)?.unwrap().csrf;
     let app = router(App {
@@ -1254,6 +1257,9 @@ async fn node_inventory_requires_a_current_local_administrator() -> Result<()> {
         Profile::Light,
         true,
     )?;
+    // Explicit synthetic Operator-web opt-in; production default remains off.
+    rusqlite::Connection::open(store.root.join("daemon.sqlite"))?
+        .execute("UPDATE security_config SET admin_enabled=1", [])?;
     assert!(
         store
             .login("viewer@fixture.invalid", "fixture-password-long", "viewer")
