@@ -2,7 +2,10 @@ use crate::{
     broker::{self, Operation, Request},
     catalog,
     store::Store,
+    tui_auth::Protection,
     tui_backup,
+    tui_client::{self, Client, Identity},
+    tui_gate::Exit,
 };
 use anyhow::{Result, ensure};
 use crossterm::{
@@ -99,11 +102,12 @@ impl Drop for Restore {
         ratatui::restore();
     }
 }
-pub fn run(store: &Store, mouse: bool) -> Result<()> {
+pub fn run(store: &Store, mouse: bool, client: &mut Client, me: &Identity) -> Result<Exit> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "Use a terminal for interactive mode, or kagnode status --json"
     );
+    let mut outcome = Exit::Quit;
     let mut settings = store.settings()?;
     let managed = store.managed_root();
     let mut terminal = ratatui::init();
@@ -139,22 +143,15 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
     let mut refreshed = std::time::Instant::now() - Duration::from_secs(10);
     let mut backups = None::<tui_backup::State>;
     let mut backups_refreshed = std::time::Instant::now();
-    loop {
+    'ui: loop {
         if !refreshing && refreshed.elapsed() >= Duration::from_secs(5) {
             refreshing = true;
-            let root = store.root.clone();
+            let reader = client.reader();
             let tx = sender.clone();
             tokio::task::spawn_blocking(move || {
-                let overview = crate::runtime::request(&root, &crate::runtime::Request::Overview);
+                let overview = reader.overview();
                 let now = crate::auth::now();
-                let history = crate::runtime::request(
-                    &root,
-                    &crate::runtime::Request::Metrics {
-                        name: "cpu.percent".into(),
-                        since: now - 3600,
-                        until: now,
-                    },
-                );
+                let history = reader.metrics("cpu.percent", now - 3600, now);
                 let _ = tx.send(Reply::Telemetry(overview, history));
             });
         }
@@ -183,6 +180,10 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
                         monitor_error.clear();
                     }
                     Err(e) => {
+                        if tui_client::is_signed_out(&e) {
+                            outcome = Exit::SignedOut;
+                            break 'ui;
+                        }
                         monitor_error = e.to_string();
                         snapshot = Value::Null;
                     }
@@ -274,7 +275,18 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
                     health.to_owned()
                 }),
             ];
-            if area.width >= 90 {
+            if me.who.protection == Protection::Owner {
+                status_spans.push(Span::styled(
+                    if area.width >= 90 { "   UNPROTECTED · owner mode" } else { "  unprotected" },
+                    Style::default().fg(WARN).bold(),
+                ));
+            } else if area.width >= 90 {
+                status_spans.push(Span::styled(
+                    format!("   {} · {}", me.who.account, me.who.role.label()),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            if area.width >= 130 {
                 status_spans.push(Span::styled("   Web dashboard ", Style::default().fg(MUTED)));
                 status_spans.push(Span::styled(
                     if settings.web_enabled { "on" } else { "off" },
@@ -342,7 +354,7 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
                 let p = &catalog::PRODUCTS[index];
                 format!("← Back to applications\n\nKagNode. {}\nRepository: every-lemon/{}\nInstalled state: {}\n\n[i] Inspect services   [h] Operation history\n[s] Start   [t] Stop   [r] Restart\nEvery change requires a reviewed plan and confirmation.\n\nHA durable state: {}\n\n{}{}", p.name, p.repository, if catalog::installed(managed, p) { "detected" } else { "not detected; services may require root enrollment" }, p.ha_state, if pending { "Waiting for the local broker…\n" } else { "" }, feedback)
             } else {
-                format!("Your KagNode workspace\n\nProfile: {:?}\nWeb dashboard: {}\n\nSelect an application and press Enter.\n[b] Backups: status, nodes, snapshots and policy (read-only).\n[w] Toggle Daemon dashboard (application UIs stay running).\n\nExisting services retain their data and native ownership.\nHA requires qualified networking, fencing, quorum and replication.\n\n{}", settings.profile, if settings.web_enabled { "enabled" } else { "disabled" }, feedback)
+                format!("Your KagNode workspace\n\nSigned in as {}{}\nProfile: {:?}\nWeb dashboard: {}\n\nSelect an application and press Enter.\n[b] Backups: status, nodes, snapshots and policy (read-only).\n[w] Toggle Daemon dashboard (application UIs stay running).\n[u] Users and roles (Operators).  [o] Sign out.\n\nExisting services retain their data and native ownership.\nHA requires qualified networking, fencing, quorum and replication.\n\n{}", me.who.account, if me.who.protection == Protection::Owner { " (owner mode, unprotected)".to_owned() } else { format!(" · {}", me.who.role.label()) }, settings.profile, if settings.web_enabled { "enabled" } else { "disabled" }, feedback)
             };
             let panel = |title: &str| {
                 Block::default()
@@ -445,7 +457,7 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
             } else if folder.is_some() {
                 vec![("i", "Inspect"), ("h", "History"), ("s/t/r", "Start·Stop·Restart"), ("Esc", "Back"), ("Ctrl+P", "Commands"), ("q", "Quit")]
             } else {
-                vec![("↑↓", "Navigate"), ("Enter", "Open"), ("b", "Backups"), ("Ctrl+P", "Commands"), ("/", "Search"), ("PgUp/PgDn", "Scroll"), ("q", "Quit")]
+                vec![("↑↓", "Navigate"), ("Enter", "Open"), ("b", "Backups"), ("u", "Users"), ("o", "Sign out"), ("Ctrl+P", "Commands"), ("/", "Search"), ("PgUp/PgDn", "Scroll"), ("q", "Quit")]
             };
             if backups.is_none() && !pending && review.is_none() && folder.is_none() && searching {
                 hints = vec![("type", "to filter"), ("Enter", "Open"), ("Esc", "Cancel")];
@@ -586,6 +598,25 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
                     b.loading = true;
                     backups_refreshed = std::time::Instant::now();
                     load_backups(store, b.node, &sender);
+                }
+                KeyCode::Char('u')
+                    if backups.is_none() && folder.is_none() && !searching && !pending =>
+                {
+                    if me.can("user_list") {
+                        match crate::tui_gate::users(&mut terminal, client, me)? {
+                            Exit::SignedOut => {
+                                outcome = Exit::SignedOut;
+                                break 'ui;
+                            }
+                            Exit::Quit => {}
+                        }
+                    } else {
+                        feedback = "Only Operators manage users.".into();
+                    }
+                }
+                KeyCode::Char('o') if !searching && !pending => {
+                    outcome = Exit::SignedOut;
+                    break 'ui;
                 }
                 KeyCode::Char('b')
                     if backups.is_none() && folder.is_none() && !searching && !pending =>
@@ -751,5 +782,5 @@ pub fn run(store: &Store, mouse: bool) -> Result<()> {
             _ => {}
         }
     }
-    Ok(())
+    Ok(outcome)
 }
