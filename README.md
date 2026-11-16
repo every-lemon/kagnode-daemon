@@ -8,7 +8,7 @@ An administrator workspace for KagNode applications, with a shared Core dashboar
 
 ### What it looks like
 
-All screenshots show current source in a temporary test installation with fictional accounts. No real server, account or data appears. They do not establish a released Rust binary, production deployment or native-service qualification.
+All screenshots are examples from reviewed feature-source fixtures with fictional accounts. No real server, account or data appears. The captured web fixture used Core 5.0.11; the integrated source now pins Core 5.0.17, so shared navigation appearance can differ. Screenshots illustrate source capabilities, not a released Rust binary, production deployment or native-service qualification.
 
 **Terminal.** `kagnode` asks who you are first, then shows the screens your role allows.
 
