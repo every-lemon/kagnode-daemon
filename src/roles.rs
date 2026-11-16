@@ -10,6 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DUMMY: &str = "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$LVpD9X5K/RWgyqzbMvnOjVApq+S+ZJ+8sAc7vPgXlZI";
 pub const BACKUP_PRODUCT: &str = "backup";
+const WEB_UID: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -274,6 +275,7 @@ CREATE TABLE IF NOT EXISTS security_attempts(identity TEXT PRIMARY KEY,start INT
 CREATE TABLE IF NOT EXISTS security_receipts(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,uid INTEGER NOT NULL,mode TEXT NOT NULL,action TEXT NOT NULL,request_hash TEXT NOT NULL,outcome TEXT NOT NULL,at INTEGER NOT NULL,receipt_mac TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS security_key(id INTEGER PRIMARY KEY CHECK(id=1),key_hex TEXT NOT NULL);")?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS web_session_revisions(session_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,auth_revision INTEGER NOT NULL);")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS web_role_sessions(hash TEXT PRIMARY KEY REFERENCES terminal_sessions(hash) ON DELETE CASCADE,csrf TEXT NOT NULL);")?;
     tx.execute(
         "INSERT OR IGNORE INTO security_key VALUES(1,?1)",
         [auth::random()?],
@@ -496,7 +498,17 @@ fn session(db: &Connection, p: &Principal, uid: u32) -> Result<Value> {
             now + 28800
         ],
     )?;
-    Ok(json!({"token":token,"expires_at":now+28800,"whoami":whoami(db,p)?}))
+    let csrf = if uid == WEB_UID {
+        let csrf = auth::random()?;
+        db.execute(
+            "INSERT INTO web_role_sessions VALUES(?1,?2)",
+            params![auth::digest(&token), csrf],
+        )?;
+        Some(csrf)
+    } else {
+        None
+    };
+    Ok(json!({"token":token,"csrf":csrf,"expires_at":now+28800,"whoami":whoami(db,p)?}))
 }
 fn capabilities(p: &Principal, m: &str) -> Value {
     let global = [
@@ -563,6 +575,45 @@ fn digest(db: &Connection, a: &Action) -> Result<String> {
 }
 
 pub fn handle(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
+    ensure!(uid != WEB_UID, "Invalid local peer UID");
+    handle_inner(store, uid, e)
+}
+/// Browser transport owns the cookie; callers cannot supply actor/session fields.
+pub fn handle_web(store: &Store, e: &Envelope) -> Result<Value> {
+    ensure!(
+        !matches!(
+            e.payload,
+            Action::OwnerSession | Action::RootRecover { .. } | Action::EnableProtection { .. }
+        ),
+        "Local control required"
+    );
+    handle_inner(store, WEB_UID, e)
+}
+pub fn web_session(store: &Store, token: &str) -> Result<String> {
+    let db = store.db()?;
+    identify(&db, WEB_UID, token)?;
+    db.query_row(
+        "SELECT csrf FROM web_role_sessions WHERE hash=?1",
+        [auth::digest(token)],
+        |r| r.get(0),
+    )
+    .map_err(|_| anyhow::anyhow!("Sign in again"))
+}
+fn web_admin_action(a: &Action) -> bool {
+    match a {
+        Action::Reauthenticate { target, .. } => web_admin_action(target),
+        Action::UserList
+        | Action::UserCreate { .. }
+        | Action::UserUpdate { .. }
+        | Action::UserResetPassword { .. }
+        | Action::SecuritySet { .. }
+        | Action::Audit
+        | Action::ReceiptGet { .. }
+        | Action::SetRetention { .. } => true,
+        _ => false,
+    }
+}
+fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
     ensure!(
         e.version == 1
             && (1..=64).contains(&e.request_id.len())
@@ -595,6 +646,20 @@ pub fn handle(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
     result
 }
 fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value> {
+    if uid == WEB_UID {
+        ensure!(
+            m == "protected",
+            "Browser sign-in requires password protection"
+        );
+        if web_admin_action(&e.payload) {
+            ensure!(
+                db.query_row("SELECT admin_enabled FROM security_config", [], |r| r
+                    .get::<_, bool>(0))?,
+                "Web administration is disabled"
+            );
+        }
+    }
+
     match &e.payload {
         Action::Login { account, password } => {
             ensure!(
