@@ -329,7 +329,7 @@ def enable_web_admin(root):
     control(root, target, session=token, confirmation=proof["confirmation"])
 
 
-def start_server(tmp):
+def start_server(tmp, admin=True):
     pw = tmp / "password"
     pw.write_text(PASSWORD)
     pw.chmod(0o600)
@@ -366,7 +366,8 @@ def start_server(tmp):
         try:
             socket.create_connection(("127.0.0.1", port), 0.2).close()
             if (tmp / "root" / "run" / "control.sock").exists():
-                enable_web_admin(tmp / "root")
+                if admin:
+                    enable_web_admin(tmp / "root")
                 return proc, port
         except OSError:
             pass

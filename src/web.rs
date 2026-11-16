@@ -121,6 +121,7 @@ pub fn router(app: App) -> Router {
         .route("/settings", get(page))
         .route("/audit", get(page))
         .route("/backup", get(page))
+        .route("/admin", get(admin_page))
         .route("/ha", get(page))
         .route("/servers/local/applications/{id}", get(application_page))
         .layer(DefaultBodyLimit::max(65536))
@@ -158,7 +159,7 @@ fn shell(s: &App, title: &str, u: Option<&Session>, body: &str) -> String {
     let head=s.core.head(json!({"authenticated":u.is_some(),"subject":u.map(|u|&u.email),"name":u.map(|u|&u.email),"home":"/","publicNavigation":false})).expect("valid Core context");
     let navigation = if u.is_some() {
         let nav = format!(
-            "<div data-core-nav-root><button class=\"quick-search\" data-core-search-open aria-label=\"Quick search\"><span data-core-icon=\"search\"></span><span class=\"nav-label\">Quick search</span><kbd>Ctrl K</kbd></button><a href=\"/\" data-core-icon=\"home\">Overview</a><button data-core-nav-open=\"applications\"><span data-core-icon=\"server\"></span><span class=\"nav-label\">Applications</span></button><a href=\"/ha\" data-core-icon=\"shield\">High availability</a><a href=\"/backup\" data-core-icon=\"archive\">Backups</a><a href=\"/audit\" data-core-icon=\"activity\">Activity</a><a href=\"/settings\" data-core-icon=\"settings\">Settings</a></div><div data-core-nav-folder=\"applications\" hidden><button data-core-nav-back><span data-core-icon=\"arrow-left\"></span><span class=\"nav-label\">Back to workspace</span></button>{}</div>",
+            "<div data-core-nav-root><button class=\"quick-search\" data-core-search-open aria-label=\"Quick search\"><span data-core-icon=\"search\"></span><span class=\"nav-label\">Quick search</span><kbd>Ctrl K</kbd></button><a href=\"/\" data-core-icon=\"home\">Overview</a><button data-core-nav-open=\"applications\"><span data-core-icon=\"server\"></span><span class=\"nav-label\">Applications</span></button><a href=\"/ha\" data-core-icon=\"shield\">High availability</a><a href=\"/backup\" data-core-icon=\"archive\">Backups</a><a href=\"/audit\" data-core-icon=\"activity\">Activity</a><a href=\"/admin\" data-core-icon=\"account\">Administration</a><a href=\"/settings\" data-core-icon=\"settings\">Settings</a></div><div data-core-nav-folder=\"applications\" hidden><button data-core-nav-back><span data-core-icon=\"arrow-left\"></span><span class=\"nav-label\">Back to workspace</span></button>{}</div>",
             catalog::PRODUCTS
                 .iter()
                 .map(|p| format!(
@@ -508,6 +509,11 @@ async fn page(State(s): State<App>, h: HeaderMap) -> Response {
         return Redirect::to("/login").into_response();
     };
     Html(shell(&s,"Workspace",Some(&u),"<h1>Your KagNode workspace</h1><p id=\"page-status\" role=\"status\">Loading workspace…</p><section id=\"content\"></section>")).into_response()
+}
+/// Administration signs in through the role API (its own session cookie), so
+/// this page needs no legacy session and also serves Managers and Viewers.
+async fn admin_page(State(s): State<App>) -> Response {
+    Html(shell(&s,"Administration",None,"<main id=\"main\" class=\"admin-main\"><h1>Administration</h1><p id=\"page-status\" role=\"status\"></p><section id=\"content\"></section></main>")).into_response()
 }
 async fn application_page(State(s): State<App>, h: HeaderMap, Path(id): Path<String>) -> Response {
     if catalog::product(&id).is_none() {
