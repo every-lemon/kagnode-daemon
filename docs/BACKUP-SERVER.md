@@ -22,7 +22,14 @@ private files, storage-directory identity checks, approved enrollment challenges
 Ed25519 verification, persistent nonce replay rejection, upload leases, resumable
 bounded chunks, ciphertext verification, snapshot commit receipts, monthly
 transfer counters, retention protections, restore leases and shared-object GC.
-Snapshot deletion is recorded as a tombstone. Stored signatures bind manifests;
+Snapshot deletion is recorded as a tombstone and a durable catalog-cleanup intent
+in the same database transaction. If unlinking or directory synchronization fails,
+the logical deletion still succeeds; administrator status reports
+`pending_catalog_cleanups`. Explicit garbage collection retries at most 128
+pending catalogs per call, favoring entries with fewer failed attempts. Existing
+repositories seed this queue once from historical tombstones, including a restart
+between logical deletion and unlink. No unindexed file without a tombstone is
+removed by this cleanup; general object-orphan reconciliation remains separate. Stored signatures bind manifests;
 file contents and filenames remain in encrypted objects.
 
 The `kagnode-backup-server` binary refuses root execution and requires a distinct
@@ -105,11 +112,15 @@ Do not enable a live Backup Server role based on these checks alone.
 
 ## Unfinished integration and qualification
 
-- Reviewed exclusive-role installation, legacy installer enforcement and native
-  service sandbox/volume permission qualification for the separate worker.
-- Automated certificate lifecycle, signed portable server receipts, node/site
-  enrollment management and durable node-to-all-server transfer jobs.
-- Durable scheduling and `/api/v1/backups/` job APIs, Core pages and TUI controls.
+- Reviewed role reservation, inactive installation and legacy installer guards are
+  implemented in source. Automatic account provisioning, existing-host adoption
+  and real systemd activation/sandbox/volume qualification remain unfinished.
+- Explicit certificate pin rotation/revocation and validated TLS reload are
+  implemented in source. Automated issuance/expiry management, portable signed
+  receipts and qualified multi-server copy health remain unfinished.
+- Durable scheduling, per-target retry/resumption and administrator read/action
+  APIs are implemented in source. Scheduler configuration is still private JSON;
+  web/TUI schedule mutation and application-consistent producers remain unfinished.
   Existing backup-server CLI/API controls require a separately configured worker.
 - Measured bandwidth, aggregate/time-window throttling, audited cap overrides,
   accounting for restore downloads, recovery reminders and multi-server K state.
@@ -255,9 +266,14 @@ attempts put that target in a 24-hour blocked cooldown. Once it expires, the
 worker allows one retry per day until success; the lifetime attempt count is
 retained across restarts. Pause, readiness, source and lease checks still apply.
 A cooldown retry is not a bypass for a refused or exhausted server lease. Only unfinished jobs count toward the 1024-job admission limit. Completed
-history remains durable for snapshot identity checks and receipts; it does not
-stop future scheduling. History currently grows with successful snapshots, so
-monitor queue disk usage; automated history compaction remains a known limit. Pause/removal or loss of
+history retains the newest 256 queued fully completed jobs, including their
+receipts. Older completed manifests/configuration/receipts are pruned atomically
+on completion and queue reopen. All unfinished jobs and transfers remain, including
+blocked retries; legacy queues migrate without changing their prepared ciphertext.
+A compact schedule/node/snapshot/digest ledger preserves immutable identity checks
+and deduplication after pruning. That ledger grows with unique completed snapshots;
+exact indefinite deduplication is not constant-space. Freed SQLite pages are reused;
+startup does not run a blocking full VACUUM or erase the identity ledger. Pause/removal or loss of
 readiness cancels an active transfer at the next one-second check. A prepared-file
 failure does not discard queued work. Configuration changes affect new jobs;
 existing target/key-path/manifest choices stay frozen. Changing schedule identity
@@ -346,7 +362,7 @@ confirmation tokens in URLs, analytics, logs or saved page state.
 
 | GET route | Response |
 | --- | --- |
-| `/api/v1/backup-server/status` | Configured: `{process_id,site,server,policy,storage_total_bytes,storage_available_bytes,verification}`. Unconfigured: `{enabled:false,status:"not configured",production_qualified:false}`. |
+| `/api/v1/backup-server/status` | Configured: `{process_id,site,server,policy,storage_total_bytes,storage_available_bytes,pending_catalog_cleanups,verification}`. Unconfigured: `{enabled:false,status:"not configured",production_qualified:false}`. |
 | `/api/v1/backup-server/nodes` | `{nodes:[{node,certificate_sha256,enrolled,revoked}]}`; at most 1000, sorted by node. Unconfigured: `{enabled:false,nodes:[]}`. |
 | `/api/v1/backup-server/snapshots/NODE` | `{snapshots:[{id,created,received_at,pinned,restore_tested}],protected:["SNAPSHOT",...]}`. Receipt time determines ordering; claimed creation time does not prove retention eligibility. |
 | `/api/v1/backup-server/policy` | `{enabled:true,policy:{...}}`; unconfigured uses `enabled:false,policy:null`. |
@@ -354,7 +370,7 @@ confirmation tokens in URLs, analytics, logs or saved page state.
 
 Agent `status.state` is `not_observed`, `disabled`, `paused`, `deferred`,
 `transferring`, `scheduled`, `source_blocked` or `blocked`. When present, `queue`
-contains the latest 64 `transfers`: `{id,snapshot,state,attempts,next_attempt,
+contains `history:{completed_job_limit:256,compacted_identities:N}` and the latest 64 `transfers`: `{id,snapshot,state,attempts,next_attempt,
 receipt,error}`. Transfer states are `pending`, `running`, `completed` or `blocked`.
 `receipt` is null or the server's `{snapshot,ciphertext_verified,verified_at,
 restore_tested:false,server}`. A ciphertext receipt is not a successful restore.

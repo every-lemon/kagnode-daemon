@@ -131,6 +131,9 @@ impl Schedule {
 }
 // After ten failures, probe at most once per day; readiness and pause still gate sends.
 const BLOCKED_RETRY_SECONDS: i64 = 24 * 60 * 60;
+/// Keep detailed history for the newest queued completed jobs. Older identities
+/// remain in a compact ledger so pruning cannot turn a retry into a new upload.
+const COMPLETED_HISTORY_LIMIT: i64 = 256;
 
 pub struct Queue {
     db: Connection,
@@ -179,9 +182,54 @@ impl Queue {
         CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY,next_run INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,schedule TEXT NOT NULL,node TEXT NOT NULL,snapshot TEXT NOT NULL,digest TEXT NOT NULL,manifest TEXT NOT NULL,config TEXT NOT NULL,queued INTEGER NOT NULL,UNIQUE(schedule,node,snapshot));
         CREATE TABLE IF NOT EXISTS transfers(id INTEGER PRIMARY KEY,job INTEGER NOT NULL,target TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL,receipt TEXT,error TEXT,UNIQUE(job,target));
+        CREATE TABLE IF NOT EXISTS completed_identities(schedule TEXT NOT NULL,node TEXT NOT NULL,snapshot TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(schedule,node,snapshot)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS unfinished_jobs ON transfers(job) WHERE state!='completed';
         UPDATE transfers SET state='pending' WHERE state='running';")?;
-        Ok(Self { db, _lock: lock })
+        let queue = Self { db, _lock: lock };
+        queue.prune_completed()?;
+        Ok(queue)
+    }
+    fn prune_completed(&self) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        // A job with no transfers is retained for inspection, not treated as a
+        // successful upload. Pending, blocked and running transfers never prune.
+        let cutoff: Option<i64> = tx
+            .query_row(
+                "SELECT j.id FROM jobs j WHERE EXISTS(SELECT 1 FROM transfers t WHERE t.job=j.id)
+             AND NOT EXISTS(SELECT 1 FROM transfers t WHERE t.job=j.id AND t.state!='completed')
+             ORDER BY j.id DESC LIMIT 1 OFFSET ?1",
+                [COMPLETED_HISTORY_LIMIT],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(cutoff) = cutoff {
+            tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS prune_jobs(id INTEGER PRIMARY KEY); DELETE FROM prune_jobs;")?;
+            tx.execute("INSERT INTO prune_jobs SELECT j.id FROM jobs j WHERE j.id<=?1
+                AND EXISTS(SELECT 1 FROM transfers t WHERE t.job=j.id)
+                AND NOT EXISTS(SELECT 1 FROM transfers t WHERE t.job=j.id AND t.state!='completed')", [cutoff])?;
+            let conflicts: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs j JOIN prune_jobs p ON p.id=j.id
+                JOIN completed_identities c USING(schedule,node,snapshot) WHERE c.digest!=j.digest",
+                [],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                conflicts == 0,
+                "Completed snapshot identity conflict; history retained for inspection"
+            );
+            tx.execute("INSERT OR IGNORE INTO completed_identities SELECT schedule,node,snapshot,digest FROM jobs WHERE id IN (SELECT id FROM prune_jobs)", [])?;
+            tx.execute(
+                "DELETE FROM transfers WHERE job IN (SELECT id FROM prune_jobs)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs WHERE id IN (SELECT id FROM prune_jobs)",
+                [],
+            )?;
+            tx.execute("DELETE FROM prune_jobs", [])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
     pub fn enqueue_due(
         &mut self,
@@ -211,7 +259,8 @@ impl Queue {
         }
         let prior: Option<String> = tx
             .query_row(
-                "SELECT digest FROM jobs WHERE schedule=?1 AND node=?2 AND snapshot=?3",
+                "SELECT digest FROM jobs WHERE schedule=?1 AND node=?2 AND snapshot=?3
+                 UNION ALL SELECT digest FROM completed_identities WHERE schedule=?1 AND node=?2 AND snapshot=?3",
                 params![config.id, config.node, manifest.snapshot],
                 |r| r.get(0),
             )
@@ -285,6 +334,7 @@ impl Queue {
                 "Invalid server receipt"
             );
             ensure!(self.db.execute("UPDATE transfers SET state='completed',receipt=?2,error=NULL WHERE id=?1 AND state='running'",params![work.id,serde_json::to_string(r)?])?==1,"Transfer is not running");
+            self.prune_completed()?;
         } else {
             let attempts: u32 = self.db.query_row(
                 "SELECT attempts FROM transfers WHERE id=?1",
@@ -303,8 +353,13 @@ impl Queue {
     pub fn status(&self) -> Result<Value> {
         let mut stmt=self.db.prepare("SELECT t.id,j.snapshot,t.state,t.attempts,t.next_attempt,t.receipt,t.error FROM transfers t JOIN jobs j ON j.id=t.job ORDER BY t.id DESC LIMIT 64")?;
         let items=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"snapshot":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"attempts":r.get::<_,u32>(3)?,"next_attempt":r.get::<_,i64>(4)?,"receipt":r.get::<_,Option<String>>(5)?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"error":r.get::<_,Option<String>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let identities: i64 =
+            self.db
+                .query_row("SELECT COUNT(*) FROM completed_identities", [], |r| {
+                    r.get(0)
+                })?;
         Ok(
-            json!({"transfers":items,"verification":"ciphertext receipt; not recovery qualification"}),
+            json!({"transfers":items,"history":{"completed_job_limit":COMPLETED_HISTORY_LIMIT,"compacted_identities":identities},"verification":"ciphertext receipt; not recovery qualification"}),
         )
     }
 }
