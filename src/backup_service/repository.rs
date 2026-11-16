@@ -196,7 +196,15 @@ CREATE TABLE IF NOT EXISTS usage(month TEXT NOT NULL,node TEXT NOT NULL,bytes IN
 CREATE TABLE IF NOT EXISTS replay(node TEXT NOT NULL,nonce TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(node,nonce));
 CREATE TABLE IF NOT EXISTS restore_leases(id TEXT PRIMARY KEY,node TEXT NOT NULL,snapshot TEXT NOT NULL,actor TEXT NOT NULL,expires INTEGER NOT NULL,FOREIGN KEY(node,snapshot) REFERENCES snapshots(node,id));
 CREATE TABLE IF NOT EXISTS tombstones(node TEXT NOT NULL,snapshot TEXT NOT NULL,at INTEGER NOT NULL,actor TEXT NOT NULL,PRIMARY KEY(node,snapshot));
+CREATE TABLE IF NOT EXISTS catalog_cleanup(node TEXT NOT NULL,snapshot TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,error TEXT,PRIMARY KEY(node,snapshot));
+CREATE TABLE IF NOT EXISTS repository_migrations(name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,actor TEXT NOT NULL,action TEXT NOT NULL,target TEXT NOT NULL);")?;
+        // One-time, crash-safe reconciliation of historical logical deletions.
+        // Only explicit tombstones authorize unlinking a leftover catalog.
+        db.execute_batch("BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO catalog_cleanup(node,snapshot) SELECT node,snapshot FROM tombstones WHERE NOT EXISTS(SELECT 1 FROM repository_migrations WHERE name='catalog-cleanup-v1');
+INSERT OR IGNORE INTO repository_migrations VALUES('catalog-cleanup-v1');
+COMMIT;")?;
         Ok(Self {
             root: root.into(),
             db,
@@ -1142,6 +1150,10 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             "INSERT INTO tombstones VALUES(?1,?2,?3,?4)",
             params![node, snapshot, auth::now(), actor],
         )?;
+        tx.execute(
+            "INSERT INTO catalog_cleanup(node,snapshot) VALUES(?1,?2)",
+            params![node, snapshot],
+        )?;
         ensure!(
             tx.execute(
                 "DELETE FROM snapshots WHERE node=?1 AND id=?2",
@@ -1154,22 +1166,63 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,acto
             params![auth::now(), actor, snapshot],
         )?;
         tx.commit()?;
-        if let Err(error) = fs::remove_file(
-            self.root
-                .join("snapshots")
-                .join(node)
-                .join(format!("{snapshot}.json")),
-        ) && error.kind() != std::io::ErrorKind::NotFound
-        {
-            // Logical deletion already committed: do not report an ambiguous failure.
-            eprintln!("Backup catalog cleanup pending for {node}/{snapshot}: {error}");
-            self.db.execute("INSERT INTO audit(at,actor,action,target) VALUES(?1,?2,'catalog-cleanup-pending',?3)",params![auth::now(),actor,format!("{node}/{snapshot}")]).ok();
+        // Logical deletion has committed. Filesystem/queue failures stay pending;
+        // never report this as an ambiguous logical deletion failure.
+        let _ = self.cleanup_catalog(node, snapshot);
+        Ok(())
+    }
+    fn cleanup_catalog(&self, node: &str, snapshot: &str) -> Result<()> {
+        ensure!(
+            identifier(node) && identifier(snapshot),
+            "Invalid cleanup identity"
+        );
+        ensure!(self.db.query_row("SELECT EXISTS(SELECT 1 FROM tombstones WHERE node=?1 AND snapshot=?2) AND NOT EXISTS(SELECT 1 FROM snapshots WHERE node=?1 AND id=?2)",params![node,snapshot],|r|r.get::<_,bool>(0))?, "Catalog cleanup requires a deleted snapshot");
+        let result = (|| -> Result<()> {
+            let parent = self.root.join("snapshots").join(node);
+            private(&parent, false)?;
+            match fs::remove_file(parent.join(format!("{snapshot}.json"))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.db.execute(
+                    "DELETE FROM catalog_cleanup WHERE node=?1 AND snapshot=?2",
+                    params![node, snapshot],
+                )?;
+            }
+            Err(_) => {
+                self.db.execute("UPDATE catalog_cleanup SET attempts=attempts+1,error='Catalog unlink or durability check failed; inspect storage and retry garbage collection' WHERE node=?1 AND snapshot=?2",params![node,snapshot])?;
+            }
+        }
+        Ok(())
+    }
+    pub fn pending_catalog_cleanup(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .query_row("SELECT COUNT(*) FROM catalog_cleanup", [], |r| r.get(0))?)
+    }
+    fn cleanup_catalogs(&self) -> Result<()> {
+        let pending = {
+            let mut q = self.db.prepare(
+                "SELECT node,snapshot FROM catalog_cleanup ORDER BY attempts,rowid LIMIT 128",
+            )?;
+            q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (node, snapshot) in pending {
+            self.cleanup_catalog(&node, &snapshot)?;
         }
         Ok(())
     }
     pub fn gc(&mut self, now: i64) -> Result<usize> {
         self.check_volume()?;
         self.cleanup_partials(now)?;
+        self.cleanup_catalogs()?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

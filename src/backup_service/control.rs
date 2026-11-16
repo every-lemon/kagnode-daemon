@@ -85,7 +85,7 @@ fn dispatch_as(shared: &Shared, req: AdminRequest, uid: u32) -> Result<Value> {
         AdminRequest::Status => {
             let (total, available) = r.capacity()?;
             Ok(
-                json!({"process_id":std::process::id(),"site":r.identity.site,"server":r.identity.server,"policy":r.policy()?,"storage_total_bytes":total,"storage_available_bytes":available,"verification":"ciphertext checks are not restore qualification"}),
+                json!({"process_id":std::process::id(),"site":r.identity.site,"server":r.identity.server,"policy":r.policy()?,"storage_total_bytes":total,"storage_available_bytes":available,"pending_catalog_cleanups":r.pending_catalog_cleanup()?,"verification":"ciphertext checks are not restore qualification"}),
             )
         }
         AdminRequest::Nodes => r.nodes(),

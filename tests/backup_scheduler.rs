@@ -185,6 +185,114 @@ fn completed_history_does_not_exhaust_pending_capacity() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn completed_history_is_bounded_without_forgetting_snapshot_identities() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("queue");
+    let mut c = config(tmp.path());
+    c.targets.truncate(1);
+    let mut q = Queue::open(&root)?;
+    for n in 0..3000 {
+        let at = 100 + n * 60;
+        let mut m = manifest();
+        m.snapshot = format!("history-{n}");
+        assert!(q.enqueue_due(&c, &m, at)?);
+        let w = q.next(at)?.unwrap();
+        q.start(w.id)?;
+        q.finish(&w, Some(&json!({"snapshot":m.snapshot,"server":"one","ciphertext_verified":true,"verified_at":at})), at)?;
+    }
+    drop(q);
+    let db = rusqlite::Connection::open(root.join("queue.sqlite"))?;
+    let count = |table: &str| -> Result<i64> {
+        Ok(db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+    };
+    assert_eq!(
+        count("jobs")?,
+        256,
+        "rich completed history must stay bounded"
+    );
+    assert_eq!(count("transfers")?, 256);
+    assert_eq!(count("completed_identities")?, 2744);
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM transfers t LEFT JOIN jobs j ON j.id=t.job WHERE j.id IS NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    drop(db);
+    let mut q = Queue::open(&root)?;
+    let mut old = manifest();
+    old.snapshot = "history-0".into();
+    assert!(!q.enqueue_due(&c, &old, 300000)?);
+    assert!(q.next(300000)?.is_none());
+    old.created_at += 1;
+    assert!(q.enqueue_due(&c, &old, 300060).is_err());
+    assert_eq!(q.status()?["history"]["compacted_identities"], 2744);
+    Ok(())
+}
+
+#[test]
+fn existing_queue_compaction_preserves_unfinished_jobs_and_is_idempotent() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("queue");
+    let mut c = config(tmp.path());
+    c.targets.truncate(1);
+    let mut q = Queue::open(&root)?;
+    let m = manifest();
+    q.enqueue_due(&c, &m, 100)?;
+    drop(q);
+    // An existing queue from before compaction, with all four transfer states.
+    let mut db = rusqlite::Connection::open(root.join("queue.sqlite"))?;
+    db.execute("DROP TABLE IF EXISTS completed_identities", [])?;
+    let tx = db.transaction()?;
+    for n in 0..400 {
+        tx.execute("INSERT INTO jobs(schedule,node,snapshot,digest,manifest,config,queued) SELECT schedule,node,?1,digest,manifest,config,queued FROM jobs WHERE id=1", [format!("legacy-{n}")])?;
+        let id = tx.last_insert_rowid();
+        let state = match n {
+            0 => "pending",
+            1 => "blocked",
+            2 => "running",
+            _ => "completed",
+        };
+        tx.execute("INSERT INTO transfers(job,target,state,attempts,next_attempt,receipt) SELECT ?1,target,?2,3,100,'{\"ciphertext_verified\":true}' FROM transfers WHERE id=1", rusqlite::params![id,state])?;
+    }
+    tx.commit()?;
+    drop(db);
+    for _ in 0..2 {
+        let q = Queue::open(&root)?;
+        let db = rusqlite::Connection::open(root.join("queue.sqlite"))?;
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))?,
+            260
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM transfers WHERE state!='completed'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            4
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM transfers WHERE state='pending'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            3
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM completed_identities", [], |r| r
+                .get::<_, i64>(0))?,
+            141
+        );
+        assert!(q.next(99)?.is_none());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn agent_status_reports_actual_preparation_and_configuration_errors() -> Result<()> {
     use kagnode_daemon::{backup_service::scheduler::supervise, store::Store};
