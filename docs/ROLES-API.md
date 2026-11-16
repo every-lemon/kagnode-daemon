@@ -139,3 +139,85 @@ No product start/stop, installation, HA or native broker apply was added. Those
 require independent phase1–3 review, authenticated actor-bound broker integration,
 and disposable service qualification before phase4. Existing direct-owner broker
 receipts remain historical; do not mislabel them as these new logical-user receipts.
+
+## Browser JSON transport (follow-up 1)
+
+This API is backend source only. Claude's login/pages must call it explicitly;
+the existing HTML form and `/api/v1/session` remain legacy Operator-only routes.
+All roles can sign in through this API. Its HttpOnly session cookie is distinct
+from the legacy cookie and cannot authorize either legacy endpoints or the local
+socket. Browser sessions use a reserved transport UID (4294967295) in receipts;
+that value denotes browser transport, **not** a claimed operating-system identity.
+The local socket rejects that UID. Current account revision and disabled state are
+checked for every request, with the same idle/absolute expiry and confirmation
+rules as the local protocol.
+
+1. `GET /api/v1/roles/auth` returns `{csrf}` and an HttpOnly login-challenge cookie.
+2. `POST /api/v1/roles/login` sends `Origin`, `X-CSRF-Token` equal to that challenge,
+   and `{request_id, confirmation:null, payload:{action:"login",account,password}}`.
+3. Success sets `kn_daemon_roles` (HttpOnly, SameSite=Strict, path `/api/v1/roles`,
+   Secure for HTTPS) and returns `{csrf,expires_at,whoami}`. It never returns the
+   authentication token in JSON. Keep CSRF in client memory; do not log responses.
+4. All subsequent POSTs require the session cookie, exact Origin, session CSRF,
+   and `{request_id,confirmation,payload}`. No actor, UID, session or role assertion
+   is accepted in the envelope. The payload's action must match the route.
+
+| Method / suffix under `/api/v1/roles` | Typed payload action / response |
+| --- | --- |
+| GET whoami, capabilities | same local response |
+| GET users | user_list; Operator + administration enabled |
+| GET security | security_get; Operator |
+| GET audit | audit; Operator + administration enabled |
+| GET overview, retention | filtered analytics for every role |
+| GET products/:product | product_status; scoped view grant |
+| GET backup-agent-status | backup_agent_status; scoped backup view grant |
+| POST confirm | reauthenticate; exact intended payload, same role and administration gate |
+| POST users-create | user_create; confirmed Operator |
+| POST users-update | user_update; confirmed Operator, revision required; disable through disabled=true, retain audit identity |
+| POST users-reset-password | user_reset_password; confirmed Operator, revision required |
+| POST security | security_set; confirmed Operator, revision required |
+| POST password | change_password; own current password |
+| POST logout | logout; cookie expired on success |
+| POST retention | set_retention; confirmed Operator |
+| POST metrics | metrics; bounded analytics query, CSRF required |
+| POST receipt | receipt_get; Operator + administration enabled |
+
+`admin_enabled=false` blocks user administration, audit, receipt access, monitoring
+policy changes and their confirmations, even for an Operator. Analytics, profile,
+logout and self-password change remain available. Enable administration through
+local authenticated control; a disabled browser gate cannot enable itself. Existing
+legacy routes are not converted to Manager/Viewer access. No web root recovery or
+owner-mode setup exists. Unknown/mismatched routes fail closed. User/configuration
+revision conflicts return409; stale sessions401; permission/confirmation/CSRF
+refusals403. Existing JSON extraction validation may return400/422. Never retry a
+mutation automatically after an ambiguous network result; inspect its receipt.
+
+Password workers are bounded to two across browser API requests, including after
+client cancellation. Existing persistent failure budgets apply to the reserved
+browser transport identity and global budget; this conservative shared browser
+limit may temporarily restrict all browser sign-ins after repeated bad passwords.
+A trusted-proxy-aware per-source throttle is not implemented by inventing trust in
+forwarded headers. No cookies or credentials belong in URLs.
+
+### Browser authentication admission and public errors
+
+Browser password limits use the actual TCP peer IP supplied by Axum
+ConnectInfo<SocketAddr>; forwarded headers are never used. Ports are not part of
+identity. Failed browser checks charge a 15-minute peer+account bucket (5 sign-in,
+20 confirmation/password-change) and the account-wide bucket (5 sign-in,
+20 confirmation). Success clears that account's relevant history. Browser failures
+never charge the reserved WEB UID bucket or the terminal global bucket; many
+made-up accounts cannot exhaust every browser/terminal user's sign-in budget.
+Five wrong passwords against one real account still lock that account across
+peers until expiry; targeted account lockout is an intentional remaining tradeoff.
+Terminal limits are unchanged (50 per UID,200 global and original account limits).
+
+Role API JSON bodies are explicitly limited to16KiB (HTTP413 on excess). When
+password/request workers are busy the API returns HTTP503 with
+`{"error":"Authentication busy; retry later"}`; this is not an authorization
+refusal. Reauthentication/other mutations do not automatically retry on overload.
+Known public authorization/validation/conflict messages retain their documented
+statuses. Any unexpected database/runtime error instead returns HTTP500 with
+`{"error":"Request unavailable"}`. Internal SQLite strings, filesystem errors
+or arbitrary exception text are never copied to a browser response. Login remains
+HTTP401 with `Sign-in failed or is temporarily limited` for ordinary auth failures.
