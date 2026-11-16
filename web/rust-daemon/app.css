@@ -303,3 +303,4 @@ dialog{max-height:calc(100dvh - 32px);overflow-y:auto}
 .admin-main .data-table td::before{content:attr(data-label);color:var(--kn-muted,#666);font-weight:600;text-align:left}
 .admin-main .row-actions{justify-content:flex-end}
 }
+.service-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
