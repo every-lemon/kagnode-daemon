@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, PermissionsExt},
         net::UnixStream,
     },
     path::Path,
@@ -84,6 +84,14 @@ pub fn dispatch_as(store: &Store, request: Request, actor: &str) -> Result<Value
     }
 }
 pub fn request(root: &Path, value: &Request) -> Result<Value> {
+    // Compatibility client only. The server rejects this unauthenticated legacy
+    // shape; terminal presentation must adopt roles::Envelope before release.
+    wire_request(root, value)
+}
+pub fn authenticated_request(root: &Path, value: &crate::roles::Envelope) -> Result<Value> {
+    wire_request(root, value)
+}
+fn wire_request(root: &Path, value: &impl Serialize) -> Result<Value> {
     let mut s = UnixStream::connect(root.join("run/control.sock")).map_err(|_| {
         anyhow::anyhow!(
             "Daemon is offline. Start kagnode-daemon.service; terminal exit never stops it."
@@ -92,6 +100,7 @@ pub fn request(root: &Path, value: &Request) -> Result<Value> {
     s.set_read_timeout(Some(Duration::from_secs(3)))?;
     s.set_write_timeout(Some(Duration::from_secs(3)))?;
     let mut bytes = serde_json::to_vec(value)?;
+    ensure!(bytes.len() <= 16384, "Terminal request exceeded limits");
     bytes.push(b'\n');
     s.write_all(&bytes)?;
     let mut reply = Vec::new();
@@ -119,18 +128,25 @@ pub async fn serve(store: Store) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let owner = std::fs::metadata(&store.root)?.uid();
     let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let workers = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
     loop {
-        let (stream, _) = listener.accept().await?;
-        let uid = stream.peer_cred()?.uid();
-        if uid != 0 && uid != owner {
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Ok(cred) = stream.peer_cred() else {
             continue;
-        }
+        };
+        let uid = cred.uid();
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
         let state = store.clone();
+        let workers = workers.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let mut input = BufReader::new(stream);
@@ -141,24 +157,66 @@ pub async fn serve(store: Store) -> Result<()> {
             )
             .await;
             let result = match read {
-                Ok(Ok(_)) if line.len() <= 16384 => match serde_json::from_str::<Request>(&line) {
-                    Ok(req) => tokio::task::spawn_blocking(move || dispatch(&state, req))
-                        .await
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Terminal worker failed"))),
-                    Err(_) => Err(anyhow::anyhow!("Invalid terminal request")),
-                },
+                Ok(Ok(_)) if line.len() <= 16384 && line.ends_with('\n') => {
+                    match serde_json::from_str::<crate::roles::Envelope>(&line) {
+                        Ok(req) => match workers.clone().try_acquire_owned() {
+                            Ok(worker) => tokio::task::spawn_blocking(move || {
+                                let _worker = worker;
+                                authenticated_dispatch(&state, uid, req)
+                            })
+                            .await
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("Terminal worker failed"))),
+                            Err(_) => Err(anyhow::anyhow!("Terminal authentication workers busy")),
+                        },
+                        Err(_) => Err(anyhow::anyhow!("Invalid terminal request")),
+                    }
+                }
                 _ => Err(anyhow::anyhow!("Terminal request exceeded limits")),
             };
+            use zeroize::Zeroize;
+            line.zeroize();
             let reply = match result {
                 Ok(value) => json!({"ok":true,"value":value}),
                 Err(e) => json!({"ok":false,"error":e.to_string()}),
             };
             let mut stream = input.into_inner();
-            let _ = stream
-                .write_all(&serde_json::to_vec(&reply).unwrap_or_default())
-                .await;
+            let encoded = serde_json::to_vec(&reply).unwrap_or_default();
+            let encoded = if encoded.len() <= 2 * 1024 * 1024 {
+                encoded
+            } else {
+                br#"{"ok":false,"error":"Response exceeded limits"}"#.to_vec()
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(3), stream.write_all(&encoded)).await;
             let _ = stream.shutdown().await;
         });
+    }
+}
+pub fn authenticated_dispatch(
+    store: &Store,
+    uid: u32,
+    request: crate::roles::Envelope,
+) -> Result<Value> {
+    let value = crate::roles::handle(store, uid, &request)?;
+    use crate::roles::Action;
+    match &request.payload {
+        Action::Overview => {
+            let h = History::open(&store.root)?;
+            let latest = h.latest()?;
+            let stale = latest
+                .as_ref()
+                .is_none_or(|v| !(0..=30).contains(&(auth::now() - v.at)));
+            Ok(
+                json!({"nodes":[{"id":"local","health":if stale{"unknown"}else{"online"},"last_sample":latest,"history_trim_events":h.health()?}]}),
+            )
+        }
+        Action::Metrics { name, since, until } => Ok(
+            json!({"node":"local","metric":name,"points":History::open(&store.root)?.query(name,*since,*until,600)?}),
+        ),
+        Action::Retention => {
+            let (r, p) = policy(store)?;
+            Ok(json!({"revision":r,"policy":p,"presets_days":[2,5,7,30,90,180,365]}))
+        }
+        _ => Ok(value),
     }
 }
 pub async fn collect(store: Store) {
