@@ -189,6 +189,26 @@ def main():
                     page.get_by_text("Mail: view").is_visible(),
                 )
 
+                # 3b. A Manager sees a Services tab limited to their grants.
+                mctx = browser.new_context(viewport={"width": 1100, "height": 800})
+                mpage = mctx.new_page()
+                sign_in(mpage, base, "manager@fixture.invalid", PASSWORD)
+                mpage.get_by_role("tab", name="Services").wait_for()
+                check(
+                    "manager tabs",
+                    tabs(mpage) == ["Overview", "Services", "My account"],
+                    str(tabs(mpage)),
+                )
+                mpage.get_by_role("tab", name="Services").click()
+                mpage.get_by_role("heading", name="Mail").wait_for()
+                body = mpage.locator("main").inner_text()
+                check(
+                    "manager sees only the granted service and its level",
+                    "VPN" not in body and "view" in body and "Read-only" in body,
+                    body[:300],
+                )
+                mctx.close()
+
                 # 4. Edit role, disable, reset password.
                 page.get_by_role(
                     "button", name="Edit role manager@fixture.invalid"

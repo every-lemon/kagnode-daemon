@@ -1255,6 +1255,7 @@
         panel = el("section", undefined, "panel stack");
       tabs.setAttribute("role", "tablist");
       const items = [["overview", "Overview", true]];
+      items.push(["services", "Services", me.user.role === "manager"]);
       items.push(["users", "Users", can("user_list")]);
       items.push(["security", "Settings", can("security_get")]);
       items.push(["audit", "Activity", can("audit")]);
@@ -1273,17 +1274,19 @@
       }
       content.append(bar, tabs, panel);
       panel.setAttribute("role", "tabpanel");
-      ({ overview, users, security, audit, account })[tab](panel).catch((e) => {
-        panel.replaceChildren(el("p", e.message, "form-error"));
-        if (e.status === 403 && /disabled/i.test(e.message))
-          panel.append(
-            el(
-              "p",
-              "Web administration is off. An Operator turns it on from the terminal (kagnode, then a, Web administration).",
-              "muted",
-            ),
-          );
-      });
+      ({ overview, services, users, security, audit, account })
+        [tab](panel)
+        .catch((e) => {
+          panel.replaceChildren(el("p", e.message, "form-error"));
+          if (e.status === 403 && /disabled/i.test(e.message))
+            panel.append(
+              el(
+                "p",
+                "Web administration is off. An Operator turns it on from the terminal (kagnode, then a, Web administration).",
+                "muted",
+              ),
+            );
+        });
       restoreFocus(content);
     }
     async function overview(panel) {
@@ -1335,6 +1338,58 @@
             "muted",
           ),
         );
+    }
+    const LEVEL_TEXT = {
+      view: "See status and health.",
+      operate:
+        "View, plus read logs and start, stop or restart through a reviewed plan.",
+      manage:
+        "Operate, plus enable or disable at boot, Core updates and product actions.",
+    };
+    async function services(panel) {
+      const ids = (me.capabilities?.products || []).map((x) => x.product);
+      panel.append(el("h2", "Your services"));
+      if (!ids.length) {
+        panel.append(
+          el(
+            "p",
+            "No services have been granted to you yet. Ask an Operator to give you a service and a level.",
+            "muted",
+          ),
+        );
+        return;
+      }
+      panel.append(
+        el(
+          "p",
+          "Each service shows the level you were given. Native actions are not switched on in this Daemon yet, so this page is read-only for now.",
+          "muted",
+        ),
+      );
+      const grid = el("div", undefined, "service-grid");
+      for (const id of ids) {
+        const level = (me.user.grants || {})[id] || "view";
+        const card = el("article", undefined, "panel stack");
+        let state = "Status available";
+        try {
+          const r = await rapi("products/" + encodeURIComponent(id));
+          state = r.native_actions_enabled
+            ? "Actions enabled"
+            : "Read-only (actions not enabled)";
+        } catch (e) {
+          state = e.message;
+        }
+        card.append(
+          el("h3", PRODUCT_NAMES[id] || id),
+          facts([
+            ["Your level", badge(level, level === "manage" ? "info" : "ok")],
+            ["Allows", LEVEL_TEXT[level] || ""],
+            ["State", state],
+          ]),
+        );
+        grid.append(card);
+      }
+      panel.append(grid);
     }
     async function users(panel) {
       const data = await rapi("users");
