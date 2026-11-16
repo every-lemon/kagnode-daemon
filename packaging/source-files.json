@@ -105,6 +105,7 @@
   "src/tui_gate.rs",
   "src/web.rs",
   "src/web_roles.rs",
+  "tests/admin_pages_browser.py",
   "tests/backup-qa.Containerfile",
   "tests/backup_pages_browser.py",
   "tests/backup_repository.rs",
