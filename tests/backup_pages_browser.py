@@ -130,6 +130,7 @@ class Fixture:
         self.held = []
         self.errors = {}  # path -> message, answered with HTTP 503
         self.garble = None  # path answered 200 with a body that is not JSON
+        self.null_policy = False  # /policy answers with no policy at all
         self.cleanups = 0
         self.password_seen_outside_confirm = False
         self.big_policy = False
@@ -199,7 +200,9 @@ class Fixture:
             if path == base + "nodes":
                 return ok(dict(nodes=self.nodes))
             if path == base + "policy":
-                return ok(dict(enabled=True, policy=self.policy))
+                return ok(
+                    dict(enabled=True, policy=None if self.null_policy else self.policy)
+                )
             if path == "/api/v1/backup-agent/status":
                 return ok(self.agent)
             if path.startswith(base + "snapshots/"):
@@ -333,6 +336,16 @@ PATTERN = re.compile(r".*/api/v1/backup-(server|agent)/.*")
 def use(page, fixture):
     page.unroute_all()
     page.route(PATTERN, fixture.handle)
+
+
+def settled(page, fx, mark):
+    """Wait until the page has re-read the policy after the action recorded at
+    call index `mark`; the refresh rebuilds every panel, including forms."""
+    for _ in range(80):
+        if any(c[0] == "GET" and c[1].endswith("/policy") for c in fx.calls[mark:]):
+            break
+        page.wait_for_timeout(100)
+    page.wait_for_timeout(300)
 
 
 def eventually(page, expression, seconds=4.0):
@@ -519,6 +532,7 @@ def main():
                     snaps().get_by_role("cell", name="snap-0001", exact=True).count()
                     == 0,
                 )
+                mark = len(fx.calls)
                 page.get_by_role("button", name="Remove unreferenced data").click()
                 d = page.get_by_role("dialog", name="Remove unreferenced data")
                 d.get_by_label("Your Daemon password").fill(PASSWORD)
@@ -527,6 +541,7 @@ def main():
                     has_text="7 unreferenced objects removed"
                 ).wait_for()
                 check("garbage collection reports count", True)
+                settled(page, fx, mark)
                 # policy
                 page.locator("input[name=required_copies]").fill("2")
                 check(
@@ -772,6 +787,16 @@ def main():
                     "pending cleanups and compacted history shown",
                     page.get_by_text("2 cleanup pending").is_visible()
                     and page.get_by_text("5 compacted").is_visible(),
+                )
+                # a reply without a policy is shown as an error, never a crash
+                fx = Fixture()
+                fx.null_policy = True
+                reload(fx)
+                page.get_by_role("heading", name="Nodes").wait_for()
+                check(
+                    "missing policy shown as an error, other panels intact",
+                    page.get_by_text("The server returned no policy.").is_visible()
+                    and page.get_by_role("heading", name="Snapshots").is_visible(),
                 )
                 # an unreadable reply after a mutation is an uncertain outcome
                 fx = Fixture()
