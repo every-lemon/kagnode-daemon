@@ -1,4 +1,4 @@
-"""Isolated daemon collector, terminal disconnect, restart and retention regression."""
+"""Collector lifecycle through authenticated v1 local control; no TUI integration claim."""
 
 import json, os, pathlib, subprocess, tempfile, time, signal
 
@@ -9,10 +9,44 @@ with tempfile.TemporaryDirectory(prefix="monitor-lifecycle-") as folder:
     password.write_text("fixture-monitor-lifecycle-password")
     password.chmod(0o600)
 
+    token = None
+    request_counter = 0
+
+    def wire(payload, session=None, confirmation=None):
+        global request_counter
+        request_counter += 1
+        request = dict(version=1, request_id=f"fixture-{request_counter}", session=session,
+                       confirmation=confirmation, payload=payload)
+        return json.loads(subprocess.check_output(
+            [str(binary), "--root", str(root), "user", "request"],
+            input=json.dumps(request), text=True, stderr=subprocess.PIPE,
+        ))
+
+    def rpc(payload, confirm=False):
+        global token
+        if token is None:
+            token = wire(dict(action="login", account="monitor@example.invalid",
+                              password="fixture-monitor-lifecycle-password"))["token"]
+        confirmation = None
+        if confirm:
+            confirmation = wire(dict(action="reauthenticate", password="fixture-monitor-lifecycle-password",
+                                     target=payload), token)["confirmation"]
+        return wire(payload, token, confirmation)
+
     def run(*args):
-        return subprocess.check_output(
-            [str(binary), "--root", str(root), *args], text=True
-        )
+        if args[0] == "monitor":
+            payload = dict(action="overview") if len(args) == 1 else dict(
+                action="metrics", name=args[2], since=int(time.time())-3600, until=int(time.time()))
+            return json.dumps(rpc(payload))
+        if args[0] == "retention":
+            current = rpc(dict(action="retention"))
+            if len(args) == 1:
+                return json.dumps(current)
+            policy = dict(current["policy"])
+            policy["days"] = int(args[args.index("--days")+1])
+            return json.dumps(rpc(dict(action="set_retention", revision=int(args[args.index("--revision")+1]),
+                                       policy=policy, confirm_trim="--confirm-trim" in args), confirm=True))
+        return subprocess.check_output([str(binary), "--root", str(root), *args], text=True)
 
     run("init", "--email", "monitor@example.invalid", "--password-file", str(password))
 
@@ -41,20 +75,11 @@ with tempfile.TemporaryDirectory(prefix="monitor-lifecycle-") as folder:
         assert first["nodes"][0]["health"] == "online"
         policy = json.loads(run("retention"))
         assert policy["policy"]["days"] == 30
-        result = subprocess.run(
-            [
-                str(binary),
-                "--root",
-                str(root),
-                "retention",
-                "--days",
-                "2",
-                "--revision",
-                "0",
-            ],
-            capture_output=True,
-        )
-        assert result.returncode != 0
+        try:
+            run("retention", "--days", "2", "--revision", "0")
+            raise AssertionError("trim accepted without explicit review")
+        except subprocess.CalledProcessError as error:
+            assert "Reducing retention requires explicit trim confirmation" in error.stderr
         run("retention", "--days", "2", "--revision", "0", "--confirm-trim")
         time.sleep(11)
         second = json.loads(run("monitor"))
