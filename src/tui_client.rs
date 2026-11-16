@@ -200,6 +200,17 @@ impl Client {
     pub fn security(&self) -> Result<Value> {
         self.send(json!({"action": "security_get"}), None)
     }
+    pub fn set_admin_enabled(&self, revision: i64, enabled: bool, my_password: &str) -> Result<()> {
+        self.confirmed(
+            json!({
+                "action": "security_set",
+                "expected_revision": revision,
+                "admin_enabled": enabled,
+            }),
+            my_password,
+        )?;
+        Ok(())
+    }
     pub fn list_users(&self) -> Result<Vec<UserRow>> {
         self.send(json!({"action": "user_list"}), None)?["users"]
             .as_array()

@@ -122,8 +122,9 @@
     thead.append(head);
     for (const cells of rows) {
       const tr = el("tr");
-      for (const c of cells) {
+      for (const [i, c] of cells.entries()) {
         const td = el("td");
+        td.dataset.label = headers[i] || "";
         td.append(c instanceof Node ? c : document.createTextNode(String(c)));
         tr.append(td);
       }
@@ -190,21 +191,44 @@
       cancel.type = "button";
       form.append(el("h2", title));
       if (intro) form.append(el("p", intro, "muted"));
+      const rows = [];
       for (const f of fields) {
-        const row = el("label", f.label),
+        const row = el("label", f.label);
+        let input;
+        if (f.options) {
+          input = el("select");
+          for (const [value, text] of f.options) {
+            const o = el("option", text);
+            o.value = value;
+            input.append(o);
+          }
+          input.value = f.value ?? f.options[0][0];
+        } else {
           input = el("input");
+          input.type = f.type || "text";
+          input.required = f.required !== false;
+          input.autocomplete = f.autocomplete || "off";
+          if (f.pattern) input.pattern = f.pattern;
+          if (f.placeholder) input.placeholder = f.placeholder;
+          if (f.spellcheck === false) input.spellcheck = false;
+          if (f.value !== undefined) input.value = f.value;
+          if (f.readonly) input.readOnly = true;
+        }
         input.name = f.name;
-        input.type = f.type || "text";
-        input.required = f.required !== false;
-        input.autocomplete = f.autocomplete || "off";
-        if (f.pattern) input.pattern = f.pattern;
-        if (f.placeholder) input.placeholder = f.placeholder;
-        if (f.spellcheck === false) input.spellcheck = false;
         row.append(input);
         if (f.hint) row.append(el("small", f.hint));
         form.append(row);
         inputs[f.name] = input;
+        rows.push([f, row]);
       }
+      // A field can depend on another field's value (grants only for Managers).
+      const refreshRows = () => {
+        for (const [f, row] of rows)
+          row.hidden =
+            !!f.showWhen && inputs[f.showWhen[0]].value !== f.showWhen[1];
+      };
+      form.addEventListener("change", refreshRows);
+      refreshRows();
       actions.append(cancel, ok);
       form.append(alert, actions);
       form.onsubmit = async (e) => {
@@ -227,7 +251,8 @@
       dialog.addEventListener(
         "close",
         () => {
-          for (const input of Object.values(inputs)) input.value = "";
+          for (const input of Object.values(inputs))
+            if (input.tagName === "INPUT") input.value = "";
           dialog.remove();
           resolve(done);
         },
@@ -997,8 +1022,577 @@
     }
     await refresh();
   }
+  /* ---------------------------------------------------------------- Administration
+     Accounts, roles and settings. Sign-in here uses the Daemon's role API with its
+     own session cookie, so Managers and Viewers can sign in too. The page only
+     shows what the signed-in role may use; the Daemon enforces every request. */
+  const PRODUCT_NAMES = {
+    "proxy-manager": "Proxy",
+    vpn: "VPN",
+    entropy: "Entropy",
+    media: "Media",
+    passwords: "Passwords",
+    mail: "Mail",
+    httpboot: "HTTP Boot",
+    netctl: "Network",
+    backup: "Backups",
+  };
+  const ROLE_TEXT = {
+    operator: "Everything, including users and Daemon settings",
+    manager: "Chosen services, each at a chosen level",
+    viewer: "Read-only server analytics; no logs or actions",
+  };
+  async function adminPage() {
+    const ROLES = "/api/v1/roles/";
+    let rcsrf = "",
+      me = null;
+    const heading = document.querySelector("h1");
+    const requestId = () =>
+      [...crypto.getRandomValues(new Uint8Array(16))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    async function rapi(suffix, payload, confirmation = null, challenge) {
+      const post = payload !== undefined;
+      let r;
+      r = await fetch(ROLES + suffix, {
+        method: post ? "POST" : "GET",
+        headers: post
+          ? {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": challenge || rcsrf,
+            }
+          : {},
+        body: post
+          ? JSON.stringify({ request_id: requestId(), confirmation, payload })
+          : undefined,
+      });
+      let v = {};
+      try {
+        v = await r.json();
+      } catch {
+        const unreadable = Error("The server's reply could not be read.");
+        unreadable.uncertain = true;
+        throw unreadable;
+      }
+      if (r.status === 401 && me) {
+        me = null;
+        signIn("Your session ended. Sign in again.");
+        throw Error("Sign in again");
+      }
+      if (!r.ok) {
+        const e = Error(v.error || "The request failed");
+        e.status = r.status;
+        throw e;
+      }
+      return v;
+    }
+    /* Password confirmation, then the identical typed request with the one-use
+       confirmation. Network failures are reported as uncertain, never retried. */
+    async function rconfirmed({
+      route,
+      payload,
+      title,
+      intro,
+      submit,
+      danger,
+      extra = [],
+      build,
+    }) {
+      let result;
+      const done = await formDialog({
+        title,
+        intro,
+        submit,
+        danger,
+        fields: [
+          ...extra,
+          {
+            name: "password",
+            label: "Your Daemon password",
+            type: "password",
+            autocomplete: "current-password",
+            hint: "Entered locally to confirm this action. It is not stored.",
+          },
+        ],
+        onSubmit: async (v) => {
+          const target = build ? build(v) : payload;
+          try {
+            const c = await rapi("confirm", {
+              action: "reauthenticate",
+              password: v.password,
+              target,
+            });
+            result = await rapi(route, target, c.confirmation);
+          } catch (error) {
+            if (error instanceof TypeError || error.uncertain)
+              throw Error(
+                "The connection failed or the reply could not be read. The action may or may not have completed. Check the current state before trying again.",
+              );
+            if (error.status === 409)
+              throw Error(
+                "This changed since you opened it. Close this and reload the list.",
+              );
+            throw error;
+          }
+        },
+      });
+      return { done, result };
+    }
+    const grantFields = (current = {}) =>
+      Object.entries(PRODUCT_NAMES).map(([id, name]) => ({
+        name: "grant:" + id,
+        label: name,
+        options: [
+          ["", "No access"],
+          ["view", "View"],
+          ["operate", "Operate"],
+          ["manage", "Manage"],
+        ],
+        value: current[id] || "",
+        showWhen: ["role", "manager"],
+      }));
+    const grantsOf = (v) => {
+      const g = {};
+      if (v.role === "manager")
+        for (const id of Object.keys(PRODUCT_NAMES))
+          if (v["grant:" + id]) g[id] = v["grant:" + id];
+      return g;
+    };
+    const roleOptions = [
+      ["viewer", "Viewer — read-only analytics"],
+      ["manager", "Manager — chosen services"],
+      ["operator", "Operator — everything"],
+    ];
+    function servicesText(u) {
+      if (u.role === "operator") return "all services";
+      if (u.role === "viewer") return "analytics only";
+      const g = Object.entries(u.grants || {});
+      return g.length
+        ? g.map(([p, l]) => (PRODUCT_NAMES[p] || p) + ": " + l).join(", ")
+        : "none";
+    }
+    const tone = { operator: "info", manager: "ok", viewer: "" };
+
+    function signIn(message) {
+      heading.textContent = "Administration";
+      content.replaceChildren();
+      const form = el("form", undefined, "panel stack sign-in");
+      form.append(el("h2", "Sign in"));
+      form.append(
+        el(
+          "p",
+          "Sign in with your Daemon account. Managers and Viewers see only what their role allows.",
+          "muted",
+        ),
+      );
+      const account = field(form, "Account", "account", "", "email"),
+        password = field(form, "Password", "password", "", "password");
+      account.autocomplete = "username";
+      password.autocomplete = "current-password";
+      const alert = el("p", message || "", "form-error"),
+        go = el("button", "Sign in", "button primary");
+      alert.setAttribute("role", "alert");
+      form.append(alert, go);
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        go.disabled = true;
+        alert.textContent = "";
+        try {
+          const challenge = await rapi("auth");
+          const r = await rapi(
+            "login",
+            {
+              action: "login",
+              account: account.value,
+              password: password.value,
+            },
+            null,
+            challenge.csrf,
+          );
+          rcsrf = r.csrf;
+          me = r.whoami;
+          password.value = "";
+          shell();
+        } catch (error) {
+          password.value = "";
+          alert.textContent = error.message;
+        } finally {
+          go.disabled = false;
+        }
+      };
+      content.append(form);
+      account.focus();
+    }
+
+    // ------------------------------------------------------------ signed in
+    const can = (a) => (me?.capabilities?.global || []).includes(a);
+    let tab = "overview";
+    function shell() {
+      heading.textContent = "Administration";
+      content.replaceChildren();
+      const bar = el("div", undefined, "admin-bar");
+      const who = el("span", undefined, "admin-who");
+      who.append(
+        el("strong", me.user.account),
+        document.createTextNode(" "),
+        badge(me.user.role, tone[me.user.role]),
+      );
+      if (me.protection === "unprotected")
+        who.append(document.createTextNode(" "), badge("unprotected", "warn"));
+      const out = el("button", "Sign out", "button small");
+      out.type = "button";
+      out.onclick = async () => {
+        try {
+          await rapi("logout", { action: "logout" });
+        } catch {
+          /* the session may already be gone */
+        }
+        me = null;
+        signIn();
+      };
+      bar.append(who, out);
+      const tabs = el("div", undefined, "tabs"),
+        panel = el("section", undefined, "panel stack");
+      tabs.setAttribute("role", "tablist");
+      const items = [["overview", "Overview", true]];
+      items.push(["users", "Users", can("user_list")]);
+      items.push(["security", "Settings", can("security_get")]);
+      items.push(["audit", "Activity", can("audit")]);
+      items.push(["account", "My account", can("change_password")]);
+      for (const [id, label, shown] of items) {
+        if (!shown) continue;
+        const b = el("button", label, "tab");
+        b.type = "button";
+        b.setAttribute("role", "tab");
+        b.setAttribute("aria-selected", String(tab === id));
+        b.onclick = () => {
+          tab = id;
+          shell();
+        };
+        tabs.append(b);
+      }
+      content.append(bar, tabs, panel);
+      panel.setAttribute("role", "tabpanel");
+      ({ overview, users, security, audit, account })[tab](panel).catch((e) => {
+        panel.replaceChildren(el("p", e.message, "form-error"));
+        if (e.status === 403 && /disabled/i.test(e.message))
+          panel.append(
+            el(
+              "p",
+              "Web administration is off. An Operator turns it on from the terminal (kagnode, then a, Web administration).",
+              "muted",
+            ),
+          );
+      });
+      restoreFocus(content);
+    }
+    async function overview(panel) {
+      const o = await rapi("overview");
+      const node = o.nodes?.[0] || {},
+        v = node.last_sample?.values || {};
+      const num = (k, unit = "") =>
+        typeof v[k] === "number" ? v[k].toFixed(1) + unit : "—";
+      panel.append(
+        el("h2", "Server"),
+        facts([
+          [
+            "Daemon",
+            badge(
+              node.health || "unknown",
+              node.health === "online" ? "ok" : "warn",
+            ),
+          ],
+          ["CPU", num("cpu.percent", "%")],
+          ["Memory", num("memory.used_percent", "%")],
+          ["Load", num("load.1")],
+        ]),
+      );
+      panel.append(el("h2", "Your access"));
+      const grants = Object.entries(me.user.grants || {});
+      panel.append(
+        facts([
+          ["Role", me.user.role],
+          ["Allowed", ROLE_TEXT[me.user.role]],
+          ...(me.user.role === "manager"
+            ? [
+                [
+                  "Services",
+                  grants.length
+                    ? grants
+                        .map(([p, l]) => (PRODUCT_NAMES[p] || p) + ": " + l)
+                        .join(", ")
+                    : "none granted yet",
+                ],
+              ]
+            : []),
+        ]),
+      );
+      if (me.protection === "unprotected")
+        panel.append(
+          el(
+            "p",
+            "This Daemon is unprotected: anyone who can use this machine's terminal is the Operator.",
+            "muted",
+          ),
+        );
+    }
+    async function users(panel) {
+      const data = await rapi("users");
+      const add = el("button", "New user", "button primary");
+      add.type = "button";
+      add.onclick = () =>
+        rconfirmed({
+          route: "users-create",
+          title: "New user",
+          intro: "Choose a role. Managers get services at a level you pick.",
+          submit: "Create user",
+          extra: [
+            {
+              name: "account",
+              label: "Account (email)",
+              type: "email",
+              autocomplete: "off",
+            },
+            {
+              name: "newpassword",
+              label: "Password",
+              type: "password",
+              autocomplete: "new-password",
+              hint: "At least 12 characters.",
+            },
+            { name: "role", label: "Role", options: roleOptions },
+            ...grantFields(),
+          ],
+          build: (v) => ({
+            action: "user_create",
+            account: v.account,
+            password: v.newpassword,
+            role: v.role,
+            grants: grantsOf(v),
+          }),
+        }).then((r) => r.done && shell());
+      const rows = data.users.map((u) => {
+        const edit = actionButton("Edit role", u.account, () =>
+          rconfirmed({
+            route: "users-update",
+            title: "Change role and services",
+            intro: u.account,
+            submit: "Save",
+            extra: [
+              {
+                name: "role",
+                label: "Role",
+                options: roleOptions,
+                value: u.role,
+              },
+              ...grantFields(u.grants),
+            ],
+            build: (v) => ({
+              action: "user_update",
+              id: u.id,
+              expected_revision: u.auth_revision,
+              role: v.role,
+              grants: grantsOf(v),
+              disabled: u.disabled,
+            }),
+          }).then((r) => r.done && shell()),
+        );
+        const toggle = actionButton(
+          u.disabled ? "Enable" : "Disable",
+          u.account,
+          () =>
+            rconfirmed({
+              route: "users-update",
+              title: (u.disabled ? "Enable " : "Disable ") + u.account,
+              intro: u.disabled
+                ? "They can sign in again."
+                : "They are signed out now and cannot sign in. History is kept.",
+              submit: u.disabled ? "Enable" : "Disable",
+              danger: !u.disabled,
+              build: () => ({
+                action: "user_update",
+                id: u.id,
+                expected_revision: u.auth_revision,
+                role: u.role,
+                grants: u.grants || {},
+                disabled: !u.disabled,
+              }),
+            }).then((r) => r.done && shell()),
+          !u.disabled,
+        );
+        const reset = actionButton("Reset password", u.account, () =>
+          rconfirmed({
+            route: "users-reset-password",
+            title: "Reset password",
+            intro: u.account + " signs in again with the new password.",
+            submit: "Reset password",
+            danger: true,
+            extra: [
+              {
+                name: "newpassword",
+                label: "New password",
+                type: "password",
+                autocomplete: "new-password",
+                hint: "At least 12 characters.",
+              },
+            ],
+            build: (v) => ({
+              action: "user_reset_password",
+              id: u.id,
+              expected_revision: u.auth_revision,
+              password: v.newpassword,
+            }),
+          }).then((r) => r.done && shell()),
+        );
+        const actions = el("span", undefined, "row-actions");
+        actions.append(edit, toggle, reset);
+        return [
+          u.account + (u.id === me.user.id ? " (you)" : ""),
+          badge(u.role, tone[u.role]),
+          servicesText(u),
+          badge(u.disabled ? "disabled" : "active", u.disabled ? "bad" : "ok"),
+          actions,
+        ];
+      });
+      panel.append(
+        el("h2", "Users"),
+        table(
+          "Daemon users",
+          ["Account", "Role", "Services", "Status", "Actions"],
+          rows,
+          true,
+        ),
+        add,
+        el(
+          "p",
+          "Every change asks for your password again. The last Operator cannot be removed or disabled.",
+          "muted",
+        ),
+      );
+    }
+    async function security(panel) {
+      const s = await rapi("security");
+      panel.append(
+        el("h2", "Web administration"),
+        facts([
+          [
+            "Protection",
+            badge(
+              s.mode === "owner"
+                ? "unprotected (owner mode)"
+                : "password protected",
+              s.mode === "owner" ? "warn" : "ok",
+            ),
+          ],
+          [
+            "Web administration",
+            badge(s.admin_enabled ? "on" : "off", s.admin_enabled ? "ok" : ""),
+          ],
+        ]),
+        el(
+          "p",
+          "When off, this page cannot change users or settings and no product shows an Administration link. Analytics and your own password stay available. Managed applications are not affected either way.",
+          "muted",
+        ),
+      );
+      if (s.mode !== "owner") {
+        const b = el(
+          "button",
+          s.admin_enabled
+            ? "Turn web administration off"
+            : "Turn web administration on",
+          "button" + (s.admin_enabled ? " danger" : " primary"),
+        );
+        b.type = "button";
+        b.onclick = () =>
+          rconfirmed({
+            route: "security",
+            title: s.admin_enabled
+              ? "Turn web administration off"
+              : "Turn web administration on",
+            intro: s.admin_enabled
+              ? "Users and settings can then only be changed from the terminal."
+              : "Operators can manage users and settings from the web.",
+            submit: s.admin_enabled ? "Turn off" : "Turn on",
+            danger: s.admin_enabled,
+            build: () => ({
+              action: "security_set",
+              expected_revision: s.revision,
+              admin_enabled: !s.admin_enabled,
+            }),
+          }).then((r) => r.done && shell());
+        panel.append(b);
+      }
+    }
+    async function audit(panel) {
+      const data = await rapi("audit");
+      panel.append(el("h2", "Recent security activity"));
+      if (!data.events.length) {
+        panel.append(el("p", "No activity yet.", "muted"));
+        return;
+      }
+      panel.append(
+        table(
+          "Recent security activity",
+          ["When", "Action", "Detail"],
+          data.events.map((e) => [when(e.at), e.action, e.detail]),
+        ),
+      );
+    }
+    async function account(panel) {
+      panel.append(
+        el("h2", "My account"),
+        facts([
+          ["Account", me.user.account],
+          ["Role", me.user.role],
+        ]),
+      );
+      const b = el("button", "Change my password", "button");
+      b.type = "button";
+      b.onclick = async () => {
+        const done = await formDialog({
+          title: "Change my password",
+          intro: "You sign in again afterwards.",
+          submit: "Change password",
+          fields: [
+            {
+              name: "current",
+              label: "Current password",
+              type: "password",
+              autocomplete: "current-password",
+            },
+            {
+              name: "next",
+              label: "New password",
+              type: "password",
+              autocomplete: "new-password",
+              hint: "At least 12 characters.",
+            },
+          ],
+          onSubmit: (v) =>
+            rapi("password", {
+              action: "change_password",
+              current_password: v.current,
+              password: v.next,
+            }),
+        });
+        if (done) {
+          me = null;
+          signIn("Password changed. Sign in with the new password.");
+        }
+      };
+      panel.append(b);
+    }
+    try {
+      me = await rapi("whoami");
+      shell();
+    } catch {
+      signIn();
+    }
+  }
   async function render() {
     if (!content) return;
+    if (location.pathname === "/admin") return adminPage();
     try {
       const session = await api("session");
       csrf = session.user.csrf;

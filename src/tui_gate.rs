@@ -328,6 +328,77 @@ pub fn users(terminal: &mut DefaultTerminal, client: &Client, me: &Identity) -> 
     }
 }
 
+/// Turn web administration on or off. It is off by default; while off, the web
+/// pages cannot change users or settings and no product shows an Administration
+/// link. The Operator confirms with their own password.
+pub fn toggle_admin(
+    terminal: &mut DefaultTerminal,
+    client: &Client,
+    me: &Identity,
+) -> Result<(Exit, String)> {
+    let state = match client.security() {
+        Ok(v) => v,
+        Err(e) if is_signed_out(&e) => return Ok((Exit::SignedOut, String::new())),
+        Err(e) => return Ok((Exit::Quit, e.to_string())),
+    };
+    if state["mode"] == "owner" {
+        return Ok((
+            Exit::Quit,
+            "Web administration needs password protection. Add an Operator password first.".into(),
+        ));
+    }
+    let enabled = state["admin_enabled"].as_bool().unwrap_or(false);
+    let revision = state["revision"].as_i64().unwrap_or(0);
+    let mut prompt = PasswordPrompt::new(
+        "Confirm with your password",
+        if enabled {
+            "Turn web administration OFF. Users and settings then change only from the terminal."
+        } else {
+            "Turn web administration ON. Operators can manage users and settings from the web."
+        },
+        &["Password"],
+    );
+    loop {
+        terminal.draw(|f| {
+            f.render_widget(
+                Block::default().style(Style::default().bg(BG).fg(FG)),
+                f.area(),
+            );
+            render_prompt(f, f.area(), &prompt);
+        })?;
+        let Some(key) = press(Duration::from_millis(250))? else {
+            continue;
+        };
+        match prompt.key(key) {
+            PromptOutcome::Cancel => return Ok((Exit::Quit, "Cancelled. Nothing changed.".into())),
+            PromptOutcome::None => {}
+            PromptOutcome::Submit => {
+                terminal.draw(|f| {
+                    f.render_widget(
+                        Block::default().style(Style::default().bg(BG).fg(FG)),
+                        f.area(),
+                    );
+                    render_prompt(f, f.area(), &prompt);
+                })?;
+                match client.set_admin_enabled(revision, !enabled, &prompt.values[0]) {
+                    Ok(()) => {
+                        let _ = me;
+                        return Ok((
+                            Exit::Quit,
+                            format!(
+                                "Web administration is now {}.",
+                                if enabled { "off" } else { "on" }
+                            ),
+                        ));
+                    }
+                    Err(e) if is_signed_out(&e) => return Ok((Exit::SignedOut, String::new())),
+                    Err(e) => prompt.refused(&e.to_string()),
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------- Manager / Viewer screen
 /// What Managers and Viewers see: server analytics (and, for Managers, the status
 /// of the services they were granted). Read-only; no action is offered here.
