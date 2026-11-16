@@ -217,6 +217,10 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
             ],
         )?;
         tx.execute("DELETE FROM attempts WHERE identity=?1", [&identity])?;
+        tx.execute(
+            "INSERT INTO web_session_revisions SELECT ?1,auth_revision FROM users WHERE email=?2",
+            params![auth::digest(&token), email],
+        )?;
         tx.commit()?;
         Ok(token)
     }
@@ -224,7 +228,7 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
     // request, including sessions retained after an administrator is removed.
     pub fn session(&self, token: &str) -> Result<Option<Session>> {
         ensure!(token.len() <= 128, "Invalid session");
-        Ok(self.db()?.query_row("SELECT s.email,s.csrf,s.authenticated_at FROM sessions s JOIN admins a ON a.email=s.email JOIN users u ON u.email=s.email WHERE s.token_hash=?1 AND s.expires>?2 AND u.role='operator' AND u.disabled=0 AND (SELECT mode FROM security_config)='protected'", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
+        Ok(self.db()?.query_row("SELECT s.email,s.csrf,s.authenticated_at FROM sessions s JOIN admins a ON a.email=s.email JOIN users u ON u.email=s.email JOIN web_session_revisions v ON v.session_hash=s.token_hash AND v.auth_revision=u.auth_revision WHERE s.token_hash=?1 AND s.expires>?2 AND u.role='operator' AND u.disabled=0 AND (SELECT mode FROM security_config)='protected'", params![auth::digest(token),auth::now()], |r| Ok(Session { email:r.get(0)?,csrf:r.get(1)?,authenticated_at:r.get(2)? })).optional()?)
     }
     /// Legacy web presentation is Operator-only until Claude integrates roles.
     /// Dashboard availability and administration permission are separate gates.

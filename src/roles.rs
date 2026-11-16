@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS terminal_confirmations(hash TEXT PRIMARY KEY,session_
 CREATE TABLE IF NOT EXISTS security_attempts(identity TEXT PRIMARY KEY,start INTEGER NOT NULL,count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS security_receipts(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,uid INTEGER NOT NULL,mode TEXT NOT NULL,action TEXT NOT NULL,request_hash TEXT NOT NULL,outcome TEXT NOT NULL,at INTEGER NOT NULL,receipt_mac TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS security_key(id INTEGER PRIMARY KEY CHECK(id=1),key_hex TEXT NOT NULL);")?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS web_session_revisions(session_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,auth_revision INTEGER NOT NULL);")?;
     tx.execute(
         "INSERT OR IGNORE INTO security_key VALUES(1,?1)",
         [auth::random()?],

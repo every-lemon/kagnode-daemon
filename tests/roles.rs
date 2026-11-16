@@ -75,6 +75,31 @@ fn add_fixture(s: &Store, id: &str, role: &str) -> Result<()> {
     Ok(())
 }
 #[test]
+fn legacy_web_sessions_check_current_auth_revision_on_every_use() -> Result<()> {
+    let (_t, s) = fixture()?;
+    let token = s.login(
+        "owner@fixture.invalid",
+        "fixture-password-long",
+        "synthetic-peer",
+    )?;
+    assert!(s.session(&token)?.is_some());
+    db(&s)?.execute(
+        "UPDATE users SET auth_revision=auth_revision+1 WHERE email='owner@fixture.invalid'",
+        [],
+    )?;
+    assert!(s.session(&token)?.is_none());
+    // A new sign-in binds the new revision; stale sessions stay invalid after restart.
+    let next = s.login(
+        "owner@fixture.invalid",
+        "fixture-password-long",
+        "synthetic-peer",
+    )?;
+    let reopened = Store::open(&s.root)?;
+    assert!(reopened.session(&token)?.is_none());
+    assert!(reopened.session(&next)?.is_some());
+    Ok(())
+}
+#[test]
 fn matrix_denies_unknown_and_scopes_every_product() -> Result<()> {
     let actions = [
         ("product_status", Level::View),
