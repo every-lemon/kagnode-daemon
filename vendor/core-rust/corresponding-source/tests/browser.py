@@ -1,0 +1,426 @@
+"""Shared component acceptance tests; no live account or application data."""
+
+import importlib.util, json, os, threading
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from playwright.sync_api import sync_playwright
+
+ROOT = Path(__file__).resolve().parents[1]
+s = importlib.util.spec_from_file_location("core", ROOT / "dist/python/kagnode_core.py")
+core = importlib.util.module_from_spec(s)
+s.loader.exec_module(core)
+HTML = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0" data-authenticated="true"><aside id="sidebar" class="sidebar"><a class="brand" href="/"><img src="/kagnode-core/1.0.0/mark.svg"><span class="brand-copy"><strong>KagNode.</strong><small>Example</small></span></a><nav class="sidebar-nav"><a href="/" aria-current="page"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg><span class="nav-label">Overview</span></a><details class="nav-group" data-group="products"><summary><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/></svg><span class="nav-label">Products</span></summary><div class="submenu"><a href="#section">A long section title that should wrap rather than change the width</a></div></details></nav></aside><div class="workspace"><header style="display:flex;justify-content:flex-end;height:60px;align-items:center;padding:12px"><button data-account-menu><span class="avatar">C</span><span class="header-account-name">Example Person</span></button><div id="account-menu" class="account-menu hidden" hidden inert><div class="account-identity"><strong>Example Person</strong></div><a href="/settings">Manage account</a><button>Sign out</button></div></header><main style="padding:24px"><h1>Shared components</h1><label for="choice">Choose</label><select id="choice"><option>First</option><option>Second</option></select><label for="number">Number</label><input id="number" type="number" min="1" max="9" value="2"><label for="date">Date</label><input id="date" type="date"><div id="nested" aria-label="Nested example" style="height:140px;overflow:auto"><div style="height:800px">Nested content</div></div><div style="height:1500px"></div><section id="section">Destination</section></main></div></body></html>"""
+
+HTML = HTML.replace(
+    '<nav class="sidebar-nav">',
+    '<button type="button" data-command class="pm-search-trigger" style="display:flex;gap:20px;padding:16px;min-width:160px"><span data-core-icon="search"></span><span class="nav-label">Quick search</span><kbd>Ctrl K</kbd></button><nav class="sidebar-nav">',
+    1,
+)
+
+HTML = HTML.replace(
+    "</body>",
+    '<div hidden data-core-search-source data-endpoint="/api/v1/search"><a href="/settings" data-description="Your preferences">Account settings</a></div></body>',
+)
+
+HTML = HTML.replace(
+    "/kagnode-core/1.0.0/", "/kagnode-core/" + core.BUNDLE["version"] + "/"
+)
+
+
+def assert_sidebar_width(page, expected):
+    page.wait_for_function(
+        "width=>Math.abs(document.querySelector('#sidebar').getBoundingClientRect().width-width)<0.5",
+        arg=expected,
+        timeout=2000,
+    )
+    assert round(page.locator("#sidebar").bounding_box()["width"]) == expected
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/api/v1/search"):
+            from urllib.parse import urlsplit, parse_qs
+
+            term = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
+            data = json.dumps(
+                {
+                    "results": []
+                    if term == "empty"
+                    else [
+                        {
+                            "id": "plan:one",
+                            "title": "A long matching plan " + term * 20,
+                            "description": "Useful details " * 20,
+                            "type": "Plan",
+                            "url": "/#section",
+                        }
+                    ],
+                    "moreUrl": "/search?q=" + term,
+                }
+            ).encode()
+            self.send_response(503 if term == "failure" else 200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        result = core.asset(self.path)
+        data, mime = (
+            result
+            if result
+            else (
+                core.inject(
+                    HTML, "example", {"authenticated": True, "subject": "fixture"}
+                ).encode(),
+                "text/html",
+            )
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+errors = []
+try:
+    with sync_playwright() as p:
+        engine = os.environ.get("KAGNODE_BROWSER_ENGINE", "chromium")
+        executable = os.environ.get("KAGNODE_BROWSER_EXECUTABLE")
+        browser = getattr(p, engine).launch(
+            headless=True, **({"executable_path": executable} if executable else {})
+        )
+        for width in [390, 768, 950, 1100, 1440]:
+            for scheme in ["light", "dark"]:
+                page = browser.new_page(
+                    viewport={"width": width, "height": 900}, color_scheme=scheme
+                )
+                page.on("pageerror", lambda e: errors.append(str(e)))
+                page.goto("http://127.0.0.1:" + str(server.server_port))
+                page.wait_for_function("!!window.KagNodeCore")
+                page.wait_for_timeout(150)
+                assert page.locator("html").evaluate("e=>e.classList.contains('js')")
+                assert page.locator("[data-core-sidebar]").count() == 1
+                if width >= 1024:
+                    page.wait_for_function(
+                        '()=>document.documentElement.dataset.coreReady==="true"'
+                    )
+                    page.set_viewport_size({"width": width, "height": 1200})
+                    page.wait_for_timeout(80)
+                    expected = 57 if width < 1360 else 260
+                    assert (
+                        page.locator(".workspace").bounding_box()["x"] >= expected - 1
+                    )
+                    page.set_viewport_size({"width": width, "height": 900})
+
+                page.keyboard.press("Control+k")
+                field = page.locator(".kn-core-search-input")
+                field.wait_for(state="visible")
+                field.fill("Account")
+                page.locator(".kn-core-search-row").first.wait_for()
+                page.wait_for_function(
+                    '()=>!document.querySelector(".kn-core-search-input").hasAttribute("aria-busy")'
+                )
+                assert page.locator(".kn-core-search").evaluate(
+                    "e=>e.scrollWidth<=e.clientWidth+1"
+                )
+                page.keyboard.press("ArrowUp")
+                assert field.get_attribute("aria-activedescendant") == page.locator(
+                    ".kn-core-search-row"
+                ).last.get_attribute("id")
+                page.keyboard.press("ArrowDown")
+                assert field.get_attribute("aria-activedescendant")
+                field.fill("failure")
+                page.locator(".kn-core-search-footer button").wait_for(state="visible")
+                field.fill("empty")
+                page.get_by_text(
+                    "No matching results. Try another phrase.", exact=True
+                ).wait_for()
+                page.keyboard.press("Escape")
+                page.locator(".kn-core-search").wait_for(state="hidden")
+
+                if width == 1440:
+                    page.mouse.move(width - 20, 700)
+                    page.evaluate(
+                        "document.activeElement.blur(); KagNodeCore.navigation.collapse(true)"
+                    )
+                    assert_sidebar_width(page, 57)
+                    search = page.locator("[data-command]")
+                    box = search.bounding_box()
+                    rail = page.locator("#sidebar").bounding_box()
+                    assert (
+                        box["width"] == 38
+                        and box["x"] >= rail["x"]
+                        and box["x"] + box["width"] <= rail["x"] + rail["width"]
+                    )
+                    assert search.get_attribute("aria-label") == "Quick search"
+                    assert search.locator("svg").is_visible()
+                    for motion in ["reduce", "no-preference"]:
+                        page.emulate_media(reduced_motion=motion)
+                        for _ in range(3):
+                            page.evaluate("KagNodeCore.navigation.collapse(false)")
+                            page.locator("details summary").click()
+                            page.wait_for_timeout(240)
+                            assert page.locator("details").evaluate("d=>d.open")
+                            assert (
+                                page.locator("details summary").get_attribute(
+                                    "aria-expanded"
+                                )
+                                == "true"
+                            )
+                            page.evaluate("KagNodeCore.navigation.collapse(true)")
+                            assert not page.locator("details").evaluate("d=>d.open")
+                            assert (
+                                page.locator("details summary").get_attribute(
+                                    "aria-expanded"
+                                )
+                                == "false"
+                            )
+                            assert page.locator("details > div").evaluate("e=>e.inert")
+                            page.evaluate("KagNodeCore.navigation.collapse(false)")
+                            assert (
+                                page.locator("details summary").get_attribute(
+                                    "aria-expanded"
+                                )
+                                == "false"
+                            )
+                    page.emulate_media(reduced_motion="no-preference")
+
+                if width < 1024:
+                    page.evaluate("KagNodeCore.navigation.open()")
+                page.evaluate("""()=>{
+                  const d=document.createElement('dialog');d.id='modal-focus-test';
+                  d.innerHTML='<input aria-label="Modal input">';document.body.append(d);
+                  d.showModal();d.querySelector('input').focus();
+                }""")
+                page.wait_for_function(
+                    "()=>document.documentElement.dataset.coreDrawer!=='true'"
+                )
+                assert page.locator("#modal-focus-test input").evaluate(
+                    "e=>e===document.activeElement"
+                )
+                assert page.locator("html").get_attribute("data-core-drawer") != "true"
+                page.evaluate(
+                    "()=>{const d=document.getElementById('modal-focus-test');d.close();d.remove()}"
+                )
+
+                assert page.locator(".brand img").evaluate(
+                    "e=>e.complete&&e.naturalWidth>0"
+                )
+                if width == 1100:
+                    assert_sidebar_width(page, 57)
+                    page.wait_for_function(
+                        "Math.abs(document.querySelector('.workspace').getBoundingClientRect().x-57)<1"
+                    )
+                    page.locator("#sidebar").hover()
+                    page.wait_for_timeout(450)
+                    assert_sidebar_width(page, 260)
+                    assert page.locator(".workspace").bounding_box()["x"] >= 259
+                    page.mouse.move(800, 80)
+                    page.wait_for_timeout(500)
+                    assert_sidebar_width(page, 57)
+                    page.locator("[data-core-toggle]").click()
+                    page.wait_for_timeout(300)
+                if width >= 1024:
+                    assert_sidebar_width(page, 260)
+                    for _ in range(10):
+                        page.locator("[data-core-toggle]").click()
+                        page.wait_for_timeout(35)
+                    page.wait_for_timeout(300)
+                    assert_sidebar_width(page, 260)
+                    page.locator("[data-core-toggle]").click()
+                    page.wait_for_timeout(300)
+                    assert_sidebar_width(page, 57)
+                    # Labels remain in the row and are clipped by its shrinking
+                    # bounds; they must not wrap or be removed during motion.
+                    assert page.locator(
+                        ".kn-core-sidebar-navigation a .nav-label"
+                    ).first.evaluate(
+                        "e=>getComputedStyle(e).display!=='none' && getComputedStyle(e).whiteSpace==='nowrap'"
+                    )
+                    assert page.locator(
+                        ".kn-core-sidebar-navigation svg"
+                    ).first.evaluate("e=>getComputedStyle(e).flexShrink==='0'")
+                    page.locator("[data-core-toggle]").click()
+                    page.wait_for_timeout(300)
+                    for _ in range(5):
+                        page.locator("summary").click()
+                        page.wait_for_timeout(30)
+                    page.wait_for_timeout(250)
+                    assert page.locator(".submenu").bounding_box()["height"] < 160
+                else:
+                    page.locator("[data-core-mobile]").click()
+                    assert (
+                        page.locator("html").get_attribute("data-core-drawer") == "true"
+                    )
+                    page.keyboard.press("Escape")
+                    page.evaluate("KagNodeCore.navigation.open()")
+                    page.evaluate(
+                        "()=>{const d=document.createElement('dialog');d.id='test-dialog';d.textContent='Example';document.body.append(d);d.showModal()}"
+                    )
+                    page.wait_for_function(
+                        "document.documentElement.dataset.coreDrawer!=='true'"
+                    )
+                    page.evaluate("document.querySelector('#test-dialog').remove()")
+                    page.evaluate("KagNodeCore.navigation.open()")
+                    page.evaluate("KagNodeCore.setSession({authenticated:false})")
+                    page.wait_for_function(
+                        "document.documentElement.dataset.coreDrawer!=='true'"
+                    )
+                    page.evaluate(
+                        "KagNodeCore.setSession({authenticated:true,subject:'fixture'})"
+                    )
+                if width < 1024:
+                    page.evaluate("KagNodeCore.navigation.open()")
+                    page.wait_for_timeout(350)
+                    page.mouse.move(width - 6, 400)
+                    page.mouse.wheel(0, 600)
+                    page.wait_for_timeout(150)
+                    assert page.evaluate("scrollY") == 0, (
+                        "page scrolled behind the open drawer"
+                    )
+                assert (
+                    page.locator(".kn-core-sidebar-footer [data-account-menu]").count()
+                    == 1
+                )
+                assert (
+                    page.locator(".kn-core-sidebar-footer [data-core-toggle]").count()
+                    == 1
+                )
+                if width >= 1024:
+                    # Cloudflare-style dock: account row above a full-width
+                    # collapse row that keeps its place in both states.
+                    toggle = page.locator(".kn-core-sidebar-footer [data-core-toggle]")
+                    account = page.locator(
+                        ".kn-core-sidebar-footer [data-account-menu]"
+                    )
+                    before = toggle.bounding_box()
+                    above = account.bounding_box()
+                    assert before["y"] >= above["y"] + above["height"] - 1, (
+                        "collapse control must sit below the account row"
+                    )
+                    assert toggle.locator("svg").count() == 1
+                    assert toggle.locator(".kn-core-toggle-label").count() == 1
+                    assert toggle.locator(
+                        ".kn-core-toggle-label"
+                    ).text_content() == toggle.get_attribute("aria-label")
+                    toggle.click()
+                    page.wait_for_timeout(450)
+                    after = toggle.bounding_box()
+                    assert abs(after["y"] - before["y"]) <= 1, (
+                        "collapse control moved between states"
+                    )
+                    assert toggle.locator(
+                        ".kn-core-toggle-label"
+                    ).text_content() == toggle.get_attribute("aria-label")
+                    toggle.click()
+                    page.wait_for_timeout(450)
+                assert (
+                    page.locator(".kn-core-sidebar-navigation").evaluate(
+                        "e=>getComputedStyle(e).scrollbarWidth"
+                    )
+                    == "none"
+                )
+                page.locator("[data-account-menu]").click()
+                assert page.locator("#account-menu").is_visible()
+                bounds = page.locator("#account-menu").bounding_box()
+                assert bounds["y"] >= 0 and bounds["y"] + bounds["height"] <= 900
+                assert bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width
+                page.keyboard.press("Escape")
+                assert page.locator("#account-menu").is_hidden()
+                page.evaluate("KagNodeCore.navigation.close()")
+                page.locator("#nested").hover()
+                page.mouse.wheel(0, 400)
+                page.wait_for_function(
+                    "document.querySelector('#nested').scrollTop>0", timeout=2000
+                )
+                page.evaluate(
+                    "()=>{window.__changes=0;document.querySelector('#choice').addEventListener('change',()=>window.__changes++);document.querySelector('#choice').selectedIndex=1;KagNodeControls.sync();}"
+                )
+                assert page.evaluate("window.__changes") == 0
+                page.evaluate(
+                    "()=>{const a=document.createElement('a');a.id='wrapped-icon-fixture';a.href='/passwords';a.innerHTML='<span data-icon=key><svg viewBox=\"0 0 24 24\"><path d=\"M4 4h16\"/></svg></span>Passwords';document.querySelector('.kn-core-sidebar-navigation').append(a);KagNodeCore.refresh()}"
+                )
+                assert page.locator("#wrapped-icon-fixture svg").count() == 1
+                before = page.locator(".kn-core-rail").count()
+                page.evaluate("KagNodeScroll.refresh();KagNodeScroll.refresh()")
+                page.wait_for_timeout(150)
+                assert page.locator(".kn-core-rail").count() == before
+                page.evaluate('KagNodeCore.loading.show("Opening example…")')
+                page.wait_for_timeout(50)
+                assert page.locator(".kn-core-rail:visible").count() == 0
+                assert page.locator("#kn-core-loading .kn-core-spinner").count() == 1
+                assert (
+                    page.locator("#kn-core-loading .kn-core-loading-label").inner_text()
+                    == "Opening example…"
+                )
+                assert (
+                    page.locator(".kn-core-spinner-layer").evaluate(
+                        "e=>getComputedStyle(e).animationName"
+                    )
+                    == "kn-core-orbit"
+                )
+                page.emulate_media(reduced_motion="reduce")
+                assert (
+                    page.locator(".kn-core-spinner-layer").evaluate(
+                        "e=>getComputedStyle(e).animationName"
+                    )
+                    == "kn-core-breathe"
+                )
+                page.emulate_media(reduced_motion="no-preference")
+                page.evaluate("KagNodeCore.loading.hide()")
+                page.evaluate(
+                    """()=>{const host=document.createElement('div');host.id='loading';host.className='loading';host.hidden=true;host.innerHTML='<img class="loading-logo"><div class="loading-strip"></div><span id="loading-label">Opening vault…</span><button id="retry-test">Try again</button>';document.body.append(host);KagNodeCore.refresh();KagNodeCore.refresh()}"""
+                )
+                assert page.locator("#loading > .kn-core-spinner").count() == 1
+                assert (
+                    page.locator("#loading #loading-label").inner_text()
+                    == "Opening vault…"
+                )
+                assert page.locator("#retry-test").inner_text() == "Try again"
+                page.evaluate(
+                    "document.querySelector('#loading').replaceChildren(Object.assign(document.createElement('span'),{textContent:'Retrying…'}));KagNodeCore.refresh()"
+                )
+                assert page.locator("#loading > .kn-core-spinner").count() == 1
+                assert "Retrying…" in page.locator("#loading").inner_text()
+                page.evaluate("document.querySelector('#loading').remove()")
+                assert page.locator("body").evaluate("(e)=>e.scrollWidth<=innerWidth+1")
+                page.evaluate(
+                    """()=>{const d=document.createElement('details');d.id='legacy-disclosure';d.innerHTML='<summary><svg data-disclosure-icon viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>Legacy disclosure</summary><p>Contents</p>';document.querySelector('main').append(d);KagNodeCore.refresh()}"""
+                )
+                assert (
+                    page.locator("#legacy-disclosure path").get_attribute("d")
+                    == "m4 8 8 8 8-8"
+                )
+                assert (
+                    page.evaluate(
+                        """async()=>{let mutations=0;const observer=new MutationObserver(records=>mutations+=records.length);observer.observe(document.querySelector('#legacy-disclosure svg'),{childList:true,subtree:true});for(let i=0;i<5;i++)KagNodeCore.refresh();await Promise.resolve();observer.disconnect();return mutations;}"""
+                    )
+                    == 0
+                )
+                page.locator("#legacy-disclosure summary").click()
+                page.wait_for_function(
+                    "getComputedStyle(document.querySelector('#legacy-disclosure svg')).transform==='matrix(-1, 0, 0, -1, 0, 0)'"
+                )
+                page.locator("#legacy-disclosure").evaluate("e=>e.remove()")
+                if width >= 1024:
+                    page.add_style_tag(content=".workspace{margin-left:284px}")
+                    assert page.evaluate(
+                        """()=>{const sidebar=document.querySelector('#sidebar');sidebar.hidden=true;KagNodeCore.refresh();sidebar.hidden=false;KagNodeCore.refresh();return document.querySelector('.workspace').getBoundingClientRect().right<=innerWidth+1;}"""
+                    ), "Shell adoption must not animate an old auto-width margin"
+                page.evaluate("KagNodeCore.setSession({authenticated:false})")
+                assert page.locator("html").get_attribute("data-theme") == scheme
+                page.close()
+        browser.close()
+    assert not errors, errors
+    print(
+        "PASS: "
+        + engine
+        + " shared shell, repeated animation, account menu, native wheel, rails, loading and anonymous system theme across 10 layouts"
+    )
+finally:
+    server.shutdown()

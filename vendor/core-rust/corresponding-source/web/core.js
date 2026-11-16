@@ -40,6 +40,11 @@
     popup = null,
     accountTrigger = null,
     lastFocus;
+  // The visible label mirrors the accessible name so both always agree.
+  const syncToggleLabel = () => {
+    const label = toggle?.querySelector(".kn-core-toggle-label");
+    if (label) label.textContent = toggle.getAttribute("aria-label") || "";
+  };
   const groups = new WeakMap();
   let manualChoice = saved("kagnode.core.sidebar.choice"),
     desktopCollapsed = manualChoice
@@ -78,6 +83,7 @@
             ? "Expand sidebar"
             : "Collapse sidebar",
       );
+      syncToggleLabel();
     }
     window.KagNodeScroll?.refresh(sidebar);
   }
@@ -215,8 +221,15 @@
       getComputedStyle(sidebar).display !== "none";
     const state = visible ? "active" : "inactive";
     if (root.dataset.coreShell !== state) {
+      // Adopting a newly visible legacy layout may change auto width to a
+      // calculated width. Do not animate only its old margin in that frame.
+      delete root.dataset.coreReady;
       root.dataset.coreShell = state;
-      requestAnimationFrame(() => window.KagNodeScroll?.refresh());
+      void document.body.offsetWidth;
+      requestAnimationFrame(() => {
+        if (root.dataset.coreShell === state) root.dataset.coreReady = "true";
+        window.KagNodeScroll?.refresh();
+      });
     }
   }
   function setCollapsed(value, persist = true) {
@@ -238,6 +251,7 @@
         value ? "Expand sidebar" : "Collapse sidebar",
       );
       toggle.title = value ? "Expand sidebar" : "Collapse sidebar";
+      syncToggleLabel();
     }
 
     if (value)
@@ -333,7 +347,10 @@
     toggle = element("button", "kn-core-sidebar-toggle");
     toggle.type = "button";
     toggle.dataset.coreToggle = "";
-    toggle.innerHTML = panelIcon;
+    toggle.innerHTML =
+      panelIcon + '<span class="kn-core-toggle-label">Collapse sidebar</span>';
+    // The collapse control lives at the bottom of the dock and never moves
+    // between expanded and collapsed states.
     footer.append(toggle);
     sidebar.replaceChildren(heading, nav, footer, legacy);
     scrim = element("button", "kn-core-drawer-scrim");
@@ -350,7 +367,11 @@
     });
     sidebar.addEventListener("pointerleave", releasePreview);
     sidebar.addEventListener("focusin", (e) => {
+      // Preview only for keyboard focus. A pointer click also focuses its
+      // target; expanding then would reflow the footer between mousedown and
+      // mouseup and swallow the click (collapsed account avatar).
       if (
+        e.target.matches?.(":focus-visible") &&
         !e.target.closest("[data-core-toggle]") &&
         desktopCollapsed &&
         !mobile()
@@ -497,13 +518,7 @@
     popup = menu;
     button.setAttribute("aria-controls", menu.id);
     button.setAttribute("aria-expanded", "true");
-    const box = button.getBoundingClientRect();
-    const maximumRight = Math.max(12, innerWidth - menu.offsetWidth - 12);
-    Object.assign(menu.style, {
-      top: Math.min(innerHeight - 100, box.bottom + 8) + "px",
-      right:
-        Math.min(maximumRight, Math.max(12, innerWidth - box.right)) + "px",
-    });
+    positionPopover(menu, button);
     if (!reduce.matches)
       menu.animate(
         [
@@ -514,6 +529,74 @@
       );
     $("a,button", menu)?.focus({ preventScroll: true });
   }
+  function positionPopover(menu, button) {
+    const box = button.getBoundingClientRect();
+    const view = window.visualViewport;
+    const left = view?.offsetLeft || 0,
+      top = view?.offsetTop || 0;
+    const width = view?.width || innerWidth,
+      height = view?.height || innerHeight;
+    menu.style.maxHeight = Math.max(120, height - 24) + "px";
+    const bounds = menu.getBoundingClientRect();
+    const below = box.bottom + 8;
+    const y =
+      below + bounds.height <= top + height - 12
+        ? below
+        : box.top - bounds.height - 8;
+    Object.assign(menu.style, {
+      position: "fixed",
+      right: "auto",
+      bottom: "auto",
+      left:
+        Math.max(
+          left + 12,
+          Math.min(box.left, left + width - bounds.width - 12),
+        ) + "px",
+      top:
+        Math.max(top + 12, Math.min(y, top + height - bounds.height - 12)) +
+        "px",
+    });
+  }
+  function footerControls() {
+    if (!sidebar) return;
+    const footer = $(".kn-core-sidebar-footer", sidebar);
+    if (!footer) return;
+    const button = $("[data-core-account-trigger]");
+    if (button && !button.closest("[data-core-account-menu]")) {
+      if (button.parentElement !== footer) footer.prepend(button);
+      let label = $(".kn-core-account-label", button);
+      if (!label) {
+        label = element("span", "kn-core-account-label");
+        label.append(
+          element("strong", "kn-core-account-name"),
+          element("small", "kn-core-account-email"),
+        );
+        const chevron = element("span", "kn-core-account-chevron");
+        // Compact up/down selector mark: the menu opens above the footer.
+        chevron.innerHTML =
+          '<svg class="ui-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m8 9 4-4 4 4M8 15l4 4 4-4"/></svg>';
+        button.append(label, chevron);
+      }
+      const name =
+        config.name ||
+        $(".account-identity strong")?.textContent.trim() ||
+        $("[data-kn-account-name]")?.textContent.trim() ||
+        "Account";
+      const email =
+        config.email || $(".account-identity small")?.textContent.trim() || "";
+      const nameNode = $(".kn-core-account-name", label),
+        emailNode = $(".kn-core-account-email", label);
+      if (nameNode && nameNode.textContent !== name)
+        nameNode.textContent = name;
+      if (emailNode && emailNode.textContent !== email)
+        emailNode.textContent = email;
+      if (emailNode) emailNode.hidden = !email;
+    }
+    const inbox = $(".header-inbox");
+    if (inbox && inbox.parentElement !== footer) footer.append(inbox);
+    // Keep the collapse control last: account and inbox sit above it.
+    if (toggle && footer.lastElementChild !== toggle) footer.append(toggle);
+  }
   function componentIcon(name) {
     const key = Object.hasOwn(window.KagNodeIcons, name) ? name : "plan";
     return (
@@ -523,6 +606,18 @@
       window.KagNodeIcons[key] +
       "</svg>"
     );
+  }
+  function normalizeDisclosure(svg) {
+    const shape = window.KagNodeIcons.chevron;
+    const path = shape.match(/\bd="([^"]+)"/)?.[1];
+    if (
+      svg.childElementCount !== 1 ||
+      svg.firstElementChild?.localName !== "path" ||
+      svg.firstElementChild.getAttribute("d") !== path
+    )
+      svg.innerHTML = shape;
+    if (!svg.hasAttribute("data-disclosure-icon"))
+      svg.dataset.disclosureIcon = "";
   }
   function normalize() {
     for (const host of all("[data-core-icon]")) {
@@ -628,6 +723,27 @@
       b.setAttribute("aria-label", "Open account menu");
       b.setAttribute("aria-haspopup", "true");
     });
+    footerControls();
+    for (const icon of all(
+      'svg[data-disclosure-icon],svg[data-core-icon-name="chevron"]',
+    )) {
+      normalizeDisclosure(icon);
+    }
+    if (sidebar) {
+      for (const button of all("[data-command]", sidebar)) {
+        button.setAttribute("aria-label", "Quick search");
+        button.dataset.coreTooltip = "Quick search";
+      }
+      for (const disclosure of all(
+        "summary .chevron, [data-disclosure-icon]",
+        sidebar,
+      )) {
+        const svg = disclosure.matches("svg")
+          ? disclosure
+          : disclosure.querySelector("svg");
+        if (svg) normalizeDisclosure(svg);
+      }
+    }
     if (sidebar)
       for (const link of all(
         ".kn-core-sidebar-navigation a,.kn-core-sidebar-navigation summary",
@@ -770,7 +886,9 @@
       if (popup) {
         e.preventDefault();
         closeAccount(true);
+        return;
       }
+      if (document.querySelector("#inbox-popover:not([hidden])")) return;
       if (root.dataset.coreDrawer === "true") {
         e.preventDefault();
         drawer(false);
@@ -792,7 +910,13 @@
               items.length
       ]?.focus();
     }
-    if (e.key === "Tab" && mobile() && root.dataset.coreDrawer === "true") {
+    if (
+      e.key === "Tab" &&
+      mobile() &&
+      root.dataset.coreDrawer === "true" &&
+      !popup &&
+      !document.querySelector("#inbox-popover:not([hidden])")
+    ) {
       const items = all(
         "a[href],button:not(:disabled),summary,input",
         sidebar,
@@ -936,6 +1060,7 @@
     icon: componentIcon,
     loading,
     closeAccount,
+    positionPopover,
     navigation: {
       open: () => drawer(true),
       close: () => drawer(false),
