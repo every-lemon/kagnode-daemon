@@ -26,7 +26,16 @@
       location.assign("/login");
       throw Error("Sign in again");
     }
-    const v = r.status === 204 ? {} : await r.json();
+    let v = {};
+    if (r.status !== 204) {
+      try {
+        v = await r.json();
+      } catch {
+        const unreadable = Error("The server's reply could not be read.");
+        unreadable.uncertain = true;
+        throw unreadable;
+      }
+    }
     if (!r.ok) throw Error(v.error || "The request failed");
     return v;
   }
@@ -241,6 +250,7 @@
     danger,
     extra = [],
     after,
+    explain,
   }) {
     let result,
       uncertain = false;
@@ -270,12 +280,14 @@
             "x-backup-confirmation": c.confirmation,
           });
         } catch (error) {
-          if (error instanceof TypeError) {
+          if (error instanceof TypeError || error.uncertain) {
             uncertain = true;
             throw Error(
-              "The connection failed. The action may or may not have completed. Check the current status before trying again.",
+              "The connection failed or the reply could not be read. The action may or may not have completed. Check the current status before trying again.",
             );
           }
+          const message = explain && explain(error);
+          if (message) throw Error(message);
           throw error;
         }
         if (after) await after(result, req);
@@ -332,43 +344,99 @@
     document.querySelector("h1").textContent = "Backups";
     const root = el("div", undefined, "stack");
     content.append(root);
-    let selected = "";
+    let selected = "",
+      generation = 0;
     const notify = (text) => (status.textContent = text);
+    const settle = (promise) =>
+      promise.then(
+        (value) => ({ ok: true, value }),
+        (error) => ({ ok: false, error }),
+      );
+    function failure(title, error, meaning) {
+      const p = el("section", undefined, "panel stack"),
+        retry = el("button", "Try again", "button small");
+      retry.type = "button";
+      retry.onclick = () => refresh();
+      p.append(
+        el("h2", title),
+        el("p", error.message, "form-error"),
+        el("p", meaning, "muted"),
+        retry,
+      );
+      return p;
+    }
     async function refresh() {
+      const mine = ++generation;
       try {
-        await load();
+        await load(mine);
       } finally {
         restoreFocus(root);
       }
     }
-    async function load() {
-      let server, agent;
-      try {
-        [server, agent] = await Promise.all([
-          api(BACKUP + "status"),
-          api("backup-agent/status"),
-        ]);
-      } catch (error) {
-        notify(error.message);
+    /* Every response is checked against the latest refresh; an older reply can
+       never replace a newer view, and each panel fails on its own. */
+    async function load(mine) {
+      const [server, agent] = await Promise.all([
+        settle(api(BACKUP + "status")),
+        settle(api("backup-agent/status")),
+      ]);
+      if (mine !== generation) return;
+      const top = [
+        server.ok
+          ? summary(server.value)
+          : failure(
+              "Backup server",
+              server.error,
+              "The server status could not be read, so nothing here about the server is current. This is not a sign that backups are healthy.",
+            ),
+        agent.ok
+          ? agentPanel(agent.value)
+          : failure(
+              "Sending from this host",
+              agent.error,
+              "The last agent observation could not be read; the server panel is unaffected.",
+            ),
+      ];
+      if (!server.ok || server.value.enabled === false) {
+        root.replaceChildren(...top);
         return;
       }
-      root.replaceChildren(summary(server), agentPanel(agent));
-      if (server.enabled === false) return;
-      try {
-        const [nodes, policy] = await Promise.all([
-          api(BACKUP + "nodes"),
-          api(BACKUP + "policy"),
-        ]);
-        if (!nodes.nodes.some((n) => n.node === selected))
-          selected = nodes.nodes[0]?.node || "";
-        root.append(
-          nodesPanel(nodes.nodes),
-          await snapshotsPanel(nodes.nodes),
-          policyPanel(policy.policy),
+      const [nodes, policy] = await Promise.all([
+        settle(api(BACKUP + "nodes")),
+        settle(api(BACKUP + "policy")),
+      ]);
+      if (mine !== generation) return;
+      const panels = [];
+      if (nodes.ok) {
+        const list = nodes.value.nodes;
+        if (!list.some((n) => n.node === selected))
+          selected = list[0]?.node || "";
+        const node = selected; // this render's immutable identity
+        const snaps = node
+          ? await settle(api(BACKUP + "snapshots/" + encodeURIComponent(node)))
+          : null;
+        if (mine !== generation) return;
+        panels.push(nodesPanel(list), snapshotsPanel(list, node, snaps));
+      } else
+        panels.push(
+          failure(
+            "Nodes and snapshots",
+            nodes.error,
+            "The node list could not be read, so nodes and snapshots are not shown.",
+          ),
         );
-      } catch (error) {
-        notify(error.message);
-      }
+      panels.push(
+        policy.ok
+          ? policyPanel(policy.value.policy)
+          : failure(
+              "Policy",
+              policy.error,
+              "The current policy could not be read, so it cannot be edited here.",
+            ),
+      );
+      // One atomic swap: the previous view (and its node selector) stays in
+      // place until this render is complete and still the latest.
+      root.replaceChildren(...top, ...panels);
     }
     function summary(s) {
       const p = el("section", undefined, "panel stack");
@@ -412,6 +480,15 @@
             "muted",
           ),
         );
+      if (s.pending_catalog_cleanups > 0)
+        p.append(
+          badge(s.pending_catalog_cleanups + " cleanup pending", "warn"),
+          el(
+            "p",
+            "Data for deleted snapshots is still being removed; the server retries this automatically.",
+            "muted",
+          ),
+        );
       p.append(
         el(
           "p",
@@ -438,6 +515,18 @@
       p.append(badge(state.replace("_", " "), tone));
       p.append(el("p", AGENT[state] || "Unknown state: " + state));
       if (st.error) p.append(el("p", String(st.error), "form-error"));
+      // A failed new snapshot is reported separately from older work that may
+      // still be running, so neither message hides the other.
+      if (st.source_error)
+        p.append(
+          el(
+            "p",
+            (state === "deferred" || state === "transferring"
+              ? "Older work is still in progress, but the next backup cannot be queued: "
+              : "The next backup cannot be queued: ") + String(st.source_error),
+            "form-error",
+          ),
+        );
       const queue = (st.queue && st.queue.transfers) || [];
       if (queue.length)
         p.append(
@@ -475,6 +564,19 @@
             ]),
           ),
         );
+      const history = st.queue && st.queue.history;
+      if (history && history.compacted_identities)
+        p.append(
+          el(
+            "p",
+            "Older completed transfers are summarised to keep history bounded: " +
+              history.compacted_identities +
+              " compacted, the most recent " +
+              history.completed_job_limit +
+              " kept.",
+            "muted",
+          ),
+        );
       p.append(
         el(
           "p",
@@ -497,9 +599,13 @@
               const cert = el("code", n.certificate_sha256.slice(0, 16) + "…");
               cert.title = n.certificate_sha256;
               const act = el("div", undefined, "actions");
+              // Rotation needs an enrolled node; a pending approval can only be revoked.
               if (!n.revoked) {
+                if (n.enrolled)
+                  act.append(
+                    actionButton("Rotate certificate", n.node, () => rotate(n)),
+                  );
                 act.append(
-                  actionButton("Rotate certificate", n.node, () => rotate(n)),
                   actionButton("Revoke", n.node, () => revoke(n), true),
                 );
               }
@@ -655,7 +761,9 @@
       if (r.done) notify("Certificate rotated for " + n.node + ".");
       await refresh();
     }
-    async function snapshotsPanel(nodes) {
+    /* `node` is the identity this panel was rendered for; every label and action
+       below uses it, never the mutable `selected` value. */
+    function snapshotsPanel(nodes, node, snaps) {
       const p = el("section", undefined, "panel stack");
       p.append(el("h2", "Snapshots"));
       if (!nodes.length) {
@@ -669,26 +777,30 @@
         o.value = n.node;
         pick.append(o);
       }
-      pick.value = selected;
+      pick.value = node;
       pick.onchange = () => {
         selected = pick.value;
         refresh();
       };
       p.append(pick);
-      let data;
-      try {
-        data = await api(BACKUP + "snapshots/" + encodeURIComponent(selected));
-      } catch (error) {
-        p.append(el("p", error.message, "form-error"));
+      if (!snaps || !snaps.ok) {
+        p.append(
+          el(
+            "p",
+            (snaps && snaps.error.message) || "Snapshots could not be read.",
+            "form-error",
+          ),
+        );
         return p;
       }
+      const data = snaps.value;
       const protectedIds = new Set(data.protected || []);
       if (!data.snapshots.length)
         p.append(el("p", "This node has not sent a snapshot yet."));
       else
         p.append(
           table(
-            "Snapshots for " + selected + " (newest received first)",
+            "Snapshots for " + node + " (newest received first)",
             ["Snapshot", "Received", "Claimed creation", "Status", "Actions"],
             data.snapshots.map((s) => {
               const state = el("div", undefined, "badges"),
@@ -702,12 +814,12 @@
               );
               act.append(
                 actionButton(s.pinned ? "Unpin" : "Pin", s.id, () =>
-                  pin(selected, s),
+                  pin(node, s),
                 ),
               );
               if (!protectedIds.has(s.id) && !s.pinned)
                 act.append(
-                  actionButton("Delete", s.id, () => remove(selected, s), true),
+                  actionButton("Delete", s.id, () => remove(node, s), true),
                 );
               return [s.id, when(s.received_at), when(s.created), state, act];
             }),
@@ -838,6 +950,7 @@
       }
       f.onsubmit = async (e) => {
         e.preventDefault();
+        let conflicted = false;
         const next = { revision: policy.revision + 1 };
         for (const [key, , , nullable] of POLICY_FIELDS) {
           const raw = inputs[key].value.trim();
@@ -861,9 +974,18 @@
             ". If another administrator changed the policy meanwhile, you will be asked to review it first.",
           submit: "Save policy",
           request: { action: "set_policy", policy: next },
+          explain: (error) =>
+            /conflict|revision/i.test(error.message)
+              ? ((conflicted = true),
+                "Another administrator changed the policy. Close this window to see the current values, review them, then save again.")
+              : null,
         });
         if (r.done) notify("Policy saved as revision " + next.revision + ".");
         await refresh();
+        if (conflicted)
+          notify(
+            "The policy changed while you were editing. The form now shows the current values; review them before saving again.",
+          );
       };
       return p;
     }

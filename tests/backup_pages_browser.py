@@ -77,7 +77,16 @@ class Fixture:
                     restore_tested=False,
                 ),
             ],
-            "beta": [],
+            # Same snapshot ID on both nodes: actions must never cross nodes.
+            "beta": [
+                dict(
+                    id="snap-0001",
+                    created=1_700_000_500,
+                    received_at=1_700_000_510,
+                    pinned=False,
+                    restore_tested=False,
+                ),
+            ],
         }
         self.agent = dict(
             revision=2,
@@ -117,6 +126,11 @@ class Fixture:
         self.tokens = {}
         self.calls = []
         self.fail_next = None
+        self.hold = set()  # paths whose responses are held until release()
+        self.held = []
+        self.errors = {}  # path -> message, answered with HTTP 503
+        self.garble = None  # path answered 200 with a body that is not JSON
+        self.cleanups = 0
         self.password_seen_outside_confirm = False
         self.big_policy = False
 
@@ -129,6 +143,16 @@ class Fixture:
             storage_total_bytes=2_000_000_000_000,
             storage_available_bytes=150_000_000_000,
             verification="Ciphertext checks only; no application restore has been attested.",
+            pending_catalog_cleanups=self.cleanups,
+        )
+
+    def release(self, index=0):
+        route, status, value = self.held.pop(index)
+        route.fulfill(
+            status=status,
+            content_type="application/json",
+            headers={"Cache-Control": "no-store"},
+            body=json.dumps(value),
         )
 
     def handle(self, route):
@@ -143,7 +167,21 @@ class Fixture:
             self.fail_next = None
             return route.abort("failed")
 
+        if path in self.errors:
+            return route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps(dict(error=self.errors[path])),
+            )
+
         def ok(value, status=200):
+            if path == self.garble:
+                return route.fulfill(
+                    status=200, content_type="text/plain", body="<html>not json"
+                )
+            if path in self.hold:
+                self.held.append((route, status, value))
+                return
             route.fulfill(
                 status=status,
                 content_type="application/json",
@@ -211,6 +249,8 @@ class Fixture:
             return ok(dict(revoked=True))
         if act == "rotate_certificate":
             n = next(n for n in self.nodes if n["node"] == body["node"])
+            if not n["enrolled"] or n["revoked"]:
+                return err("Unknown or not enrolled node")
             if n["certificate_sha256"] != body["expected_sha256"]:
                 return err("Certificate changed; review a fresh rotation")
             n["certificate_sha256"] = body["certificate_sha256"]
@@ -285,6 +325,14 @@ def start_server(tmp):
             time.sleep(0.1)
     proc.kill()
     raise SystemExit("Daemon dashboard did not start")
+
+
+PATTERN = re.compile(r".*/api/v1/backup-(server|agent)/.*")
+
+
+def use(page, fixture):
+    page.unroute_all()
+    page.route(PATTERN, fixture.handle)
 
 
 def eventually(page, expression, seconds=4.0):
@@ -502,12 +550,25 @@ def main():
                 d = page.get_by_role("dialog", name="Save backup policy")
                 d.get_by_label("Your Daemon password").fill(PASSWORD)
                 d.get_by_role("button", name="Save policy").click()
-                d.get_by_role("alert").filter(has_text="revision conflict").wait_for()
+                d.get_by_role("alert").filter(
+                    has_text="Another administrator changed the policy"
+                ).wait_for()
                 check(
                     "policy conflict shown without overwriting",
                     fx.policy["required_copies"] == 2,
                 )
                 d.get_by_role("button", name="Cancel").click()
+                check(
+                    "after a conflict the form shows the current values",
+                    eventually(
+                        page,
+                        "document.querySelector('input[name=required_copies]').value === '2'",
+                    )
+                    and page.locator("#page-status")
+                    .filter(has_text="policy changed while you were editing")
+                    .count()
+                    == 1,
+                )
                 # uncertain outcome
                 page.get_by_role("button", name="Revoke alpha").click()
                 d = page.get_by_role("dialog", name="Revoke alpha")
@@ -568,6 +629,139 @@ def main():
                 check(
                     "Escape closes the dialog and focus returns to the opener", focused
                 )
+
+                # ---- Codex's PR #30 contract review (R1-R4) and follow-ups
+                sel = lambda: page.locator("select[aria-label=Node]")
+                reload = lambda f: (use(page, f), page.goto(base + "/backup"))
+                fx = Fixture()
+                reload(fx)
+                page.get_by_role("heading", name="Nodes").wait_for()
+                check(
+                    "R2 pending node: Revoke offered, Rotate not",
+                    page.get_by_role("button", name="Revoke beta").count() == 1
+                    and page.get_by_role(
+                        "button", name="Rotate certificate beta"
+                    ).count()
+                    == 0
+                    and page.get_by_role(
+                        "button", name="Rotate certificate alpha"
+                    ).count()
+                    == 1,
+                )
+                # R1: a late response for an older selection never replaces the view,
+                # and actions bind to the node that was rendered (same snapshot ID on both).
+                fx.hold.add("/api/v1/backup-server/snapshots/beta")
+                sel().select_option("beta")
+                eventually(page, "true")
+                sel().select_option("alpha")
+                check(
+                    "R1 latest selection renders",
+                    eventually(
+                        page,
+                        "document.querySelector('table caption') && [...document.querySelectorAll('table caption')].some(c => c.textContent.startsWith('Snapshots for alpha'))",
+                    ),
+                )
+                check("R1 beta response is held", len(fx.held) == 1)
+                fx.release(0)  # the stale beta reply arrives late
+                page.wait_for_timeout(500)
+                check(
+                    "R1 stale reply discarded: still alpha",
+                    sel().input_value() == "alpha"
+                    and snaps()
+                    .locator("caption")
+                    .inner_text()
+                    .startswith("Snapshots for alpha")
+                    and snaps()
+                    .get_by_role("cell", name="snap-0003", exact=True)
+                    .count()
+                    == 1,
+                )
+                page.get_by_role("button", name="Pin snap-0001").click()
+                page.get_by_role("button", name="Unpin snap-0001").wait_for()
+                pins = [c for c in fx.calls if c[1].endswith("/pin")]
+                check(
+                    "R1 pin request carries the rendered node",
+                    pins and pins[-1][2]["node"] == "alpha",
+                    str(pins[-1:] if pins else ""),
+                )
+                # R3: preparation error shown beside older work, for both states
+                for state in ("deferred", "transferring"):
+                    fx = Fixture()
+                    fx.agent["status"]["state"] = state
+                    fx.agent["status"]["source_error"] = (
+                        "Prepared snapshot manifest changed"
+                    )
+                    reload(fx)
+                    page.get_by_role(
+                        "heading", name="Sending from this host"
+                    ).wait_for()
+                    check(
+                        f"R3 source_error visible while {state}",
+                        page.get_by_text(
+                            "Older work is still in progress, but the next backup cannot be queued"
+                        ).is_visible()
+                        and page.get_by_text(
+                            "Prepared snapshot manifest changed"
+                        ).is_visible(),
+                    )
+                # R4: each panel fails alone
+                fx = Fixture()
+                fx.errors["/api/v1/backup-server/status"] = "worker unavailable"
+                reload(fx)
+                page.get_by_role("heading", name="Sending from this host").wait_for()
+                check(
+                    "R4 server fails, agent panel still shown",
+                    page.get_by_text("worker unavailable").is_visible()
+                    and page.get_by_text(
+                        "not a sign that backups are healthy"
+                    ).is_visible()
+                    and page.get_by_text("Transfers are waiting").is_visible()
+                    and page.get_by_role("heading", name="Nodes").count() == 0,
+                )
+                del fx.errors["/api/v1/backup-server/status"]
+                page.get_by_role("button", name="Try again").click()
+                page.get_by_role("heading", name="Nodes").wait_for()
+                check(
+                    "R4 retry recovers the server panels",
+                    page.get_by_text("free of").is_visible(),
+                )
+                fx = Fixture()
+                fx.errors["/api/v1/backup-agent/status"] = "status document unreadable"
+                reload(fx)
+                page.get_by_role("heading", name="Nodes").wait_for()
+                check(
+                    "R4 agent fails, server panels still shown",
+                    page.get_by_text("status document unreadable").is_visible()
+                    and page.get_by_text("free of").is_visible(),
+                )
+                # additive status fields from PR #28
+                fx = Fixture()
+                fx.cleanups = 2
+                fx.agent["status"]["queue"]["history"] = dict(
+                    completed_job_limit=64, compacted_identities=5
+                )
+                reload(fx)
+                page.get_by_role("heading", name="Nodes").wait_for()
+                check(
+                    "pending cleanups and compacted history shown",
+                    page.get_by_text("2 cleanup pending").is_visible()
+                    and page.get_by_text("5 compacted").is_visible(),
+                )
+                # an unreadable reply after a mutation is an uncertain outcome
+                fx = Fixture()
+                reload(fx)
+                page.get_by_role("heading", name="Nodes").wait_for()
+                fx.garble = "/api/v1/backup-server/revoke"
+                page.get_by_role("button", name="Revoke alpha").click()
+                d = page.get_by_role("dialog", name="Revoke alpha")
+                d.get_by_label("Your Daemon password").fill(PASSWORD)
+                d.get_by_role("button", name="Revoke node").click()
+                d.get_by_role("alert").filter(
+                    has_text="may or may not have completed"
+                ).wait_for()
+                check("unreadable reply reported as uncertain", True)
+                d.get_by_role("button", name="Cancel").click()
+                d.wait_for(state="detached")
                 ctx.close()
                 # mobile: no page-level horizontal overflow
                 m = browser.new_context(
