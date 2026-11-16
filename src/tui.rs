@@ -354,7 +354,7 @@ pub fn run(store: &Store, mouse: bool, client: &mut Client, me: &Identity) -> Re
                 let p = &catalog::PRODUCTS[index];
                 format!("← Back to applications\n\nKagNode. {}\nRepository: every-lemon/{}\nInstalled state: {}\n\n[i] Inspect services   [h] Operation history\n[s] Start   [t] Stop   [r] Restart\nEvery change requires a reviewed plan and confirmation.\n\nHA durable state: {}\n\n{}{}", p.name, p.repository, if catalog::installed(managed, p) { "detected" } else { "not detected; services may require root enrollment" }, p.ha_state, if pending { "Waiting for the local broker…\n" } else { "" }, feedback)
             } else {
-                format!("Your KagNode workspace\n\nSigned in as {}{}\nProfile: {:?}\nWeb dashboard: {}\n\nSelect an application and press Enter.\n[b] Backups: status, nodes, snapshots and policy (read-only).\n[w] Toggle Daemon dashboard (application UIs stay running).\n[u] Users and roles (Operators).  [o] Sign out.\n\nExisting services retain their data and native ownership.\nHA requires qualified networking, fencing, quorum and replication.\n\n{}", me.who.account, if me.who.protection == Protection::Owner { " (owner mode, unprotected)".to_owned() } else { format!(" · {}", me.who.role.label()) }, settings.profile, if settings.web_enabled { "enabled" } else { "disabled" }, feedback)
+                format!("Your KagNode workspace\n\nSigned in as {}{}\nProfile: {:?}\nWeb dashboard: {}\n\nSelect an application and press Enter.\n[b] Backups: status, nodes, snapshots and policy (read-only).\n[w] Toggle Daemon dashboard (application UIs stay running).\n[u] Users and roles.  [a] Web administration on/off.  [o] Sign out.\n\nExisting services retain their data and native ownership.\nHA requires qualified networking, fencing, quorum and replication.\n\n{}", me.who.account, if me.who.protection == Protection::Owner { " (owner mode, unprotected)".to_owned() } else { format!(" · {}", me.who.role.label()) }, settings.profile, if settings.web_enabled { "enabled" } else { "disabled" }, feedback)
             };
             let panel = |title: &str| {
                 Block::default()
@@ -612,6 +612,21 @@ pub fn run(store: &Store, mouse: bool, client: &mut Client, me: &Identity) -> Re
                         }
                     } else {
                         feedback = "Only Operators manage users.".into();
+                    }
+                }
+                KeyCode::Char('a')
+                    if backups.is_none() && folder.is_none() && !searching && !pending =>
+                {
+                    if me.can("security_set") {
+                        let (exit, message) =
+                            crate::tui_gate::toggle_admin(&mut terminal, client, me)?;
+                        if exit == Exit::SignedOut {
+                            outcome = Exit::SignedOut;
+                            break 'ui;
+                        }
+                        feedback = message;
+                    } else {
+                        feedback = "Only Operators change web administration.".into();
                     }
                 }
                 KeyCode::Char('o') if !searching && !pending => {
