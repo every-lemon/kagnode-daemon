@@ -42,7 +42,10 @@ actions, products and levels are refused. Maximum8 connections,2 blocking worker
 3-second input/output deadlines and2MiB reply limit. The kernel peer UID is bound
 to every session and never supplied by JSON. The CLI `kagnode user <verb>` reads the
 request from bounded stdin; it does not open the database or drop the caller UID.
-Passwords and session tokens must never be placed in command arguments.
+Passwords and session tokens must never be placed in command arguments. Regular-file
+stdin must be caller-owned, single-link and mode0600 (or stricter); pipes/terminal
+input are accepted. Malformed CLI requests produce a generic error without echoing
+unknown field/variant values.
 
 ```json
 {"version":1,"request_id":"unique-review-id","session":null,"confirmation":null,"payload":{"action":"login","account":"person@example.invalid","password":"entered privately"}}

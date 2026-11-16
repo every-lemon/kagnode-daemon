@@ -660,3 +660,26 @@ async fn web_admin_gate_is_independent_and_revokes_existing_web_sessions() -> Re
     );
     Ok(())
 }
+#[test]
+fn cli_rejects_public_credential_files_and_does_not_echo_invalid_fields() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let path = t.path().join("request");
+    let sentinel = "synthetic-credential-must-not-be-echoed";
+    std::fs::write(&path,json!({"version":1,"request_id":"fixture","session":null,"confirmation":null,"payload":{"action":sentinel}}).to_string())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+    let run = || -> Result<std::process::Output> {
+        Ok(std::process::Command::new(env!("CARGO_BIN_EXE_kagnode"))
+            .args(["user", "request"])
+            .stdin(std::fs::File::open(&path)?)
+            .output()?)
+    };
+    let r = run()?;
+    assert!(!r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("must be private"));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let r = run()?;
+    assert!(!r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("Invalid authenticated request"));
+    assert!(!String::from_utf8_lossy(&r.stderr).contains(sentinel));
+    Ok(())
+}

@@ -303,10 +303,25 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(Command::User { action }) = &args.command {
         use std::io::Read;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        ensure!(
+            unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } == 0,
+            "Cannot inspect request input"
+        );
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+            ensure!(
+                stat.st_uid == unsafe { libc::geteuid() }
+                    && stat.st_mode & 0o077 == 0
+                    && stat.st_nlink == 1,
+                "Credential request files must be private and owned by the caller"
+            );
+        }
         let mut raw = zeroize::Zeroizing::new(Vec::new());
         std::io::stdin().take(16385).read_to_end(&mut raw)?;
         ensure!(raw.len() <= 16384, "Request exceeds 16 KiB");
-        let request: kagnode_daemon::roles::Envelope = serde_json::from_slice(&raw)?;
+        let request: kagnode_daemon::roles::Envelope = serde_json::from_slice(&raw)
+            .map_err(|_| anyhow::anyhow!("Invalid authenticated request"))?;
         let expected = match action.as_str() {
             "list" => "user_list".into(),
             "create" => "user_create".into(),
