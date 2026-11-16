@@ -556,6 +556,20 @@ def main():
                     and fx.policy["monthly_node_bytes"] is None,
                     str(fx.policy),
                 )
+                # Let the page's post-save refresh finish reading the policy before
+                # another administrator "changes" it, or the page would read revision 9.
+                last_save = max(
+                    i
+                    for i, c in enumerate(fx.calls)
+                    if c[0] == "POST" and c[1].endswith("/policy")
+                )
+                for _ in range(50):
+                    if any(
+                        c[0] == "GET" and c[1].endswith("/policy")
+                        for c in fx.calls[last_save + 1 :]
+                    ):
+                        break
+                    page.wait_for_timeout(100)
                 fx.policy["revision"] = 9  # another administrator changed it
                 page.locator("input[name=required_copies]").fill("3")
                 page.get_by_role("button", name="Review and save").click()
