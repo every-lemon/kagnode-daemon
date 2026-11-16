@@ -31,6 +31,9 @@ policy change is itself an event and receipt. Viewer receives no audit data.
 1. Allocate a durable archive-job intent in SQLite with a fixed inclusive event-ID
    range, row count and previous committed segment digest. Retain the source rows.
    New events get monotonically increasing IDs and cannot enter the frozen range.
+   The existing INTEGER PRIMARY KEY allocation is not an archival guarantee: a
+   reviewed migration must add a durable sequence anchored beyond all archived
+   IDs, allocated in the same event transaction; pruning may never reuse IDs.
 2. Export canonical typed events to a new private temporary segment using fixed
    paths and secure ownership/modes; reject symlink/hardlink paths. Stream export
    rather than holding all events or the database mutex in memory. Include schema,
