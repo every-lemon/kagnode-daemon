@@ -13,8 +13,8 @@ pub struct Product {
 pub const PRODUCTS: &[Product] = &[
     Product {
         id: "proxy-manager",
-        name: "PM",
-        repository: "kagnode-pm",
+        name: "Proxy",
+        repository: "kagnode-proxy",
         icon: "network",
         units: &[
             "kagnode-proxy-controller.service",
@@ -73,8 +73,8 @@ pub const PRODUCTS: &[Product] = &[
     },
     Product {
         id: "netctl",
-        name: "Netctl",
-        repository: "kagnode-netctl",
+        name: "Network",
+        repository: "kagnode-network",
         icon: "network",
         units: &["kagnode-netctl.service"],
         ha_state: "network plans, IPAM and durable service configuration",
@@ -93,4 +93,21 @@ pub fn installed(root: &Path, product: &Product) -> bool {
     ["installation.json", "state.json", "current"]
         .iter()
         .any(|name| path.join(name).exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_renames_keep_product_ids_and_units() {
+        let proxy = product("pm").unwrap();
+        assert_eq!(proxy.id, "proxy-manager");
+        assert_eq!(proxy.repository, "kagnode-proxy");
+        assert_eq!(proxy.units[0], "kagnode-proxy-controller.service");
+        let network = product("netctl").unwrap();
+        assert_eq!(network.repository, "kagnode-network");
+        assert_eq!(network.id, "netctl");
+        assert_eq!(network.units, &["kagnode-netctl.service"]);
+    }
 }
