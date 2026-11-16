@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod runtime;
 pub mod store;
 pub mod tui;
+pub mod tui_auth;
 pub mod tui_backup;
 pub mod web;
 
