@@ -369,6 +369,10 @@
       const mine = ++generation;
       try {
         await load(mine);
+      } catch (error) {
+        // An unexpected reply shape must never leave a blank or half-built page.
+        if (mine === generation)
+          notify("This page could not be updated: " + error.message);
       } finally {
         restoreFocus(root);
       }
@@ -407,7 +411,7 @@
       ]);
       if (mine !== generation) return;
       const panels = [];
-      if (nodes.ok) {
+      if (nodes.ok && Array.isArray(nodes.value.nodes)) {
         const list = nodes.value.nodes;
         if (!list.some((n) => n.node === selected))
           selected = list[0]?.node || "";
@@ -421,16 +425,18 @@
         panels.push(
           failure(
             "Nodes and snapshots",
-            nodes.error,
+            nodes.ok ? Error("The server returned no node list.") : nodes.error,
             "The node list could not be read, so nodes and snapshots are not shown.",
           ),
         );
       panels.push(
-        policy.ok
+        policy.ok && policy.value.policy
           ? policyPanel(policy.value.policy)
           : failure(
               "Policy",
-              policy.error,
+              policy.ok
+                ? Error("The server returned no policy.")
+                : policy.error,
               "The current policy could not be read, so it cannot be edited here.",
             ),
       );
