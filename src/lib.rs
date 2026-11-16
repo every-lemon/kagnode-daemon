@@ -12,6 +12,7 @@ pub mod tui;
 pub mod tui_auth;
 pub mod tui_backup;
 pub mod tui_client;
+pub mod tui_gate;
 pub mod web;
 
 pub mod maintenance;

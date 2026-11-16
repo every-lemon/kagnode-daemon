@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 pub struct Client {
     root: PathBuf,
     token: Option<Zeroizing<String>>,
+    /// Only the owner of a session signs it out when dropped.
+    owns: bool,
 }
 /// Everything the screens need to know about the signed-in person.
 #[derive(Clone, Debug)]
@@ -124,7 +126,19 @@ fn role_text(role: Role) -> &'static str {
 }
 impl Client {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, token: None }
+        Self {
+            root,
+            token: None,
+            owns: true,
+        }
+    }
+    /// A read-only copy for a background thread; it never signs the session out.
+    pub fn reader(&self) -> Client {
+        Client {
+            root: self.root.clone(),
+            token: self.token.clone(),
+            owns: false,
+        }
     }
     pub fn signed_in(&self) -> bool {
         self.token.is_some()
@@ -265,6 +279,8 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         // Leaving the terminal ends this person's session; the Daemon keeps running.
-        self.logout();
+        if self.owns {
+            self.logout();
+        }
     }
 }

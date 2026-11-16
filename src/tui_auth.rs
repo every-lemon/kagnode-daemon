@@ -538,7 +538,7 @@ pub fn render_users(f: &mut Frame, area: Rect, users: &Users, you: &str) {
                 Line::from(name),
                 Line::from(Span::styled(
                     format!(" {} ", u.role.label()),
-                    Style::default().fg(Color::Black).bg(role_color(u.role)),
+                    Style::default().fg(role_color(u.role)).bold(),
                 )),
                 Line::from(grants_text(u)),
                 Line::from(if u.disabled {
@@ -671,6 +671,126 @@ fn render_create(f: &mut Frame, area: Rect, form: &CreateForm) {
         Span::styled(" cancel", Style::default().fg(MUTED)),
     ]));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+// ------------------------------------------------- password confirmation
+/// A small modal asking for one or more passwords (confirming a risky change with
+/// your own password, or choosing a new password). Values are never drawn.
+pub struct PasswordPrompt {
+    pub title: String,
+    pub explain: String,
+    pub labels: Vec<&'static str>,
+    pub values: Vec<Zeroizing<String>>,
+    pub focus: usize,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptOutcome {
+    None,
+    Cancel,
+    Submit,
+}
+impl PasswordPrompt {
+    pub fn new(title: &str, explain: &str, labels: &[&'static str]) -> Self {
+        Self {
+            title: title.into(),
+            explain: explain.into(),
+            labels: labels.to_vec(),
+            values: labels
+                .iter()
+                .map(|_| Zeroizing::new(String::new()))
+                .collect(),
+            focus: 0,
+            busy: false,
+            error: None,
+        }
+    }
+    pub fn refused(&mut self, message: &str) {
+        self.busy = false;
+        self.error = Some(message.to_owned());
+        for v in &mut self.values {
+            v.clear();
+        }
+        self.focus = 0;
+    }
+    pub fn key(&mut self, key: KeyEvent) -> PromptOutcome {
+        if self.busy {
+            return PromptOutcome::None;
+        }
+        match key.code {
+            KeyCode::Esc => return PromptOutcome::Cancel,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return PromptOutcome::Cancel;
+            }
+            KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % self.values.len(),
+            KeyCode::BackTab | KeyCode::Up => {
+                self.focus = (self.focus + self.values.len() - 1) % self.values.len()
+            }
+            KeyCode::Enter if self.focus + 1 < self.values.len() => self.focus += 1,
+            KeyCode::Enter => {
+                if self.values.iter().any(|v| v.is_empty()) {
+                    self.error = Some("Fill in every password.".into());
+                    return PromptOutcome::None;
+                }
+                self.busy = true;
+                self.error = None;
+                return PromptOutcome::Submit;
+            }
+            KeyCode::Backspace => {
+                self.values[self.focus].pop();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.values[self.focus].chars().count() < 1024 =>
+            {
+                self.values[self.focus].push(c);
+            }
+            _ => {}
+        }
+        PromptOutcome::None
+    }
+}
+pub fn render_prompt(f: &mut Frame, area: Rect, prompt: &PasswordPrompt) {
+    let rect = centered(area, 62, 11 + prompt.values.len() as u16);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(format!(" {} ", prompt.title))
+        .title_style(Style::default().fg(FG).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            prompt.explain.clone(),
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+    ];
+    for (n, label) in prompt.labels.iter().enumerate() {
+        lines.push(field(label, &prompt.values[n], prompt.focus == n, true));
+    }
+    lines.push(Line::from(""));
+    if prompt.busy {
+        lines.push(Line::from(Span::styled(
+            "Working…",
+            Style::default().fg(MUTED),
+        )));
+    } else if let Some(e) = &prompt.error {
+        lines.push(Line::from(Span::styled(
+            e.clone(),
+            Style::default().fg(BAD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(ACCENT).bold()),
+        Span::styled(" continue   ", Style::default().fg(MUTED)),
+        Span::styled("Esc", Style::default().fg(ACCENT).bold()),
+        Span::styled(" cancel", Style::default().fg(MUTED)),
+    ]));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 #[cfg(test)]
@@ -1094,5 +1214,35 @@ mod tests {
             };
             let _ = screen(w, h, |f| render_users(f, f.area(), &create, "a"));
         }
+    }
+
+    #[test]
+    fn password_prompt_hides_values_and_clears_them_when_refused() {
+        let mut prompt = PasswordPrompt::new(
+            "Reset password",
+            "For ops@example.invalid",
+            &["New", "Yours"],
+        );
+        type_text(&mut prompt, "secret-new-password", |p, k| {
+            p.key(k);
+        });
+        assert_eq!(prompt.key(press(KeyCode::Enter)), PromptOutcome::None);
+        assert_eq!(prompt.focus, 1);
+        // Both fields are required before anything is sent.
+        assert_eq!(prompt.key(press(KeyCode::Enter)), PromptOutcome::None);
+        assert!(prompt.error.is_some());
+        type_text(&mut prompt, "my-own-password", |p, k| {
+            p.key(k);
+        });
+        let text = screen(100, 24, |f| render_prompt(f, f.area(), &prompt));
+        assert!(!text.contains("secret-new-password") && !text.contains("my-own-password"));
+        assert!(text.contains("•••••"));
+        assert_eq!(prompt.key(press(KeyCode::Enter)), PromptOutcome::Submit);
+        // Busy prompts ignore further keys until the Daemon answers.
+        assert_eq!(prompt.key(press(KeyCode::Esc)), PromptOutcome::None);
+        prompt.refused("Authentication refused");
+        assert!(prompt.values.iter().all(|v| v.is_empty()));
+        assert_eq!(prompt.focus, 0);
+        assert_eq!(prompt.key(press(KeyCode::Esc)), PromptOutcome::Cancel);
     }
 }

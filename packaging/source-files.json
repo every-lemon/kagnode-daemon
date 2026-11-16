@@ -98,6 +98,7 @@
   "src/tui_auth.rs",
   "src/tui_backup.rs",
   "src/tui_client.rs",
+  "src/tui_gate.rs",
   "src/web.rs",
   "tests/backup-qa.Containerfile",
   "tests/backup_pages_browser.py",
