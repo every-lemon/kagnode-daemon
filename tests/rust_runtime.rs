@@ -22,6 +22,11 @@ fn fixture() -> (tempfile::TempDir, Store) {
             true,
         )
         .unwrap();
+    // This legacy Operator-web fixture opts in explicitly; default-off is tested in roles.rs.
+    rusqlite::Connection::open(root.path().join("daemon.sqlite"))
+        .unwrap()
+        .execute("UPDATE security_config SET admin_enabled=1", [])
+        .unwrap();
     (root, store)
 }
 #[test]

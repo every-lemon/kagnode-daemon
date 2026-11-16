@@ -31,6 +31,17 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Explicit single-owner setup; never downgrades an existing protected store.
+    InitOwner {
+        #[arg(long, value_enum, default_value = "light")]
+        profile: Profile,
+    },
+    /// Backend automation endpoint. Reads a bounded v1 request from stdin;
+    /// credentials must never be supplied in command arguments.
+    User {
+        #[arg(value_parser=["login","owner-session","whoami","capabilities","logout","reauthenticate","list","create","update","reset-password","change-password","enable-protection","security-get","security-set","root-recover","request"])]
+        action: String,
+    },
     Init {
         #[arg(long)]
         email: String,
@@ -290,6 +301,42 @@ fn prompt(message: &str) -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::User { action }) = &args.command {
+        use std::io::Read;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        ensure!(
+            unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } == 0,
+            "Cannot inspect request input"
+        );
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+            ensure!(
+                stat.st_uid == unsafe { libc::geteuid() }
+                    && stat.st_mode & 0o077 == 0
+                    && stat.st_nlink == 1,
+                "Credential request files must be private and owned by the caller"
+            );
+        }
+        let mut raw = zeroize::Zeroizing::new(Vec::new());
+        std::io::stdin().take(16385).read_to_end(&mut raw)?;
+        ensure!(raw.len() <= 16384, "Request exceeds 16 KiB");
+        let request: kagnode_daemon::roles::Envelope = serde_json::from_slice(&raw)
+            .map_err(|_| anyhow::anyhow!("Invalid authenticated request"))?;
+        let expected = match action.as_str() {
+            "list" => "user_list".into(),
+            "create" => "user_create".into(),
+            "update" => "user_update".into(),
+            "reset-password" => "user_reset_password".into(),
+            other => other.replace('-', "_"),
+        };
+        ensure!(
+            action == "request" || request.payload.name() == expected,
+            "Subcommand and request action differ"
+        );
+        let result = kagnode_daemon::runtime::authenticated_request(&args.root, &request)?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
     if let Some(Command::BackupInstall {
         managed_root,
         config,
@@ -481,6 +528,12 @@ async fn main() -> Result<()> {
     }
     let store = Store::open(&args.root)?;
     match args.command {
+        Some(Command::InitOwner { profile }) => {
+            kagnode_daemon::roles::init_owner(&store, unsafe { libc::geteuid() }, profile)?;
+            println!(
+                "Owner mode initialized: unprotected, local-only, web administration disabled."
+            );
+        }
         Some(Command::Init {
             email,
             password_file,
@@ -758,7 +811,8 @@ async fn main() -> Result<()> {
             println!("Daemon local health is OK");
         }
         Some(
-            Command::Broker { .. }
+            Command::User { .. }
+            | Command::Broker { .. }
             | Command::Services { .. }
             | Command::BackupInstall { .. }
             | Command::BackupRole { .. }
