@@ -130,6 +130,9 @@ pub enum Action {
     ProductStatus {
         product: String,
     },
+    ProductControls {
+        product: String,
+    },
     BackupAgentStatus,
     Audit,
     ReceiptGet {
@@ -185,6 +188,7 @@ impl Action {
             Self::Retention => "retention",
             Self::SetRetention { .. } => "set_retention",
             Self::ProductStatus { .. } => "product_status",
+            Self::ProductControls { .. } => "product_controls",
             Self::BackupAgentStatus => "backup_agent_status",
             Self::Audit => "audit",
             Self::ReceiptGet { .. } => "receipt_get",
@@ -202,7 +206,7 @@ impl Action {
     }
     fn scope(&self) -> Option<&str> {
         match self {
-            Self::ProductStatus { product } => Some(product),
+            Self::ProductStatus { product } | Self::ProductControls { product } => Some(product),
             Self::BackupAgentStatus => Some(BACKUP_PRODUCT),
             _ => None,
         }
@@ -257,6 +261,8 @@ pub fn permits(p: &Principal, action: &str, product: Option<&str>) -> bool {
 fn allowed(p: &Principal, a: &Action) -> bool {
     let action = if matches!(a, Action::SetRetention { .. }) {
         "global_manage"
+    } else if matches!(a, Action::ProductControls { .. }) {
+        "product_status"
     } else if matches!(a, Action::BackupAgentStatus) {
         "backup_read"
     } else {
@@ -819,7 +825,7 @@ fn capabilities(p: &Principal, m: &str) -> Value {
     let products = catalog::PRODUCTS
         .iter()
         .filter(|x| permits(p, "product_status", Some(x.id)))
-        .map(|x| json!({"product":x.id,"actions":["product_status"]}))
+        .map(|x| json!({"product":x.id,"actions":["product_status","product_controls"]}))
         .collect::<Vec<_>>();
     json!({"global":global,"products":products,"backup_agent_status":permits(p,"backup_read",Some(BACKUP_PRODUCT)),"native_actions_enabled":false})
 }
@@ -1275,6 +1281,7 @@ fn execute(
                 .ok_or_else(|| anyhow::anyhow!("No application adapter for this product"))?;
             json!({"id":item.id,"name":item.name,"native_actions_enabled":false})
         }
+        Action::ProductControls { product } => crate::control_availability::status(product)?,
         Action::BackupAgentStatus => {
             let row = tx
                 .query_row(
