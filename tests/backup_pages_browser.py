@@ -529,6 +529,13 @@ def main():
                 check("garbage collection reports count", True)
                 # policy
                 page.locator("input[name=required_copies]").fill("2")
+                check(
+                    "policy edit registered in the form",
+                    eventually(
+                        page,
+                        "document.querySelector('input[name=required_copies]').value === '2'",
+                    ),
+                )
                 page.get_by_role("button", name="Review and save").click()
                 d = page.get_by_role("dialog", name="Save backup policy")
                 check(
@@ -538,11 +545,16 @@ def main():
                 d.get_by_label("Your Daemon password").fill(PASSWORD)
                 d.get_by_role("button", name="Save policy").click()
                 page.locator("#page-status").filter(has_text="revision 4").wait_for()
+                for _ in range(30):  # the fixture answers on this thread's event loop
+                    if fx.policy["revision"] == 4:
+                        break
+                    page.wait_for_timeout(100)
                 check(
                     "policy saved at revision + 1",
                     fx.policy["revision"] == 4
                     and fx.policy["required_copies"] == 2
                     and fx.policy["monthly_node_bytes"] is None,
+                    str(fx.policy),
                 )
                 fx.policy["revision"] = 9  # another administrator changed it
                 page.locator("input[name=required_copies]").fill("3")
