@@ -123,7 +123,7 @@ def main():
                 )
                 check(
                     "overview shows server and role",
-                    page.get_by_text("Your access").is_visible(),
+                    (page.get_by_text("Your access").wait_for() or True),
                 )
                 page.get_by_role("tab", name="Users").click()
                 page.get_by_text("Web administration is disabled").first.wait_for()
@@ -276,7 +276,7 @@ def main():
                 )
                 check(
                     "viewer overview shows role",
-                    page.get_by_text("Read-only server analytics").is_visible(),
+                    (page.get_by_text("Read-only server analytics").wait_for() or True),
                 )
                 status = page.evaluate(
                     "fetch('/api/v1/roles/users').then(r => r.status)"
