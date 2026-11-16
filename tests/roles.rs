@@ -580,7 +580,7 @@ fn self_password_change_revokes_terminal_and_legacy_web_tokens() -> Result<()> {
     Ok(())
 }
 #[test]
-fn confirmation_expiry_revision_and_successful_login_rate_are_enforced() -> Result<()> {
+fn confirmation_expiry_revision_and_failed_login_rate_are_enforced() -> Result<()> {
     let (_t, s) = fixture()?;
     let token = login(&s, 110, "owner@fixture.invalid")?;
     let target = json!({"action":"security_set","expected_revision":1,"admin_enabled":true});
@@ -612,7 +612,16 @@ fn confirmation_expiry_revision_and_successful_login_rate_are_enforced() -> Resu
     db(&s)?.execute("UPDATE users SET auth_revision=auth_revision+1", [])?;
     assert!(call(&s, 110, Some(&token), target, c["confirmation"].as_str()).is_err());
     for _ in 0..5 {
-        login(&s, 111, "owner@fixture.invalid")?;
+        assert!(
+            call(
+                &s,
+                111,
+                None,
+                json!({"action":"login","account":"owner@fixture.invalid","password":"wrong"}),
+                None
+            )
+            .is_err()
+        );
     }
     assert!(
         login(&s, 111, "owner@fixture.invalid")
@@ -706,5 +715,119 @@ fn cli_rejects_public_credential_files_and_does_not_echo_invalid_fields() -> Res
     assert!(!r.status.success());
     assert!(String::from_utf8_lossy(&r.stderr).contains("Invalid authenticated request"));
     assert!(!String::from_utf8_lossy(&r.stderr).contains(sentinel));
+    Ok(())
+}
+
+#[test]
+fn successful_onboarding_clears_failures_without_consuming_login_budget() -> Result<()> {
+    let (_t, s) = fixture()?;
+    for _ in 0..4 {
+        assert!(
+            call(
+                &s,
+                222,
+                None,
+                json!({"action":"login","account":"owner@fixture.invalid","password":"wrong"}),
+                None
+            )
+            .is_err()
+        );
+    }
+    let token = login(&s, 222, "owner@fixture.invalid")?;
+    for n in 0..10 {
+        confirmed(
+            &s,
+            222,
+            &token,
+            json!({"action":"user_create","account":format!("new{n}@fixture.invalid"),"password":"fixture-password-long","role":"viewer","grants":{}}),
+        )?;
+    }
+    assert_eq!(
+        db(&s)?.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))?,
+        11
+    );
+    assert!(login(&s, 222, "owner@fixture.invalid").is_ok());
+    for _ in 0..5 {
+        assert!(
+            call(
+                &s,
+                222,
+                None,
+                json!({"action":"login","account":"owner@fixture.invalid","password":"wrong"}),
+                None
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        login(&s, 222, "owner@fixture.invalid")
+            .unwrap_err()
+            .to_string()
+            .contains("retry later")
+    );
+    Ok(())
+}
+
+#[test]
+fn reauthentication_has_separate_higher_failures_and_broad_limits_remain() -> Result<()> {
+    let (_t, s) = fixture()?;
+    let token = login(&s, 223, "owner@fixture.invalid")?;
+    let target = json!({"action":"security_set","expected_revision":1,"admin_enabled":true});
+    for _ in 0..6 {
+        assert!(
+            call(
+                &s,
+                223,
+                Some(&token),
+                json!({"action":"reauthenticate","password":"wrong","target":target}),
+                None
+            )
+            .is_err()
+        );
+    }
+    // More than five reauth failures do not consume the five-failure login bucket.
+    assert!(login(&s, 223, "owner@fixture.invalid").is_ok());
+    assert_eq!(
+        db(&s)?.query_row(
+            "SELECT count FROM security_attempts WHERE identity='uid:223'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        6
+    );
+    for _ in 0..20 {
+        assert!(
+            call(
+                &s,
+                223,
+                Some(&token),
+                json!({"action":"reauthenticate","password":"wrong","target":target}),
+                None
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        call(
+            &s,
+            223,
+            Some(&token),
+            json!({"action":"reauthenticate","password":"fixture-password-long","target":target}),
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("retry later")
+    );
+    db(&s)?.execute(
+        "UPDATE security_attempts SET count=50 WHERE identity='uid:223'",
+        [],
+    )?;
+    assert!(login(&s, 223, "owner@fixture.invalid").is_err());
+    db(&s)?.execute(
+        "UPDATE security_attempts SET count=200 WHERE identity='global'",
+        [],
+    )?;
+    assert!(login(&s, 224, "owner@fixture.invalid").is_err());
     Ok(())
 }

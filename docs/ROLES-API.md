@@ -107,11 +107,15 @@ different payload is refused. Never automatically retry a timed-out mutation;
 inspect state/receipt, obtain fresh confirmation and review again.
 
 Sessions have15-minute idle and8-hour absolute expiry, survive server restart,
-and never store plaintext tokens. Login and reauthentication attempts charge
-persistent15-minute buckets:5 per account+UID,50 per UID,200 global. The broad
-buckets are charged before creating identity keys, so identity guessing cannot
-create unbounded rows within a window. Successful attempts count too; these
-conservative review defaults can limit a long administration session. Disabled
+and never store plaintext tokens. Only failed password checks charge persistent
+15-minute buckets: 5 login failures per account+UID, a separate higher ceiling
+of 20 reauthentication/password-change failures per account+UID, 50 failures per
+UID and 200 global. A login lockout also blocks confirmations. A successful
+password check clears that account's login and reauthentication buckets, but
+never resets UID/global failure totals. Successful administration does not
+consume the failure budget. Checks and accounting remain serialized by the
+store mutex. Unknown identity keys are bounded by the UID/global ceilings.
+Disabled
 or absent identities use a dummy Argon2 verification. Root recovery is root-only,
 not an unthrottled public password endpoint. Request-password strings are zeroized
 on drop; no claim is made that all allocator/serializer copies can be erased.

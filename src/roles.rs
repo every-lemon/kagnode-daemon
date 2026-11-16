@@ -379,25 +379,61 @@ fn audit(
     )?;
     Ok(())
 }
-fn rate(db: &Connection, uid: u32, account: &str) -> Result<()> {
+// Check before costly password work; charge only failures. The store mutex
+// serializes checks/verification/accounting across concurrent requests.
+fn rate(db: &Connection, uid: u32, account: &str, purpose: &str, failed: bool) -> Result<()> {
     let now = auth::now();
     db.execute("DELETE FROM security_attempts WHERE start<=?1", [now - 900])?;
-    // Charge broad buckets before inserting attacker-controlled identity keys.
     for (key, limit) in [
         ("global".to_owned(), 200),
         (format!("uid:{uid}"), 50),
         (format!("id:{uid}:{}", auth::digest(account)), 5),
+        (format!("reauth:{uid}:{}", auth::digest(account)), 20),
     ] {
-        db.execute("INSERT INTO security_attempts VALUES(?1,?2,1) ON CONFLICT(identity) DO UPDATE SET count=count+1",params![key,now])?;
-        ensure!(
-            db.query_row(
+        // Both authentication methods honor a login lockout; reauthentication
+        // has its own higher ceiling and cannot exhaust the login bucket.
+        let relevant = !key.starts_with("reauth:") || purpose == "reauth";
+        if !relevant {
+            continue;
+        }
+        if failed && (!key.starts_with("id:") || purpose == "login") {
+            db.execute("INSERT INTO security_attempts VALUES(?1,?2,1) ON CONFLICT(identity) DO UPDATE SET count=count+1",params![key,now])?;
+        }
+        let count = db
+            .query_row(
                 "SELECT count FROM security_attempts WHERE identity=?1",
                 [key],
-                |r| r.get::<_, i64>(0)
-            )? <= limit,
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        ensure!(
+            count < limit || failed,
             "Authentication refused; retry later"
         );
     }
+    Ok(())
+}
+fn password_check(
+    db: &Connection,
+    uid: u32,
+    account: &str,
+    purpose: &str,
+    password: &str,
+    hash: &str,
+) -> Result<()> {
+    rate(db, uid, account, purpose, false)?;
+    if !auth::verify(password, hash) {
+        rate(db, uid, account, purpose, true)?;
+        anyhow::bail!("Authentication refused");
+    }
+    db.execute(
+        "DELETE FROM security_attempts WHERE identity IN (?1,?2)",
+        params![
+            format!("id:{uid}:{}", auth::digest(account)),
+            format!("reauth:{uid}:{}", auth::digest(account))
+        ],
+    )?;
     Ok(())
 }
 fn invalidate(db: &Connection, id: &str) -> Result<()> {
@@ -566,7 +602,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
                 "Authentication refused"
             );
             let account = auth::email(account).unwrap_or_default();
-            rate(db, uid, &account)?;
+
             let row = db
                 .query_row(
                     "SELECT id,password_hash FROM users WHERE email=?1 AND disabled=0",
@@ -574,11 +610,15 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .optional()?;
-            let valid = auth::verify(
+            password_check(
+                db,
+                uid,
+                &account,
+                "login",
                 password,
                 row.as_ref().and_then(|r| r.1.as_deref()).unwrap_or(DUMMY),
-            );
-            ensure!(valid && row.is_some(), "Authentication refused");
+            )?;
+            ensure!(row.is_some(), "Authentication refused");
             let (id, verified_hash) = row.unwrap();
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let current: Option<String> = tx
@@ -662,16 +702,20 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             allowed(&p, target) && target.risky() && m == "protected" && e.confirmation.is_none(),
             "Confirmation refused"
         );
-        rate(db, uid, &p.account)?;
+
         let hash: Option<String> = db.query_row(
             "SELECT password_hash FROM users WHERE id=?1",
             [&p.id],
             |r| r.get(0),
         )?;
-        ensure!(
-            auth::verify(password, hash.as_deref().unwrap_or(DUMMY)),
-            "Authentication refused"
-        );
+        password_check(
+            db,
+            uid,
+            &p.account,
+            "reauth",
+            password,
+            hash.as_deref().unwrap_or(DUMMY),
+        )?;
         let confirmation = auth::random()?;
         db.execute(
             "DELETE FROM terminal_confirmations WHERE session_hash=?1 OR expires<=?2",
@@ -703,8 +747,24 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
         return Ok(json!({"confirmation":confirmation,"expires_in":90}));
     }
     ensure!(allowed(&p, &e.payload), "Action not permitted");
-    if matches!(e.payload, Action::ChangePassword { .. }) {
-        rate(db, uid, &p.account)?;
+    if let Action::ChangePassword {
+        current_password, ..
+    } = &e.payload
+    {
+        ensure!(m == "protected", "Use enable_protection in owner mode");
+        let hash: Option<String> = db.query_row(
+            "SELECT password_hash FROM users WHERE id=?1",
+            [&p.id],
+            |r| r.get(0),
+        )?;
+        password_check(
+            db,
+            uid,
+            &p.account,
+            "reauth",
+            current_password,
+            hash.as_deref().unwrap_or(DUMMY),
+        )?;
     }
     if e.payload.risky() {
         ensure!(m == "protected", "Enable password protection first");
@@ -809,20 +869,7 @@ fn execute(db: &mut Connection, uid: u32, e: &Envelope, m: &str) -> Result<Value
             password_change(&tx, id, password)?;
             json!({"fresh_login_required":true})
         }
-        Action::ChangePassword {
-            current_password,
-            password,
-        } => {
-            ensure!(m == "protected", "Use enable_protection in owner mode");
-            let hash: Option<String> = tx.query_row(
-                "SELECT password_hash FROM users WHERE id=?1",
-                [&p.id],
-                |r| r.get(0),
-            )?;
-            ensure!(
-                auth::verify(current_password, hash.as_deref().unwrap_or(DUMMY)),
-                "Authentication refused"
-            );
+        Action::ChangePassword { password, .. } => {
             password_change(&tx, &p.id, password)?;
             json!({"fresh_login_required":true})
         }
