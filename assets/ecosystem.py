@@ -42,8 +42,9 @@ RELEASE_PUBLIC_KEY = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAuJzR4gg2djgIr
 
 CATALOG = {
     "proxy-manager": {
-        "name": "KagNode. PM",
-        "repo": "kagnode-pm",
+        "name": "KagNode. Proxy",
+        "repo": "kagnode-proxy",
+        "legacy_release_repo": "kagnode-pm",
         "kind": "native",
         "port": 9443,
     },
@@ -824,7 +825,11 @@ class Manager:
             )
             if (
                 manifest.get("schema") != 1
-                or manifest.get("repository") != f"every-lemon/{repo}"
+                or manifest.get("repository")
+                not in {
+                    f"every-lemon/{repo}",
+                    "every-lemon/" + CATALOG[name].get("legacy_release_repo", repo),
+                }
                 or not re.fullmatch(r"[a-f0-9]{40}", manifest.get("source_commit", ""))
             ):
                 raise ManagerError("Release manifest identity is invalid.")
