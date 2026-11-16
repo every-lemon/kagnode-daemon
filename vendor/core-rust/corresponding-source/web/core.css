@@ -10,19 +10,19 @@
   --kn-accent: #2563eb;
   --kn-link: #1d4ed8;
   --kn-focus: #79a7ff;
-  --kn-bg: #fff;
-  --kn-panel: #f7f7f8;
+  --kn-bg: #faf9f6;
+  --kn-panel: #f0efeb;
   --kn-line: #dcdde1;
   --kn-text: #17181b;
   --kn-muted: #61636b;
 }
 html[data-theme="dark"] {
-  --kn-bg: #101010;
+  --kn-bg: #191919;
   --kn-link: #8ab4ff;
-  --kn-panel: #191919;
-  --kn-line: #303033;
-  --kn-text: #f1f1f3;
-  --kn-muted: #a3a3aa;
+  --kn-panel: #252524;
+  --kn-line: #3a3a38;
+  --kn-text: #ecebe8;
+  --kn-muted: #aaa9a5;
 }
 html[data-kn-core] {
   color-scheme: light;
@@ -105,15 +105,14 @@ html[data-kn-core] [data-core-account-trigger] > svg {
 html[data-kn-core] [data-core-account-menu] {
   box-sizing: border-box;
   position: fixed !important;
-  left: auto !important;
-  width: min(288px, calc(100vw - 24px)) !important;
+  width: min(304px, calc(100vw - 24px)) !important;
   padding: 8px !important;
   border: 1px solid var(--kn-line) !important;
   border-radius: 12px !important;
-  background: var(--kn-bg) !important;
+  background: var(--kn-panel) !important;
   color: var(--kn-text) !important;
   box-shadow: 0 12px 36px #0003 !important;
-  z-index: 12000 !important;
+  z-index: 14000 !important;
   max-height: calc(100dvh - 80px);
   overflow: auto;
   transform: none !important;
@@ -136,7 +135,7 @@ html[data-kn-core] [data-core-account-menu] :is(a, button) {
   border-radius: var(--kn-radius-control) !important;
 }
 html[data-kn-core] [data-core-account-menu] :is(a, button):hover {
-  background: var(--kn-panel);
+  background: color-mix(in srgb, var(--kn-text) 8%, var(--kn-panel));
 }
 .kn-core-account-identity,
 .account-identity {
@@ -161,7 +160,7 @@ html[data-kn-core] .sidebar[data-core-sidebar] {
   border-radius: 0 !important;
   background: var(--kn-bg) !important;
   color: var(--kn-text) !important;
-  overflow: visible !important;
+  overflow: hidden !important;
   transform: none !important;
   transition: width var(--kn-motion) var(--kn-easing) !important;
   z-index: 120 !important;
@@ -280,7 +279,7 @@ html[data-kn-core]
   transition: transform 180ms;
 }
 .kn-core-nav-group[open] > summary > .chevron {
-  transform: rotate(90deg);
+  transform: rotate(180deg);
 }
 html[data-kn-core] .kn-core-nav-group > .submenu {
   position: static !important;
@@ -306,24 +305,42 @@ html[data-kn-core] .kn-core-nav-group > .submenu {
   padding: 8px 9px;
 }
 .kn-core-sidebar-toggle {
-  display: grid;
-  place-items: center;
-  width: 38px;
-  height: 38px;
-  padding: 8px;
+  /* Dock row like a navigation item: icon + label, no chrome until hovered. */
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  overflow: hidden;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
   border: 0;
+  border-radius: var(--kn-radius-control);
   background: transparent;
   color: var(--kn-muted);
   cursor: pointer;
+  transition:
+    background-color 150ms,
+    color 150ms;
 }
 .kn-core-sidebar-toggle:hover {
-  background: var(--kn-panel);
+  background: color-mix(in srgb, var(--kn-text) 7%, transparent);
   color: var(--kn-text);
+}
+.kn-core-sidebar-toggle:active {
+  background: color-mix(in srgb, var(--kn-text) 11%, transparent);
+}
+.kn-core-sidebar-toggle:focus-visible {
+  outline: 2px solid var(--kn-focus);
+  outline-offset: 1px;
 }
 .kn-core-sidebar-toggle svg,
 .kn-core-mobile-toggle svg {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   stroke: currentColor;
   stroke-width: 1.5;
 }
@@ -340,14 +357,7 @@ html[data-kn-core][data-core-collapsed="true"] .kn-core-sidebar-heading {
 [data-core-collapsed="true"] .kn-core-sidebar-heading :is(.brand-copy, strong),
 [data-core-collapsed="true"]
   .kn-core-sidebar-navigation
-  :is(
-    .nav-label,
-    .nav-heading,
-    .nav-section-title,
-    .chevron,
-    .website-link-arrow,
-    kbd
-  ),
+  :is(.nav-heading, .nav-section-title, .chevron, .website-link-arrow, kbd),
 [data-core-collapsed="true"]
   .kn-core-sidebar-navigation
   .kn-core-nav-group
@@ -357,19 +367,50 @@ html[data-kn-core][data-core-collapsed="true"] .kn-core-sidebar-heading {
 html[data-kn-core][data-core-collapsed="true"]
   .kn-core-sidebar-navigation
   :is(a, summary) {
-  width: 38px !important;
+  width: 100% !important;
   height: 36px;
   min-width: 38px;
-  padding: 9px !important;
-  gap: 12px !important;
+  padding: 7px 10px !important;
+  gap: 11px !important;
   white-space: nowrap;
-  font-size: 0 !important;
+  font-size: 13px !important;
 }
-[data-core-collapsed="true"]
-  .kn-core-sidebar-navigation
-  :is(a, summary)
-  > span:not(:has(svg)):not(.ui-icon):not(.icon) {
-  display: none !important;
+@media (min-width: 1024px) {
+  html[data-kn-core][data-core-collapsed="true"]
+    .sidebar[data-core-sidebar]
+    :is([data-core-search-open], [data-command], .quick-search) {
+    box-sizing: border-box !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 38px !important;
+    min-width: 38px !important;
+    max-width: 38px !important;
+    height: 38px !important;
+    margin-inline: 0 !important;
+    padding: 9px !important;
+    gap: 0 !important;
+    overflow: hidden !important;
+    font-size: 0 !important;
+  }
+  html[data-kn-core][data-core-collapsed="true"]
+    .sidebar[data-core-sidebar]
+    :is([data-core-search-open], [data-command], .quick-search)
+    > :not(svg):not(.ui-icon):not(.icon):not([data-core-icon]):not(
+      [data-icon]
+    ) {
+    display: none !important;
+  }
+  html[data-kn-core][data-core-collapsed="true"]
+    .sidebar[data-core-sidebar]
+    :is([data-core-search-open], [data-command], .quick-search)
+    svg {
+    width: 18px !important;
+    height: 18px !important;
+    min-width: 18px !important;
+    flex: none !important;
+    margin: 0 !important;
+  }
 }
 .kn-core-drawer-scrim,
 .kn-core-mobile-toggle {
@@ -466,6 +507,17 @@ html[data-kn-core][data-core-collapsed="true"]
     width: 100%;
     height: 100dvh;
     border-radius: 0 !important;
+    touch-action: none;
+  }
+  /* Touch layouts: comfortable 44px targets; desktop density is unchanged. */
+  html[data-kn-core] .kn-core-sidebar-navigation :is(a, summary) {
+    min-height: 44px !important;
+  }
+  /* The open drawer is modal: keep the page behind it from scrolling. */
+  html[data-core-drawer="true"],
+  html[data-core-drawer="true"] body {
+    overflow: hidden;
+    overscroll-behavior: none;
   }
   [data-core-public="true"] .site-header .site-brand {
     margin-left: 42px;
@@ -908,4 +960,327 @@ html[data-kn-core]
   ) {
   border-radius: 50% !important;
   object-fit: cover;
+}
+
+/* Normalize disclosure motion even when markup comes from an older server adapter. */
+html[data-kn-core] [data-disclosure-icon] {
+  transform: none;
+  transition: transform 180ms var(--kn-easing);
+}
+html[data-kn-core]
+  :is(details[open] > summary, [aria-expanded="true"])
+  > [data-disclosure-icon] {
+  transform: rotate(180deg);
+}
+html[data-kn-core] summary .chevron:has([data-disclosure-icon]) {
+  transform: none !important;
+}
+html[data-kn-core] details[open] > summary .chevron [data-disclosure-icon] {
+  transform: rotate(180deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  html[data-kn-core] [data-disclosure-icon] {
+    transition: none;
+  }
+}
+
+/* Stable row geometry while the sidebar clips its labels during motion. */
+html[data-kn-core] .kn-core-sidebar-navigation :is(a, summary, button),
+html[data-kn-core]
+  .kn-core-sidebar-navigation
+  :is(.nav-label, .nav-section-title),
+html[data-kn-core] .kn-core-sidebar-heading .brand-copy {
+  white-space: nowrap !important;
+  overflow-wrap: normal !important;
+}
+html[data-kn-core]
+  .kn-core-sidebar-navigation
+  :is(.nav-label, a > span, summary > span) {
+  flex-shrink: 0;
+}
+html[data-kn-core]
+  .sidebar[data-core-sidebar]
+  :is(svg, img, .ui-icon, .icon, [data-core-icon]) {
+  flex-shrink: 0 !important;
+}
+html[data-kn-core] .kn-core-sidebar-navigation {
+  scrollbar-width: none !important;
+}
+html[data-kn-core] .kn-core-sidebar-navigation::-webkit-scrollbar {
+  display: none !important;
+  width: 0;
+  height: 0;
+}
+html[data-kn-core] [data-core-brand-link] :is(svg, path) {
+  fill: currentColor !important;
+  color: var(--kn-muted) !important;
+}
+html[data-kn-core] [data-core-brand-link] img {
+  filter: grayscale(1);
+}
+html[data-kn-core] .kn-core-sidebar-heading {
+  position: relative;
+  gap: 8px;
+  padding-inline: 14px 8px;
+}
+html[data-kn-core] .kn-core-sidebar-heading > .brand {
+  flex: 1;
+  overflow: hidden;
+}
+/* Bottom dock: account row and inbox above the collapse control. The control
+   keeps the same bottom-left position whether the sidebar is open or closed. */
+html[data-kn-core] .kn-core-sidebar-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+  min-height: 0;
+  height: auto;
+  padding: 8px 9px 10px;
+}
+html[data-kn-core] .kn-core-sidebar-footer > .kn-core-sidebar-toggle {
+  grid-column: 1 / -1;
+  justify-self: stretch;
+  margin-top: 2px;
+}
+.kn-core-sidebar-toggle .kn-core-toggle-label {
+  min-width: 0;
+  overflow: hidden;
+}
+/* Drawer layout has its own close control; no collapse control there. */
+@media (max-width: 1023px) {
+  html[data-kn-core] .kn-core-sidebar-footer > .kn-core-sidebar-toggle {
+    display: none;
+  }
+}
+html[data-kn-core] .kn-core-sidebar-footer [data-core-account-trigger] {
+  /* Full-width account row: avatar, name over email, selector chevron.
+     Must beat the global trigger `flex: none !important` and app max-widths,
+     otherwise the inbox control is pushed past the sidebar edge. */
+  width: auto !important;
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  height: 48px !important;
+  padding: 6px 8px !important;
+  justify-content: flex-start;
+  gap: 10px !important;
+  background: transparent;
+  border: 0 !important;
+  color: var(--kn-text);
+  border-radius: var(--kn-radius-control) !important;
+  text-align: left;
+  transition: background-color 150ms;
+}
+html[data-kn-core]
+  .kn-core-sidebar-footer
+  [data-core-account-trigger]:is(:hover, [aria-expanded="true"]) {
+  background: color-mix(in srgb, var(--kn-text) 7%, transparent);
+}
+html[data-kn-core]
+  .kn-core-sidebar-footer
+  [data-core-account-trigger]:focus-visible {
+  outline: 2px solid var(--kn-focus);
+  outline-offset: -2px;
+}
+.kn-core-account-label {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 1px;
+  white-space: nowrap;
+}
+.kn-core-account-label > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kn-core-account-name {
+  font-size: 13.5px;
+  font-weight: 550;
+  line-height: 1.25;
+}
+.kn-core-account-email {
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--kn-muted);
+}
+.kn-core-account-email[hidden] {
+  display: none;
+}
+html[data-kn-core] .kn-core-sidebar-footer .kn-core-account-chevron {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-left: auto;
+  color: var(--kn-muted);
+}
+html[data-kn-core] .kn-core-sidebar-footer .kn-core-account-chevron svg {
+  width: 16px;
+  height: 16px;
+}
+html[data-kn-core]
+  .kn-core-sidebar-footer
+  [data-core-account-trigger]
+  > :is(.avatar, img) {
+  flex: none;
+}
+html[data-kn-core]
+  .kn-core-sidebar-footer
+  :is(.header-inbox, [data-inbox-toggle]) {
+  flex: none;
+}
+html[data-kn-core] .kn-core-sidebar-footer [data-inbox-toggle] {
+  width: 32px;
+  height: 32px;
+  padding: 7px;
+  border: 0;
+  border-radius: var(--kn-radius-control);
+  background: transparent;
+  color: var(--kn-muted);
+}
+html[data-kn-core] .kn-core-sidebar-footer [data-inbox-toggle]:hover {
+  background: color-mix(in srgb, var(--kn-text) 7%, transparent);
+  color: var(--kn-text);
+}
+html[data-kn-core][data-core-collapsed="true"] .kn-core-sidebar-footer {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+}
+/* Collapsed: the toggle stays a full-width row with the same inset as
+   navigation items, so its icon sits in the rail centre and the label is
+   clipped by the shrinking sidebar; nothing snaps during the animation. */
+html[data-kn-core][data-core-collapsed="true"]
+  .kn-core-sidebar-footer
+  > .kn-core-sidebar-toggle {
+  justify-self: stretch;
+}
+html[data-kn-core][data-core-collapsed="true"]
+  .kn-core-sidebar-footer
+  [data-core-account-trigger] {
+  width: 38px !important;
+  flex: none !important;
+  justify-content: center;
+  padding: 4px !important;
+}
+html[data-kn-core][data-core-collapsed="true"]
+  .kn-core-sidebar-footer
+  :is(.kn-core-account-label, .kn-core-account-chevron) {
+  display: none;
+}
+html[data-kn-core] [data-core-account-menu] :is(svg, .ui-icon) {
+  width: 19px;
+  height: 19px;
+  flex: none;
+}
+html[data-kn-core] [data-core-account-menu] .account-identity {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+html[data-kn-core]
+  [data-core-account-menu]
+  .account-identity
+  :is(strong, small) {
+  display: block;
+}
+html[data-kn-core] [data-core-account-menu] small {
+  color: var(--kn-muted);
+}
+html[data-kn-core] [data-core-account-menu] form {
+  border-top: 1px solid var(--kn-line);
+  margin-top: 6px;
+  padding-top: 6px;
+}
+html[data-kn-core] #page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+html[data-kn-core] #page-actions > :is(button, .button) {
+  min-height: 40px;
+  flex: 0 1 auto;
+}
+html[data-kn-core]
+  [data-core-account-trigger]
+  :is(.avatar, .account-avatar, img) {
+  border-radius: 50% !important;
+}
+html[data-kn-core] {
+  --bg: var(--kn-bg);
+  --panel: var(--kn-panel);
+  --surface: var(--kn-panel);
+  --text: var(--kn-text);
+  --muted: var(--kn-muted);
+  --border: var(--kn-line);
+}
+html[data-kn-core] body {
+  background-color: var(--kn-bg);
+  color: var(--kn-text);
+}
+
+html[data-kn-core] #inbox-popover {
+  position: fixed;
+  z-index: 14001;
+  background: var(--kn-panel);
+  color: var(--kn-text);
+  border-color: var(--kn-line);
+}
+html[data-kn-core] .kn-core-sidebar-footer [data-core-account-trigger] > img {
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: 50% !important;
+}
+
+html[data-kn-core] .kn-core-sidebar-heading .brand-copy > strong {
+  flex-wrap: nowrap !important;
+}
+html[data-core-shell="active"] .top-actions > .top-divider {
+  display: none;
+}
+html[data-kn-core]
+  .kn-core-sidebar-heading
+  :is([data-dismiss-nav], #sidebar-close) {
+  display: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  html[data-kn-core]
+    :is(
+      .kn-core-sidebar-toggle,
+      .kn-core-sidebar-footer [data-core-account-trigger]
+    ) {
+    transition: none;
+  }
+}
+html[data-kn-core] .kn-core-sidebar-toggle > svg {
+  width: 18px !important;
+  height: 18px !important;
+  stroke-width: 1.6;
+}
+/* Circular avatar follows the theme: soft accent tint in light, deeper in dark. */
+html[data-kn-core]
+  :is([data-core-account-trigger], [data-core-account-menu] .account-identity)
+  :is(.avatar, .avatar-fallback, .account-avatar) {
+  width: 30px !important;
+  height: 30px !important;
+  border-radius: 50% !important;
+  background: color-mix(in srgb, var(--kn-accent) 14%, var(--kn-bg)) !important;
+  color: var(--kn-link) !important;
+  border: 1px solid color-mix(in srgb, var(--kn-accent) 28%, transparent) !important;
+  font-weight: 600;
+}
+/* Fallback initials sit in the circle's centre (image avatars are untouched). */
+html[data-kn-core]
+  :is([data-core-account-trigger], [data-core-account-menu] .account-identity)
+  :is(.avatar, .avatar-fallback, .account-avatar):not(img) {
+  display: inline-grid;
+  place-items: center;
+  line-height: 1;
+  flex: none;
 }

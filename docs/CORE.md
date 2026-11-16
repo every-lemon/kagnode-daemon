@@ -17,3 +17,13 @@ python3 scripts/bundle_core_manager.py /path/to/reviewed-core-release --core-sou
 The build step verifies the existing pinned public key, full manifest signature, every signed package checksum, canonical source archive, Python wheel bytes and committed Core Git source. It updates only this CLI source tree and its manager-only provenance. It does not install a runtime helper, change application bindings, enable automatic backend upgrades or restart any service. The UI manifest alone cannot authorize a helper import.
 
 The reviewed 5.0.6 helper keeps manager protocol 1 and adds a sanitized `summary` query plus an independent summaries policy (`core policy APP --summaries on|off`). Automatic UI activation notices are emitted only by the trusted background update cycle. Manual application and rollback cannot claim to be automatic events. Installing this CLI source/package does not restart an existing manager; its running helper remains a separate administrator-reviewed operation.
+
+## Rust dashboard offline fallback
+
+The Rust dashboard pins the signed Core 5.0.17 fallback. Refresh it with
+`python3 scripts/vendor_core_rust.py /path/to/downloaded-core-release`.
+The importer verifies both manifests, package sizes/hashes and each fallback
+asset, rejects unsafe archive entries, and imports corresponding readable source.
+Backend adapter changes require administrator review; this source update does
+not update any running installation or enable Core Offloading. The legacy Python
+manager bundle remains separately pinned and reviewed.
