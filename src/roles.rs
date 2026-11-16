@@ -421,6 +421,7 @@ fn rate(db: &Connection, uid: u32, account: &str, purpose: &str, failed: bool) -
 #[derive(Default)]
 struct Prepared {
     check: Option<PasswordCheck>,
+    peer: Option<std::net::IpAddr>,
     new_hash: Option<Result<Zeroizing<String>, String>>,
     security_revision: Option<i64>,
     principal: Option<(String, i64)>,
@@ -476,6 +477,7 @@ fn prepare_work(
     store: &Store,
     uid: u32,
     e: &Envelope,
+    peer: Option<std::net::IpAddr>,
     verify: impl FnOnce(&str, &str) -> bool,
     hash: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Prepared> {
@@ -494,6 +496,7 @@ fn prepare_work(
         _ => return Ok(Prepared::default()),
     };
     let mut prepared = Prepared {
+        peer,
         _permit: Some(store.password_worker()?),
         ..Prepared::default()
     };
@@ -561,7 +564,7 @@ fn prepare_work(
             }
         };
         if old_password.is_some() {
-            rate(&db, uid, &account, purpose, false)?;
+            password_rate(&db, uid, &account, purpose, false, peer)?;
             let stored: Option<Option<String>> = db
                 .query_row(
                     "SELECT password_hash FROM users WHERE email=?1 AND disabled=0",
@@ -593,6 +596,72 @@ fn prepare_work(
     }
     Ok(prepared)
 }
+fn web_rate(
+    db: &Connection,
+    peer: std::net::IpAddr,
+    account: &str,
+    purpose: &str,
+    failed: bool,
+) -> Result<()> {
+    let now = auth::now();
+    db.execute("DELETE FROM security_attempts WHERE start<=?1", [now - 900])?;
+    let account = auth::digest(account);
+    let peer = auth::digest(&peer.to_canonical().to_string());
+    for (key, limit, charge) in [
+        (format!("web:id:{account}"), 5, purpose == "login"),
+        (format!("web:reauth:{account}"), 20, purpose == "reauth"),
+        (
+            format!("web:peer:{peer}:{account}:login"),
+            5,
+            purpose == "login",
+        ),
+        (
+            format!("web:peer:{peer}:{account}:reauth"),
+            20,
+            purpose == "reauth",
+        ),
+    ] {
+        if purpose != "reauth" && (key.ends_with(":reauth") || key.starts_with("web:reauth:")) {
+            continue;
+        }
+        if failed && charge {
+            db.execute("INSERT INTO security_attempts VALUES(?1,?2,1) ON CONFLICT(identity) DO UPDATE SET count=count+1",params![key,now])?;
+        }
+        let count = db
+            .query_row(
+                "SELECT count FROM security_attempts WHERE identity=?1",
+                [key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        ensure!(
+            failed || count < limit,
+            "Authentication refused; retry later"
+        );
+    }
+    Ok(())
+}
+fn password_rate(
+    db: &Connection,
+    uid: u32,
+    account: &str,
+    purpose: &str,
+    failed: bool,
+    peer: Option<std::net::IpAddr>,
+) -> Result<()> {
+    if uid == WEB_UID {
+        web_rate(
+            db,
+            peer.ok_or_else(|| anyhow::anyhow!("Browser peer unavailable"))?,
+            account,
+            purpose,
+            failed,
+        )
+    } else {
+        rate(db, uid, account, purpose, failed)
+    }
+}
 fn password_check(
     db: &Connection,
     uid: u32,
@@ -600,7 +669,9 @@ fn password_check(
     purpose: &str,
     hash: &str,
     prepared: &Prepared,
+    peer: Option<std::net::IpAddr>,
 ) -> Result<()> {
+    ensure!(prepared.peer == peer, "Authentication refused");
     let check = prepared
         .check
         .as_ref()
@@ -609,10 +680,24 @@ fn password_check(
         check.account == account && check.purpose == purpose && check.hash.as_str() == hash,
         "Authentication refused"
     );
-    rate(db, uid, account, purpose, false)?;
+    password_rate(db, uid, account, purpose, false, peer)?;
     if !check.valid {
-        rate(db, uid, account, purpose, true)?;
+        password_rate(db, uid, account, purpose, true, peer)?;
         bail!("Authentication refused");
+    }
+    if uid == WEB_UID {
+        let account = auth::digest(account);
+        let peer = auth::digest(&peer.unwrap().to_canonical().to_string());
+        db.execute(
+            "DELETE FROM security_attempts WHERE identity IN (?1,?2,?3,?4)",
+            params![
+                format!("web:id:{account}"),
+                format!("web:peer:{peer}:{account}:login"),
+                format!("web:peer:{peer}:{account}:reauth"),
+                format!("web:reauth:{account}")
+            ],
+        )?;
+        return Ok(());
     }
     db.execute(
         "DELETE FROM security_attempts WHERE identity IN (?1,?2)",
@@ -761,10 +846,10 @@ fn digest(db: &Connection, a: &Action) -> Result<String> {
 
 pub fn handle(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
     ensure!(uid != WEB_UID, "Invalid local peer UID");
-    handle_inner(store, uid, e)
+    handle_inner(store, uid, e, None)
 }
 /// Browser transport owns the cookie; callers cannot supply actor/session fields.
-pub fn handle_web(store: &Store, e: &Envelope) -> Result<Value> {
+pub fn handle_web(store: &Store, e: &Envelope, peer: std::net::IpAddr) -> Result<Value> {
     ensure!(
         !matches!(
             e.payload,
@@ -772,7 +857,7 @@ pub fn handle_web(store: &Store, e: &Envelope) -> Result<Value> {
         ),
         "Local control required"
     );
-    handle_inner(store, WEB_UID, e)
+    handle_inner(store, WEB_UID, e, Some(peer))
 }
 pub fn web_session(store: &Store, token: &str) -> Result<String> {
     let db = store.db()?;
@@ -798,7 +883,12 @@ fn web_admin_action(a: &Action) -> bool {
         _ => false,
     }
 }
-fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
+fn handle_inner(
+    store: &Store,
+    uid: u32,
+    e: &Envelope,
+    peer: Option<std::net::IpAddr>,
+) -> Result<Value> {
     ensure!(
         e.version == 1
             && (1..=64).contains(&e.request_id.len())
@@ -807,7 +897,7 @@ fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "Invalid request envelope"
     );
-    let prepared = prepare_work(store, uid, e, auth::verify, auth::hash_password);
+    let prepared = prepare_work(store, uid, e, peer, auth::verify, auth::hash_password);
     let mut db = store.db()?;
     let m = mode(&db)?;
     let actor = e
@@ -825,7 +915,7 @@ fn handle_inner(store: &Store, uid: u32, e: &Envelope) -> Result<Value> {
     let action = e.payload.name();
     let result = prepared.and_then(|p| {
         p.recheck(&db)?;
-        execute(&mut db, uid, e, &m, &p)
+        execute(&mut db, uid, e, &m, &p, peer)
     });
     // Audit refused authentication/authorization too, without echoing identities,
     // request bodies, passwords, tokens or arbitrary error strings.
@@ -857,6 +947,7 @@ fn execute(
     e: &Envelope,
     m: &str,
     prepared: &Prepared,
+    peer: Option<std::net::IpAddr>,
 ) -> Result<Value> {
     web_gate(db, uid, e, m)?;
     match &e.payload {
@@ -881,6 +972,7 @@ fn execute(
                 "login",
                 row.as_ref().and_then(|r| r.1.as_deref()).unwrap_or(DUMMY),
                 prepared,
+                peer,
             )?;
             ensure!(row.is_some(), "Authentication refused");
             let (id, verified_hash) = row.unwrap();
@@ -979,6 +1071,7 @@ fn execute(
             "reauth",
             hash.as_deref().unwrap_or(DUMMY),
             prepared,
+            peer,
         )?;
         let confirmation = auth::random()?;
         db.execute(
@@ -1025,6 +1118,7 @@ fn execute(
             "reauth",
             hash.as_deref().unwrap_or(DUMMY),
             prepared,
+            peer,
         )?;
     }
     if e.payload.risky() {
@@ -1354,6 +1448,7 @@ mod password_work_tests {
             &store,
             42,
             &request,
+            None,
             |password, hash| {
                 // This would deadlock if Argon2 were called with the database guard held.
                 assert!(store.settings().is_ok());
@@ -1363,7 +1458,7 @@ mod password_work_tests {
         )?;
         let mut db = store.db()?;
         prepared.recheck(&db)?;
-        assert!(execute(&mut db, 42, &request, "protected", &prepared).is_ok());
+        assert!(execute(&mut db, 42, &request, "protected", &prepared, None).is_ok());
         Ok(())
     }
     #[test]
@@ -1374,6 +1469,7 @@ mod password_work_tests {
             &store,
             42,
             &request,
+            None,
             |password, hash| {
                 assert!(auth::verify(password, hash));
                 store
@@ -1390,6 +1486,7 @@ mod password_work_tests {
             &store,
             42,
             &request,
+            None,
             |_password, _hash| {
                 store
                     .db()
@@ -1414,10 +1511,24 @@ mod password_work_tests {
     fn limited_workers_and_rechecked_failure_budget_prevent_concurrent_bypass() -> Result<()> {
         let (_temp, store) = fixture()?;
         let request = login_request();
-        let first = prepare_work(&store, 42, &request, |_, _| false, auth::hash_password)?;
-        let second = prepare_work(&store, 42, &request, |_, _| false, auth::hash_password)?;
+        let first = prepare_work(
+            &store,
+            42,
+            &request,
+            None,
+            |_, _| false,
+            auth::hash_password,
+        )?;
+        let second = prepare_work(
+            &store,
+            42,
+            &request,
+            None,
+            |_, _| false,
+            auth::hash_password,
+        )?;
         assert!(
-            prepare_work(&store, 42, &request, |_, _| true, auth::hash_password)
+            prepare_work(&store, 42, &request, None, |_, _| true, auth::hash_password)
                 .err()
                 .unwrap()
                 .to_string()
@@ -1429,8 +1540,8 @@ mod password_work_tests {
         for _ in 0..5 {
             rate(&db, 42, "owner@fixture.invalid", "login", true)?;
         }
-        assert!(execute(&mut db, 42, &request, "protected", &first).is_err());
-        assert!(execute(&mut db, 42, &request, "protected", &second).is_err());
+        assert!(execute(&mut db, 42, &request, "protected", &first, None).is_err());
+        assert!(execute(&mut db, 42, &request, "protected", &second, None).is_err());
         drop(db);
         drop(first);
         drop(second);
@@ -1450,7 +1561,7 @@ mod password_work_tests {
         let request: Envelope = serde_json::from_value(
             json!({"version":1,"request_id":"create","session":token,"confirmation":proof["confirmation"],"payload":target}),
         )?;
-        let prepared = prepare_work(&store, 42, &request, auth::verify, |password| {
+        let prepared = prepare_work(&store, 42, &request, None, auth::verify, |password| {
             store
                 .db()?
                 .execute("UPDATE users SET auth_revision=auth_revision+1", [])?;

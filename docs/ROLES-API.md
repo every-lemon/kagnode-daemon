@@ -227,3 +227,25 @@ metrics and collector work do not wait for the Argon2 computation to release the
 shared database mutex. This does not move every historical compatibility password
 routine into this scheduler; those host-owner routines and native deployment
 remain separate qualification work.
+### Browser authentication admission and public errors
+
+Browser password limits use the actual TCP peer IP supplied by Axum
+ConnectInfo<SocketAddr>; forwarded headers are never used. Ports are not part of
+identity. Failed browser checks charge a 15-minute peer+account bucket (5 sign-in,
+20 confirmation/password-change) and the account-wide bucket (5 sign-in,
+20 confirmation). Success clears that account's relevant history. Browser failures
+never charge the reserved WEB UID bucket or the terminal global bucket; many
+made-up accounts cannot exhaust every browser/terminal user's sign-in budget.
+Five wrong passwords against one real account still lock that account across
+peers until expiry; targeted account lockout is an intentional remaining tradeoff.
+Terminal limits are unchanged (50 per UID,200 global and original account limits).
+
+Role API JSON bodies are explicitly limited to16KiB (HTTP413 on excess). When
+password/request workers are busy the API returns HTTP503 with
+`{"error":"Authentication busy; retry later"}`; this is not an authorization
+refusal. Reauthentication/other mutations do not automatically retry on overload.
+Known public authorization/validation/conflict messages retain their documented
+statuses. Any unexpected database/runtime error instead returns HTTP500 with
+`{"error":"Request unavailable"}`. Internal SQLite strings, filesystem errors
+or arbitrary exception text are never copied to a browser response. Login remains
+HTTP401 with `Sign-in failed or is temporarily limited` for ordinary auth failures.
