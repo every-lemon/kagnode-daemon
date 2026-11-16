@@ -197,8 +197,15 @@ pub fn authenticated_dispatch(
     request: crate::roles::Envelope,
 ) -> Result<Value> {
     let value = crate::roles::handle(store, uid, &request)?;
+    complete_analytics(store, &request.payload, value)
+}
+pub(crate) fn complete_analytics(
+    store: &Store,
+    action: &crate::roles::Action,
+    value: Value,
+) -> Result<Value> {
     use crate::roles::Action;
-    match &request.payload {
+    match action {
         Action::Overview => {
             let h = History::open(&store.root)?;
             let latest = h.latest()?;
