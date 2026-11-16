@@ -324,6 +324,11 @@
     resumeReturn();
   }
   function reset(container = document) {
+    const forms = [
+      ...(container.matches?.("form") ? [container] : []),
+      ...(container.querySelectorAll?.("form") || []),
+    ];
+    for (const form of forms) progressive.get(form)?.reset();
     const buttons = [
       ...(container.matches?.("button[data-core-login-provider]")
         ? [container]
@@ -431,7 +436,7 @@
           signal: controller.signal,
         });
       let animation;
-      const state = { stage: "identity" };
+      const state = { stage: "identity", identity: identity.value };
       progressive.set(form, state);
       const show = (stage, focus = true) => {
         state.stage = stage;
@@ -460,11 +465,16 @@
       };
       const advance = (focus = true) => {
         if (!originalNoValidate && !identity.reportValidity()) return false;
+        if (state.identity !== identity.value) secret.value = "";
+        state.identity = identity.value;
         show("password", focus);
         return true;
       };
       on(next, "click", () => advance());
-      on(change, "click", () => show("identity"));
+      on(change, "click", () => {
+        secret.value = "";
+        show("identity");
+      });
       on(identity, "keydown", (event) => {
         if (
           event.key === "Enter" &&
@@ -503,6 +513,13 @@
         true,
       );
       const autofill = () => {
+        if (state.identity && state.identity !== identity.value) {
+          secret.value = "";
+          state.identity = identity.value;
+          show("identity", false);
+          return;
+        }
+        state.identity = identity.value;
         if (state.stage === "identity" && secret.value) show("password", false);
         value.textContent = identity.value;
       };
@@ -515,6 +532,11 @@
         false,
       );
       state.show = show;
+      state.reset = () => {
+        secret.value = "";
+        state.identity = identity.value;
+        show("identity", false);
+      };
       state.advance = advance;
       state.sync = () => {
         value.textContent = identity.value;
