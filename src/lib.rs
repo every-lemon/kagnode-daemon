@@ -21,3 +21,5 @@ pub mod backup_service;
 
 pub mod control_availability;
 pub mod web_roles;
+
+pub mod local_admission;

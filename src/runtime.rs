@@ -89,7 +89,7 @@ pub fn request(root: &Path, value: &Request) -> Result<Value> {
     wire_request(root, value)
 }
 pub fn authenticated_request(root: &Path, value: &crate::roles::Envelope) -> Result<Value> {
-    wire_request(root, value)
+    crate::local_admission::private_request(root, value)
 }
 fn wire_request(root: &Path, value: &impl Serialize) -> Result<Value> {
     let mut s = UnixStream::connect(root.join("run/control.sock")).map_err(|_| {
