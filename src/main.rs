@@ -31,6 +31,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Root-only reviewed native setup at fixed paths; global --root does not change them.
+    NativeSetup {
+        #[command(subcommand)]
+        action: NativeSetup,
+    },
     /// Explicit single-owner setup; never downgrades an existing protected store.
     InitOwner {
         #[arg(long, value_enum, default_value = "light")]
@@ -152,6 +157,35 @@ enum Command {
         #[command(subcommand)]
         command: Services,
     },
+}
+#[derive(Subcommand)]
+enum NativeSetup {
+    Plan {
+        #[arg(
+            long,
+            required_unless_present = "owner_uid",
+            conflicts_with = "owner_uid"
+        )]
+        account: Option<String>,
+        #[arg(long, required_unless_present = "account", conflicts_with = "account")]
+        owner_uid: Option<u32>,
+        #[arg(long, value_enum, default_value = "light")]
+        profile: Profile,
+        #[arg(long)]
+        web: bool,
+        #[arg(long, default_value = "http://127.0.0.1:8750")]
+        origin: String,
+    },
+    Apply {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        expected_sha256: String,
+        /// Read the secret from a bounded pipe or private input file, never argv.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    Recovery,
 }
 #[derive(Subcommand)]
 enum BackupServer {
@@ -307,6 +341,106 @@ fn prompt(message: &str) -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::NativeSetup { action }) = &args.command {
+        use kagnode_daemon::native_install::{self, Options, Protection, ProtectionChoice};
+        ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "Native installation requires root"
+        );
+        let result = match action {
+            NativeSetup::Plan {
+                account,
+                owner_uid,
+                profile,
+                web,
+                origin,
+            } => {
+                let choice = if let Some(account) = account {
+                    ProtectionChoice::Protected {
+                        account: account.clone(),
+                    }
+                } else {
+                    ProtectionChoice::Owner {
+                        actual_owner_uid: owner_uid
+                            .ok_or_else(|| anyhow::anyhow!("Choose account or owner uid"))?,
+                    }
+                };
+                serde_json::to_value(native_install::plan(
+                    Options {
+                        profile: *profile,
+                        web: *web,
+                        origin: origin.clone(),
+                    },
+                    choice,
+                )?)?
+            }
+            NativeSetup::Apply {
+                plan,
+                expected_sha256,
+                password_stdin,
+            } => {
+                let plan = native_install::read_plan(plan)?;
+                match &plan.protection {
+                    ProtectionChoice::Owner { actual_owner_uid } => {
+                        ensure!(!password_stdin, "Owner setup does not take password input");
+                        native_install::apply_reviewed(
+                            &plan,
+                            Protection::Owner {
+                                actual_owner_uid: *actual_owner_uid,
+                            },
+                            expected_sha256,
+                        )?
+                    }
+                    ProtectionChoice::Protected { account } => {
+                        use std::io::Read;
+                        ensure!(
+                            *password_stdin,
+                            "Protected setup requires --password-stdin; never put a password in argv"
+                        );
+                        ensure!(
+                            unsafe { libc::isatty(libc::STDIN_FILENO) } == 0,
+                            "Use a bounded pipe or private password input file"
+                        );
+                        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                        ensure!(
+                            unsafe { libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) } == 0,
+                            "Cannot inspect setup input"
+                        );
+                        let stat = unsafe { stat.assume_init() };
+                        ensure!(
+                            stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                                || (stat.st_uid == 0
+                                    && stat.st_mode & 0o077 == 0
+                                    && stat.st_nlink == 1),
+                            "Password input file must be private and root-owned"
+                        );
+                        let mut secret = zeroize::Zeroizing::new(Vec::new());
+                        std::io::stdin().take(1027).read_to_end(&mut secret)?;
+                        if secret.last() == Some(&b'\n') {
+                            secret.pop();
+                            if secret.last() == Some(&b'\r') {
+                                secret.pop();
+                            }
+                        }
+                        ensure!(
+                            secret.len() <= 1024,
+                            "Setup password input exceeded its bound"
+                        );
+                        let password = std::str::from_utf8(&secret)
+                            .map_err(|_| anyhow::anyhow!("Setup password must be valid UTF-8"))?;
+                        native_install::apply_reviewed(
+                            &plan,
+                            Protection::Protected { account, password },
+                            expected_sha256,
+                        )?
+                    }
+                }
+            }
+            NativeSetup::Recovery => native_install::recovery_status()?,
+        };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     if let Some(Command::User { action }) = &args.command {
         use std::io::Read;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -858,7 +992,8 @@ async fn main() -> Result<()> {
             println!("Daemon local health is OK");
         }
         Some(
-            Command::User { .. }
+            Command::NativeSetup { .. }
+            | Command::User { .. }
             | Command::Broker { .. }
             | Command::Services { .. }
             | Command::BackupInstall { .. }

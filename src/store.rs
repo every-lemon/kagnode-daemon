@@ -125,13 +125,26 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
     pub fn init(&self, email: &str, password: &str, profile: Profile, web: bool) -> Result<()> {
         let email = auth::email(email)?;
         let hash = auth::hash_password(password)?;
+        self.init_prepared(&email, &hash, profile, web)
+    }
+    /// Internal fresh-install path; expensive password work already completed before mutation.
+    pub(crate) fn init_prepared(
+        &self,
+        email: &str,
+        hash: &str,
+        profile: Profile,
+        web: bool,
+    ) -> Result<()> {
+        let email = auth::email(email)?;
+        let _ = argon2::PasswordHash::new(hash)
+            .map_err(|_| anyhow::anyhow!("Invalid prepared password verifier"))?;
         let mut db = self.db()?;
         let tx = db.transaction()?;
         ensure!(
             tx.query_row("SELECT COUNT(*) FROM admins", [], |r| r.get::<_, i64>(0))? == 0,
             "Existing administrators retained; initialization cannot reset accounts"
         );
-        crate::roles::initialized_user(&tx, &email, &hash)?;
+        crate::roles::initialized_user(&tx, &email, hash)?;
         tx.execute("INSERT INTO admins VALUES(?1,?2)", params![email, hash])?;
         tx.execute(
             "INSERT INTO settings VALUES(1,?1)",

@@ -1404,6 +1404,28 @@ pub fn init_owner(store: &Store, uid: u32, profile: crate::store::Profile) -> Re
         uid == unsafe { libc::geteuid() },
         "Owner mode records the actual initializing uid"
     );
+    initialize_owner(store, uid, profile)
+}
+/// Narrow root installer path; generic owner initialization keeps its actual-uid guard.
+pub(crate) fn init_owner_for_installer(
+    store: &Store,
+    uid: u32,
+    profile: crate::store::Profile,
+) -> Result<()> {
+    ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "Only root native installation may assign a verified owner uid"
+    );
+    crate::native_install::owner_user(uid)?;
+    use std::os::unix::fs::MetadataExt;
+    let m = store.root.symlink_metadata()?;
+    ensure!(
+        m.is_dir() && !m.file_type().is_symlink() && m.uid() == 0 && m.mode() & 0o077 == 0,
+        "Native owner initialization requires a fresh private root-owned store"
+    );
+    initialize_owner(store, uid, profile)
+}
+fn initialize_owner(store: &Store, uid: u32, profile: crate::store::Profile) -> Result<()> {
     let mut db = store.db()?;
     let tx = db.transaction()?;
     ensure!(
