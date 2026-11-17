@@ -146,8 +146,13 @@ fn hash(bytes: &[u8]) -> String {
 fn file_hash(path: &Path) -> Result<String> {
     let mut f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let m = f.metadata()?;
+    ensure!(
+        m.is_file() && m.nlink() == 1 && m.len() <= MAX_TOTAL,
+        "Candidate hash input must be a bounded independent regular file"
+    );
     let mut h = Sha256::new();
     let mut block = [0u8; 65536];
     loop {
@@ -206,7 +211,7 @@ fn relative(name: &str) -> bool {
 fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let m = f.metadata()?;
     ensure!(
@@ -502,7 +507,7 @@ fn target_arch(target: &str) -> Result<(&'static str, u16)> {
 fn check_elf(path: &Path, machine: u16) -> Result<()> {
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let m = f.metadata()?;
     ensure!(
@@ -547,10 +552,30 @@ fn copy(source: &Path, destination: &Path, mode: u32) -> Result<()> {
         !destination.exists() && !destination.is_symlink(),
         "Candidate payload file already exists"
     );
-    std::fs::copy(source, destination)?;
-    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode))?;
-    File::open(destination)?.sync_all()?;
-    Ok(())
+    // Open with the same nonblocking, no-follow regular-file checks as manifests.
+    let bytes = read_bounded(source, MAX_TOTAL)?;
+    write(destination, &bytes, mode)
+}
+fn detach_cargo_output(source: &Path, destination: &Path) -> Result<()> {
+    // Cargo hardlinks its own output into its private target root. This narrow
+    // internal step admits those links, then creates an independent staged file.
+    // No source/download/signing input uses this exception.
+    let input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)?;
+    let metadata = input.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= MAX_FILE,
+        "Cargo output must be a bounded regular executable"
+    );
+    let mut bytes = Vec::new();
+    input.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_FILE,
+        "Cargo output grew beyond bound"
+    );
+    write(destination, &bytes, 0o755)
 }
 fn key(fd: i32) -> Result<File> {
     ensure!(
@@ -1274,7 +1299,7 @@ pub fn build(options: &BuildOptions) -> Result<serde_json::Value> {
         for name in BINARIES {
             let p = dir.join(&options.target).join("release").join(name);
             let independent = p.with_extension("independent");
-            copy(&p, &independent, 0o755)?;
+            detach_cargo_output(&p, &independent)?;
             std::fs::rename(&independent, &p)?;
             check_elf(&p, machine)?;
             let mut c = Command::new(&p);
@@ -1608,6 +1633,60 @@ mod tests {
             .env("LD_PRELOAD", "invalid-fixture");
         let output = String::from_utf8(run(command, Duration::from_secs(5), None)?)?;
         assert!(!output.contains("KAGNODE_FIXTURE_SECRET") && !output.contains("LD_PRELOAD="));
+        Ok(())
+    }
+    fn fifo_refused_promptly(reader: fn(&Path) -> Result<()>) -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let path = t.path().join("untrusted-input");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        ensure!(
+            unsafe { libc::mkfifo(name.as_ptr(), 0o600) } == 0,
+            "fixture fifo"
+        );
+        let (send, receive) = std::sync::mpsc::channel();
+        let input = path.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = send.send(reader(&input).is_err());
+        });
+        let timely = receive.recv_timeout(Duration::from_millis(500)).ok();
+        if timely.is_none() {
+            // Let a blocking old reader finish, so the failing regression cannot
+            // leave a hung test process or FIFO descriptor behind.
+            let writer = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)?;
+            drop(writer);
+            let _ = receive.recv_timeout(Duration::from_secs(2));
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture reader panic"))?;
+        ensure!(
+            timely == Some(true),
+            "FIFO input blocked before regular-file admission"
+        );
+        Ok(())
+    }
+    #[test]
+    fn fifo_manifest_input_is_refused_without_waiting_for_writer() -> Result<()> {
+        fifo_refused_promptly(|p| read_bounded(p, 1024).map(|_| ()))
+    }
+    #[test]
+    fn fifo_hash_input_is_refused_without_waiting_for_writer() -> Result<()> {
+        fifo_refused_promptly(|p| file_hash(p).map(|_| ()))
+    }
+    #[test]
+    fn cargo_link_detachment_is_narrow_and_independent() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let input = t.path().join("cargo-output");
+        write(&input, b"synthetic cargo output", 0o755)?;
+        std::fs::hard_link(&input, t.path().join("cargo-internal-link"))?;
+        assert!(read_bounded(&input, MAX_FILE).is_err());
+        let staged = t.path().join("independent");
+        detach_cargo_output(&input, &staged)?;
+        assert_eq!(staged.metadata()?.nlink(), 1);
+        assert_eq!(read_bounded(&staged, MAX_FILE)?, b"synthetic cargo output");
         Ok(())
     }
     #[test]
