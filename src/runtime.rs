@@ -114,6 +114,18 @@ fn wire_request(root: &Path, value: &impl Serialize) -> Result<Value> {
     Ok(d["value"].clone())
 }
 pub async fn serve(store: Store) -> Result<()> {
+    let authority_store = store.clone();
+    let authority_listener = crate::actor_broker::authority_listener(&store)?;
+    let authority = tokio::spawn(async move {
+        crate::actor_broker::serve_authority_on(authority_store, authority_listener).await
+    });
+    struct Abort(tokio::task::JoinHandle<anyhow::Result<()>>);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut authority = Abort(authority);
     let socket = store.root.join("run/control.sock");
     if socket.exists() {
         ensure!(
@@ -131,7 +143,11 @@ pub async fn serve(store: Store) -> Result<()> {
     let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let workers = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
     loop {
-        let (stream, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted=listener.accept()=>accepted,
+            _=&mut authority.0=>return Err(anyhow::anyhow!("Authority callback stopped")),
+        };
+        let (stream, _) = match accepted {
             Ok(v) => v,
             Err(_) => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -197,6 +213,9 @@ pub fn authenticated_dispatch(
     request: crate::roles::Envelope,
 ) -> Result<Value> {
     let value = crate::roles::handle(store, uid, &request)?;
+    if matches!(request.payload, crate::roles::Action::BrokerIntent { .. }) {
+        return crate::actor_broker::dispatch_private(store, value);
+    }
     complete_analytics(store, &request.payload, value)
 }
 pub(crate) fn complete_analytics(

@@ -18,15 +18,15 @@ availability response into a successful operation in the UI.
 | backup_approve/revoke/rotate_certificate/delete/policy | manage | Extend backup supervisor to validate current logical actor and reviewed payload/confirmation; synthetic failure/replay qualification |
 | backup_pin | operate | Same actor-bound backup supervisor integration |
 
-The existing service broker trusts a registered Unix service UID; its request does
-not carry a verified logical-user authorization decision or bind that actor in its
-native receipt. The backup supervisor similarly has host-owner administration.
+The legacy service broker now refuses nonroot peers, including a registered service
+UID. The new [actor-bound substrate](ACTOR-BROKER.md) implements private authority
+admission and journals with an always-unavailable production dispatcher. The backup supervisor similarly has host-owner administration.
 Forwarding Manager payloads into these interfaces would turn the service account
 into a privileged deputy. Neither a UI role check nor the socket permission matrix
 repairs that gap. Existing host-owner interfaces remain outside logical-user role
 isolation; no new lower-role route reaches them.
 
-Before enabling: review the role backend, define an unforgeable short-lived broker
+Before enabling: independently review the role backend and short-lived broker
 authorization envelope scoped to exact action/product/actor/revision/plan/request,
 check current authority immediately before native admission, consume once, record
 durable uncertain outcomes, and test restart/replay/revocation/concurrent changes in

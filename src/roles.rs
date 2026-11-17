@@ -10,7 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DUMMY: &str = "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$LVpD9X5K/RWgyqzbMvnOjVApq+S+ZJ+8sAc7vPgXlZI";
 pub const BACKUP_PRODUCT: &str = "backup";
-const WEB_UID: u32 = u32::MAX;
+pub(crate) const WEB_UID: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -134,6 +134,13 @@ pub enum Action {
         product: String,
     },
     BackupAgentStatus,
+    BrokerIntent {
+        request: crate::actor_broker::ReviewedRequest,
+    },
+    BrokerReceipt {
+        request_id: String,
+        product: String,
+    },
     Audit,
     ReceiptGet {
         request_id: String,
@@ -190,11 +197,16 @@ impl Action {
             Self::ProductStatus { .. } => "product_status",
             Self::ProductControls { .. } => "product_controls",
             Self::BackupAgentStatus => "backup_agent_status",
+            Self::BrokerIntent { .. } => "broker_intent",
+            Self::BrokerReceipt { .. } => "broker_receipt",
             Self::Audit => "audit",
             Self::ReceiptGet { .. } => "receipt_get",
         }
     }
     fn risky(&self) -> bool {
+        if let Self::BrokerIntent { request } = self {
+            return request.action.risky();
+        }
         matches!(
             self,
             Self::UserCreate { .. }
@@ -259,6 +271,16 @@ pub fn permits(p: &Principal, action: &str, product: Option<&str>) -> bool {
         || (p.role == Role::Manager && p.grants.get(product).is_some_and(|v| Some(*v) >= level))
 }
 fn allowed(p: &Principal, a: &Action) -> bool {
+    match a {
+        Action::BrokerIntent { request } => {
+            return request.valid().is_ok()
+                && permits(p, request.action.permission(), Some(&request.product));
+        }
+        Action::BrokerReceipt { product, .. } => {
+            return permits(p, "product_status", Some(product));
+        }
+        _ => {}
+    }
     let action = if matches!(a, Action::SetRetention { .. }) {
         "global_manage"
     } else if matches!(a, Action::ProductControls { .. }) {
@@ -280,6 +302,7 @@ CREATE TABLE IF NOT EXISTS terminal_confirmations(hash TEXT PRIMARY KEY,session_
 CREATE TABLE IF NOT EXISTS security_attempts(identity TEXT PRIMARY KEY,start INTEGER NOT NULL,count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS security_receipts(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,uid INTEGER NOT NULL,mode TEXT NOT NULL,action TEXT NOT NULL,request_hash TEXT NOT NULL,outcome TEXT NOT NULL,at INTEGER NOT NULL,receipt_mac TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS security_key(id INTEGER PRIMARY KEY CHECK(id=1),key_hex TEXT NOT NULL);")?;
+    crate::actor_broker::migrate(&tx)?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS web_session_revisions(session_hash TEXT PRIMARY KEY REFERENCES sessions(token_hash) ON DELETE CASCADE,auth_revision INTEGER NOT NULL);")?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS web_role_sessions(hash TEXT PRIMARY KEY REFERENCES terminal_sessions(hash) ON DELETE CASCADE,csrf TEXT NOT NULL);")?;
     tx.execute(
@@ -327,7 +350,7 @@ pub(crate) fn initialized_user(db: &Connection, email: &str, hash: &str) -> Resu
     )?;
     Ok(())
 }
-fn principal(db: &Connection, id: &str) -> Result<Principal> {
+pub(crate) fn principal(db: &Connection, id: &str) -> Result<Principal> {
     let mut p = db.query_row(
         "SELECT id,email,role,disabled,auth_revision,created_at,created_by FROM users WHERE id=?1",
         [id],
@@ -362,7 +385,7 @@ fn mode(db: &Connection) -> Result<String> {
         })?,
     )
 }
-fn audit(
+pub(crate) fn audit(
     db: &Connection,
     actor: &str,
     uid: u32,
@@ -903,6 +926,7 @@ fn handle_inner(
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "Invalid request envelope"
     );
+    crate::actor_broker::check_available(store, &e.payload)?;
     let prepared = prepare_work(store, uid, e, peer, auth::verify, auth::hash_password);
     let mut db = store.db()?;
     let m = mode(&db)?;
@@ -1140,6 +1164,13 @@ fn execute(
     let p = identify(&tx, uid, token)?;
     ensure!(allowed(&p, &e.payload), "Action not permitted");
     let value = match &e.payload {
+        Action::BrokerIntent { request } => {
+            crate::actor_broker::issue(&tx, &p, uid, token, &e.request_id, request)?
+        }
+        Action::BrokerReceipt {
+            request_id,
+            product,
+        } => crate::actor_broker::retrieve(&tx, &p, request_id, product)?,
         Action::Whoami => whoami(&tx, &p)?,
         Action::Capabilities => capabilities(&p, m),
         Action::Logout => {

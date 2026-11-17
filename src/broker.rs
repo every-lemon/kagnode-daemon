@@ -265,6 +265,10 @@ async fn plan(product: &str, operation: Operation) -> Result<Value> {
     Ok(value)
 }
 async fn handle(db: &mut rusqlite::Connection, mut request: Request, peer: u32) -> Result<Value> {
+    ensure!(
+        peer == 0,
+        "Legacy native controls require explicit host-root authority"
+    );
     let product = match &mut request {
         Request::History { product }
         | Request::Status { product }
@@ -384,13 +388,15 @@ async fn handle(db: &mut rusqlite::Connection, mut request: Request, peer: u32) 
                 Ok::<_, anyhow::Error>(observed)
             }
             .await;
-            let (state, value) = match result {
+            let (state, mut value) = match result {
                 Ok(v) => ("completed", v),
                 Err(e) => (
                     "uncertain",
                     json!({"error":e.to_string(),"requires_inspection":true}),
                 ),
             };
+            value["actor"] = json!("host-root");
+            value["peer_uid"] = json!(peer);
             db.execute(
                 "UPDATE operations SET state=?1,result=?2 WHERE id=?3",
                 rusqlite::params![state, serde_json::to_string(&value)?, request_id],
@@ -487,7 +493,7 @@ pub async fn serve(root: &Path, allowed_uid: u32) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let uid = stream.peer_cred()?.uid();
-        if uid != 0 && uid != allowed_uid {
+        if uid != 0 {
             continue;
         }
         let mut reader = BufReader::new(stream);
@@ -505,7 +511,7 @@ pub async fn serve(root: &Path, allowed_uid: u32) -> Result<()> {
             _ => Err(anyhow::anyhow!("Broker request exceeded its bound")),
         };
         let value = match result {
-            Ok(v) => json!({"ok":true,"value":v}),
+            Ok(v) => json!({"ok":true,"value":v,"actor":"host-root","peer_uid":uid}),
             Err(e) => json!({"ok":false,"error":e.to_string()}),
         };
         let mut stream = reader.into_inner();
@@ -547,6 +553,30 @@ mod tests {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE operations(id TEXT PRIMARY KEY,digest TEXT,state TEXT,result TEXT,at INTEGER,peer INTEGER,product TEXT);").unwrap();
         db
+    }
+    #[tokio::test]
+    async fn service_uid_cannot_use_legacy_deputy() {
+        let mut db = journal();
+        assert!(
+            handle(
+                &mut db,
+                Request::Apply {
+                    product: "mail".into(),
+                    operation: Operation::Restart,
+                    expected_sha256: "a".repeat(64),
+                    request_id: "b".repeat(32)
+                },
+                42
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM operations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
     #[tokio::test]
     async fn aliases_share_history_and_cannot_resolve_another_products_operation() {

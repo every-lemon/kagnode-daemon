@@ -13,6 +13,8 @@ pub struct Store {
     pub root: PathBuf,
     db: Arc<Mutex<Connection>>,
     password_workers: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) actor_test_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -99,6 +101,8 @@ CREATE TABLE IF NOT EXISTS documents(kind TEXT PRIMARY KEY, revision INTEGER NOT
             root: root.into(),
             db: Arc::new(Mutex::new(db)),
             password_workers: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(test)]
+            actor_test_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
     pub(crate) fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
