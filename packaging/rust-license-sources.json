@@ -1,0 +1,131 @@
+{
+  "schema": 1,
+  "packages": [
+    {
+      "name": "age",
+      "version": "0.12.1",
+      "spdx": "MIT OR Apache-2.0",
+      "upstream_commit": "7a854c9c8c02dab2ebea19e02e6693a5730a8b2a",
+      "selected_license": "preserve upstream offered alternatives",
+      "reason": "Published crate omits full license files; exact upstream VCS source retained. io_tee README grant is paired with canonical SPDX Apache2 text where upstream has no standalone license.",
+      "files": [
+        {
+          "path": "packaging/third-party-licenses/age-0.12.1/LICENSE-APACHE",
+          "sha256": "3708458dee7f359ac6c9c5558023ed481be87e5372c43ebd7f2ca7ad23c12026",
+          "upstream_blob": "1e5006dc141e22213c898c27abaded8d936c32f0",
+          "source_url": "https://github.com/str4d/rage/blob/7a854c9c8c02dab2ebea19e02e6693a5730a8b2a/LICENSE-APACHE"
+        },
+        {
+          "path": "packaging/third-party-licenses/age-0.12.1/LICENSE-MIT",
+          "sha256": "fe56c030c2d8c3404a37fe711cebb27ebea13d0aacf7e3524db4198335ad8cd1",
+          "upstream_blob": "c775f6102aead463c9d606fd34d47a3c2218148f",
+          "source_url": "https://github.com/str4d/rage/blob/7a854c9c8c02dab2ebea19e02e6693a5730a8b2a/LICENSE-MIT"
+        }
+      ]
+    },
+    {
+      "name": "age-core",
+      "version": "0.12.0",
+      "spdx": "MIT OR Apache-2.0",
+      "upstream_commit": "f6383f367e9aa514a3b5fbce7feede08a425d647",
+      "selected_license": "preserve upstream offered alternatives",
+      "reason": "Published crate omits full license files; exact upstream VCS source retained. io_tee README grant is paired with canonical SPDX Apache2 text where upstream has no standalone license.",
+      "files": [
+        {
+          "path": "packaging/third-party-licenses/age-core-0.12.0/LICENSE-APACHE",
+          "sha256": "3708458dee7f359ac6c9c5558023ed481be87e5372c43ebd7f2ca7ad23c12026",
+          "upstream_blob": "1e5006dc141e22213c898c27abaded8d936c32f0",
+          "source_url": "https://github.com/str4d/rage/blob/f6383f367e9aa514a3b5fbce7feede08a425d647/LICENSE-APACHE"
+        },
+        {
+          "path": "packaging/third-party-licenses/age-core-0.12.0/LICENSE-MIT",
+          "sha256": "fe56c030c2d8c3404a37fe711cebb27ebea13d0aacf7e3524db4198335ad8cd1",
+          "upstream_blob": "c775f6102aead463c9d606fd34d47a3c2218148f",
+          "source_url": "https://github.com/str4d/rage/blob/f6383f367e9aa514a3b5fbce7feede08a425d647/LICENSE-MIT"
+        }
+      ]
+    },
+    {
+      "name": "cookie-factory",
+      "version": "0.3.3",
+      "spdx": "MIT",
+      "upstream_commit": "d36b805dbd7dd65f2df947235c5bcc573afe2c76",
+      "selected_license": "preserve upstream offered alternatives",
+      "reason": "Published crate omits full license files; exact upstream VCS source retained. io_tee README grant is paired with canonical SPDX Apache2 text where upstream has no standalone license.",
+      "files": [
+        {
+          "path": "packaging/third-party-licenses/cookie-factory-0.3.3/MIT.txt",
+          "sha256": "d09216dc1ea5f273997667935a8d6514d80f00b89fb6954ecc3a43e0a6e360de",
+          "upstream_blob": "d9e66dc90589bbf32cdf66d1431c03434d65bdf3",
+          "source_url": "https://github.com/rust-bakery/cookie-factory/blob/d36b805dbd7dd65f2df947235c5bcc573afe2c76/LICENSES/MIT.txt"
+        }
+      ]
+    },
+    {
+      "name": "fluent-langneg",
+      "version": "0.13.1",
+      "spdx": "Apache-2.0 OR MIT",
+      "upstream_commit": "7fdc590466ea63ca2367ac10fb1b881fe561f1a8",
+      "selected_license": "preserve upstream offered alternatives",
+      "reason": "Published crate omits full license files; exact upstream VCS source retained. io_tee README grant is paired with canonical SPDX Apache2 text where upstream has no standalone license.",
+      "files": [
+        {
+          "path": "packaging/third-party-licenses/fluent-langneg-0.13.1/LICENSE-APACHE",
+          "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+          "upstream_blob": "8dada3edaf50dbc082c9a125058f25def75e625a",
+          "source_url": "https://github.com/projectfluent/fluent-langneg-rs/blob/7fdc590466ea63ca2367ac10fb1b881fe561f1a8/LICENSE-APACHE"
+        },
+        {
+          "path": "packaging/third-party-licenses/fluent-langneg-0.13.1/LICENSE-MIT",
+          "sha256": "016fcc02048817d628b04b140c54db290fd9d29a5e8a55b77871194e810716ac",
+          "upstream_blob": "00ec7a238dcd2fb765a6abc64ae43d80f0514140",
+          "source_url": "https://github.com/projectfluent/fluent-langneg-rs/blob/7fdc590466ea63ca2367ac10fb1b881fe561f1a8/LICENSE-MIT"
+        }
+      ]
+    },
+    {
+      "name": "intl_pluralrules",
+      "version": "7.0.2",
+      "spdx": "Apache-2.0/MIT",
+      "upstream_commit": "d0715d5b7cca72e228d6e6c4de154bd30dfdd06a",
+      "selected_license": "preserve upstream offered alternatives",
+      "reason": "Published crate omits full license files; exact upstream VCS source retained. io_tee README grant is paired with canonical SPDX Apache2 text where upstream has no standalone license.",
+      "files": [
+        {
+          "path": "packaging/third-party-licenses/intl_pluralrules-7.0.2/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "upstream_blob": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+          "source_url": "https://github.com/zbraniecki/pluralrules/blob/d0715d5b7cca72e228d6e6c4de154bd30dfdd06a/intl_pluralrules/LICENSE-APACHE"
+        },
+        {
+          "path": "packaging/third-party-licenses/intl_pluralrules-7.0.2/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "upstream_blob": "31aa79387f27e730e33d871925e152e35e428031",
+          "source_url": "https://github.com/zbraniecki/pluralrules/blob/d0715d5b7cca72e228d6e6c4de154bd30dfdd06a/intl_pluralrules/LICENSE-MIT"
+        }
+      ]
+    },
+    {
+      "name": "io_tee",
+      "version": "0.1.1",
+      "spdx": "MIT OR Apache-2.0",
+      "upstream_commit": "8a7adecebf3429cbc58a0368751d1851dfaf58ed",
+      "selected_license": "Apache-2.0",
+      "reason": "Published crate omits full license files; exact upstream VCS source retained. io_tee README grant is paired with canonical SPDX Apache2 text where upstream has no standalone license.",
+      "files": [
+        {
+          "path": "packaging/third-party-licenses/io_tee-0.1.1/README.md",
+          "sha256": "0ba20a4b5d8188a85014c5f6d52b5407aec2077986c05f6ba686f9899b767b95",
+          "upstream_blob": "4434eb39e66b30090dab13a8587e734b94a07b29",
+          "source_url": "https://github.com/TheOnlyMrCat/io_tee/blob/8a7adecebf3429cbc58a0368751d1851dfaf58ed/README.md"
+        },
+        {
+          "path": "packaging/third-party-licenses/io_tee-0.1.1/Apache-2.0.txt",
+          "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
+          "upstream_blob": "137069b823873b8bcf42979bcf8e9371052d26a2",
+          "source_url": "https://github.com/spdx/license-list-data/blob/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/Apache-2.0.txt"
+        }
+      ]
+    }
+  ]
+}

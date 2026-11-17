@@ -36,7 +36,9 @@ jobs:
           name: packaging-preview
           path: dist/packages/
   publish:
-    if: startsWith(github.ref, 'refs/tags/packages/v') || startsWith(github.ref, 'refs/tags/v')
+    # Legacy Go/source preview artifacts must never silently become a Rust release.
+    # Rust candidates are explicitly unqualified and have no automatic publisher.
+    if: ${{ false }}
     needs: packages
     runs-on: ubuntu-24.04
     permissions:

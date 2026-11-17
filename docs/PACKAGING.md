@@ -11,3 +11,11 @@ Each archive has a named top-level directory. TAR timestamps/ownership and ZIP m
 For Debian preview source packages use `sudo apt install ./<package>.deb`; for RPM previews use `sudo dnf install ./<package>.rpm` in an isolated Rocky Linux 10 environment. Inspect files under /usr/share/kagnode. Removal deletes only package-owned source/data files; user data lives elsewhere. CLI executable packages install /usr/bin/kagnode and preserve XDG credentials on removal.
 
 Release automation builds and checks payloads before publication. CLI 5.0 stable scope does not qualify managed native services. Existing release assets and installers are retained. These packages do not claim native Rocky Linux service operation, Media codecs/GPU validation, HTTP Boot image qualification or stable-release approval.
+
+## Rust Daemon candidate pipeline
+
+The historical builder above remains the compatibility Go/source preview path;
+it is not the reviewed Rust runtime. Automatic tag publication of that path is
+disabled pending reviewed Rust native qualification. See [RUST-RELEASE.md](RUST-RELEASE.md)
+for the new maintainer-only Rust candidate builder/verifier. It cannot publish,
+activate or migrate a service, and its signed preview metadata is not stable approval.

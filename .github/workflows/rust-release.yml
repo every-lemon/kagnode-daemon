@@ -1,0 +1,27 @@
+name: Rust candidate pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  candidate:
+    name: Rust candidate pipeline checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: cargo test --locked --lib release::tests
+      - run: cargo build --locked --bin kagnode-release
+      - run: target/debug/kagnode-release --help
+      - name: Candidate verification never trusts an empty download
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/not-a-release"
+          if target/debug/kagnode-release verify --directory "$RUNNER_TEMP/not-a-release"; then
+            echo 'Empty candidate unexpectedly verified' >&2
+            exit 1
+          fi
+      # No signing secret, release permission, upload or publishing step.
