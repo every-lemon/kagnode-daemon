@@ -172,9 +172,6 @@ fn error_lines(message: &str) -> Vec<Line<'static>> {
             Line::from(badge("not configured", WARN)),
             Line::from(""),
             Line::from("This host is not set up as a backup server. Nothing is stored here."),
-            Line::from(muted(
-                "Setup is done locally by the administrator; see the backup server documentation.",
-            )),
         ]
     } else {
         vec![
@@ -408,9 +405,6 @@ fn sending(agent: &Value) -> (Vec<Line<'static>>, Vec<Row<'static>>) {
             h["compacted_identities"], h["completed_job_limit"]
         ))));
     }
-    lines.push(Line::from(muted(
-        "Last recorded worker observation; this view does not probe remote servers.",
-    )));
     let rows = status["queue"]["transfers"]
         .as_array()
         .map(|t| {

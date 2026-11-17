@@ -478,11 +478,6 @@
             "p",
             "This host is not configured as a backup server. Nothing is being stored here.",
           ),
-          el(
-            "p",
-            "Setup is done locally by the administrator (see the backup server documentation); this page then shows its status, nodes and snapshots.",
-            "muted",
-          ),
         );
         return p;
       }
@@ -520,14 +515,7 @@
             "muted",
           ),
         );
-      p.append(
-        el(
-          "p",
-          (s.verification ? String(s.verification) + " " : "") +
-            "A ciphertext receipt proves the stored copy matches what was sent. It is not a restore test.",
-          "muted",
-        ),
-      );
+      if (s.verification) p.append(el("p", String(s.verification), "muted"));
       return p;
     }
     function agentPanel(a) {
@@ -600,21 +588,13 @@
         p.append(
           el(
             "p",
-            "Older completed transfers are summarised to keep history bounded: " +
-              history.compacted_identities +
-              " compacted, the most recent " +
+            history.compacted_identities +
+              " compacted, latest " +
               history.completed_job_limit +
-              " kept.",
+              " kept",
             "muted",
           ),
         );
-      p.append(
-        el(
-          "p",
-          "Last recorded worker observation; this page does not probe remote servers.",
-          "muted",
-        ),
-      );
       return p;
     }
     function nodesPanel(nodes) {
@@ -937,13 +917,6 @@
         inputs = {};
       const grid = el("div", undefined, "form-grid");
       p.append(el("h2", "Policy"), f);
-      f.append(
-        el(
-          "p",
-          "How often nodes should send, how many snapshots are kept and how much of the link and storage they may use. A policy does not start a schedule by itself.",
-          "muted",
-        ),
-      );
       let editable = true;
       for (const [key, label, unit, nullable] of POLICY_FIELDS) {
         const row = el("label", label),
@@ -1178,13 +1151,6 @@
       content.replaceChildren();
       const form = el("form", undefined, "panel stack sign-in");
       form.append(el("h2", "Sign in"));
-      form.append(
-        el(
-          "p",
-          "Sign in with your Daemon account. Managers and Viewers see only what their role allows.",
-          "muted",
-        ),
-      );
       const account = field(form, "Account", "account", "", "email"),
         password = field(form, "Password", "password", "", "password");
       account.autocomplete = "username";
@@ -1334,7 +1300,7 @@
         panel.append(
           el(
             "p",
-            "This Daemon is unprotected: anyone who can use this machine's terminal is the Operator.",
+            "Unprotected: anyone using this machine's terminal is the Operator.",
             "muted",
           ),
         );
@@ -1359,13 +1325,6 @@
         );
         return;
       }
-      panel.append(
-        el(
-          "p",
-          "Each service shows the level you were given. Native actions are not switched on in this Daemon yet, so this page is read-only for now.",
-          "muted",
-        ),
-      );
       const grid = el("div", undefined, "service-grid");
       for (const id of ids) {
         const level = (me.user.grants || {})[id] || "view";
@@ -1518,11 +1477,6 @@
           true,
         ),
         add,
-        el(
-          "p",
-          "Every change asks for your password again. The last Operator cannot be removed or disabled.",
-          "muted",
-        ),
       );
     }
     async function security(panel) {
@@ -1544,11 +1498,6 @@
             badge(s.admin_enabled ? "on" : "off", s.admin_enabled ? "ok" : ""),
           ],
         ]),
-        el(
-          "p",
-          "When off, this page cannot change users or settings and no product shows an Administration link. Analytics and your own password stay available. Managed applications are not affected either way.",
-          "muted",
-        ),
       );
       if (s.mode !== "owner") {
         const b = el(
@@ -1670,14 +1619,7 @@
         check.dataset.coreSwitch = "";
         check.checked = s.web_enabled;
         row.append(check, el("span", "Enable the Daemon web dashboard"));
-        f.append(
-          row,
-          el(
-            "p",
-            "Disabling the dashboard leaves managed applications running. Re-enable it through kagnode settings web on and restart the Daemon.",
-            "muted",
-          ),
-        );
+        f.append(row);
         const save = el("button", "Save preferences", "button primary");
         f.append(save);
         f.onsubmit = async (e) => {
@@ -1946,13 +1888,6 @@
               el(
                 "p",
                 services.message || "Native service control is unavailable.",
-              ),
-            );
-            management.append(
-              el(
-                "p",
-                "A root administrator must explicitly enroll each existing unit before Daemon can change it. Configuration and data remain with the application.",
-                "muted",
               ),
             );
           }
