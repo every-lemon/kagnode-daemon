@@ -282,6 +282,8 @@ fn safe_error(message: &str) -> &str {
         "Sign in again"
         | "Authentication refused"
         | "Authentication refused; retry later"
+        | "Session limit reached"
+        | "Reducing retention requires explicit trim confirmation"
         | "Action not permitted"
         | "Fresh confirmation required"
         | "Confirmation refused"
@@ -968,6 +970,8 @@ mod tests {
             "Authentication refused",
             "Sign in again",
             "User changed; reload",
+            "Session limit reached",
+            "Reducing retention requires explicit trim confirmation",
         ] {
             assert_eq!(safe_error(message), message);
         }
