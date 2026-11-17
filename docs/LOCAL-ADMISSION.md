@@ -70,6 +70,29 @@ service primary group. Root/service UID are deployment trust identities, not
 logical member privileges. Fixture transport refreshes before input, immediately
 before dispatch and before reply, so removal refuses existing connections.
 
+Admission sessions are persisted with a server-created random epoch, bound to the
+actual peer UID, complete validated policy, normalized current groups and trusted
+local-file metadata. The metadata includes device/inode identity, ownership/mode,
+length and nanosecond mtime/ctime of the root policy, `/etc/passwd` and `/etc/group`.
+The snapshot must remain equal across authorization reads. Replacing or editing
+these files, including removal/readdition with identical final groups and policy
+revision, expires the old epoch. Unrelated account-file edits also expire admitted
+sessions conservatively. This is a local-files model only; directory-service
+changes are not covered. Metadata is not an event log: same-inode, same-length
+rewrites with identical timestamps (filesystem timestamp granularity or privileged
+restoration) cannot be proven observed. Native removal/readdition qualification
+remains required; admission stays unavailable.
+No epoch or UID supplied by a client is accepted.
+
+An observed denial transactionally deletes that peer's bound admission sessions
+and their confirmations and records actor revocation audit events. It tombstones
+the persisted generation, so readdition requires fresh password authentication
+and cannot restore old tokens or an in-flight login. Sessions on the private-owner
+transport, root and service trust identities are not invalidated by membership
+refresh. A decreasing policy revision is refused. The original safe authentication
+and session error strings remain available to clients; unrecognized internal
+errors are replaced by a fixed message. No TUI source changes are required.
+
 Membership only permits authentication attempts. Actual peer UID is passed to
 existing role/session checks, which reject a UID-A token used by UID-B and retain
 Viewer analytics, Manager explicit grants, owner UID and root recovery boundaries.
@@ -105,7 +128,9 @@ native systems; the previous failed SSH VM boot is not a pass and is not retried
 Unit fixtures test validation, disabled gates, permission plans, metadata
 symlink/FIFO/mode rejection, live/stale socket refusal, actual kernel peer UID,
 framed dispatch, refresh removal, absolute trickle deadlines, UID fairness and
-cross-UID session rejection. An existing nobody65534 client actually connects to
+cross-UID session rejection, persisted removal/readdition token refusal,
+confirmation/audit revocation, private-owner session preservation, same-content
+metadata rewrite/replacement detection and removal during login. An existing nobody65534 client actually connects to
 the same staged/published socket and is refused a non-owner owner_session; the
 server observes actual kernel UID65534. Its membership policy remains synthetic. Root-only
 filesystem fixtures skip without root and are explicitly synthetic. All-root

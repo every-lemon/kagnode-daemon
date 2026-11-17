@@ -1,5 +1,6 @@
 //! Disabled separate-UID transport. Policy is root controlled, never request JSON.
 use anyhow::{Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -33,11 +34,14 @@ pub struct Policy {
 impl Policy {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.revision > 0 && self.daemon_uid != u32::MAX,
+            self.revision > 0 && self.revision <= i64::MAX as u64 && self.daemon_uid != u32::MAX,
             "Invalid admission policy"
         );
         ensure!(
-            self.admission_gid != 0 && self.admission_gid != self.service_gid,
+            self.service_gid != u32::MAX
+                && self.admission_gid != 0
+                && self.admission_gid != u32::MAX
+                && self.admission_gid != self.service_gid,
             "Admission group must be distinct"
         );
         ensure!(
@@ -273,6 +277,24 @@ fn write_bounded(
     }
     Ok(())
 }
+fn safe_error(message: &str) -> &str {
+    match message {
+        "Sign in again"
+        | "Authentication refused"
+        | "Authentication refused; retry later"
+        | "Action not permitted"
+        | "Fresh confirmation required"
+        | "Confirmation refused"
+        | "Unexpected confirmation"
+        | "User changed; reload"
+        | "Security settings changed; reload"
+        | "Retention changed; reload"
+        | "Authentication workers busy"
+        | "Password workers busy; retry later"
+        | "Authorization changed; retry after signing in" => message,
+        _ => "Request unavailable",
+    }
+}
 fn exchange(mut stream: UnixStream, value: &crate::roles::Envelope) -> Result<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut bytes = zeroize::Zeroizing::new(serde_json::to_vec(value)?);
@@ -281,7 +303,11 @@ fn exchange(mut stream: UnixStream, value: &crate::roles::Envelope) -> Result<Va
     write_bounded(&mut stream, &bytes, deadline)?;
     let reply = read_bounded(&mut stream, 2 * 1024 * 1024, deadline, false)?;
     let response: Value = serde_json::from_slice(&reply)?;
-    ensure!(response["ok"] == true, "Daemon request refused");
+    ensure!(
+        response["ok"] == true,
+        "{}",
+        safe_error(response["error"].as_str().unwrap_or("Request unavailable"))
+    );
     Ok(response["value"].clone())
 }
 /// Callable client contract for Claude. Fixed locator only; failure never retries
@@ -397,32 +423,204 @@ pub fn apply_installer_plan(_plan: &Value) -> Result<()> {
     )
 }
 
-/// One bounded framed request, actual kernel UID; the supplier must reopen root
-/// policy and current membership at both boundaries. No public enabled server.
+fn admission_schema(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS local_admission_uids(uid INTEGER PRIMARY KEY,epoch TEXT NOT NULL,revision INTEGER NOT NULL,identity TEXT NOT NULL); CREATE TABLE IF NOT EXISTS local_admission_sessions(hash TEXT PRIMARY KEY,uid INTEGER NOT NULL,epoch TEXT NOT NULL);")?;
+    Ok(())
+}
+fn revoke_uid(db: &Connection, uid: u32) -> Result<()> {
+    let actors:Vec<(String,String)>=db.prepare("SELECT DISTINCT u.id,u.email FROM terminal_sessions s JOIN users u ON u.id=s.user_id WHERE s.uid=?1 AND s.hash IN (SELECT hash FROM local_admission_sessions WHERE uid=?1)")?.query_map([uid],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<std::result::Result<_,_>>()?;
+    let mode: String = db.query_row("SELECT mode FROM security_config", [], |r| r.get(0))?;
+    db.execute("DELETE FROM terminal_confirmations WHERE session_hash IN (SELECT hash FROM local_admission_sessions WHERE uid=?1)",[uid])?;
+    db.execute("DELETE FROM terminal_sessions WHERE uid=?1 AND hash IN (SELECT hash FROM local_admission_sessions WHERE uid=?1)",[uid])?;
+    db.execute("DELETE FROM local_admission_sessions WHERE uid=?1", [uid])?;
+    for (actor, account) in actors {
+        db.execute("INSERT INTO audit(at,actor,action,detail) VALUES(?1,?2,'security:local_admission_revoked',?3)",params![crate::auth::now(),actor,serde_json::json!({"account":account,"uid":uid,"mode":mode,"request_id":crate::auth::random()?,"outcome":"revoked"}).to_string()])?;
+    }
+    Ok(())
+}
+fn revoke_observed(store: &crate::store::Store, uid: u32) -> Result<()> {
+    // Only a previously recorded distinct admission UID may be invalidated.
+    // Root/service owner traffic never creates these rows.
+    if uid == 0 {
+        return Ok(());
+    }
+    let mut db = store.db()?;
+    let tx = db.transaction()?;
+    admission_schema(&tx)?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_admission_uids WHERE uid=?1)",
+        [uid],
+        |r| r.get::<_, bool>(0),
+    )? {
+        revoke_uid(&tx, uid)?;
+        tx.execute(
+            "UPDATE local_admission_uids SET epoch=?2,identity='revoked' WHERE uid=?1",
+            params![uid, crate::auth::random()?],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+#[derive(PartialEq, Eq)]
+struct AdmissionContext {
+    uid: u32,
+    epoch: Option<String>,
+}
+// Server-side policy, current local groups and trusted metadata fingerprint.
+// Never deserialized from a client frame.
+type Authorization = (Policy, Vec<u32>, String);
+fn refresh_context(
+    store: &crate::store::Store,
+    uid: u32,
+    refresh: &impl Fn(u32) -> Result<Authorization>,
+) -> Result<AdmissionContext> {
+    let checked = refresh(uid).and_then(|(p, g, i)| {
+        admitted(&p, uid, &g)?;
+        Ok((p, g, i))
+    });
+    let (policy, mut groups, identity) = match checked {
+        Ok(v) => v,
+        Err(_) => {
+            revoke_observed(store, uid)?;
+            anyhow::bail!("Sign in again");
+        }
+    };
+    if uid == 0 || uid == policy.daemon_uid {
+        return Ok(AdmissionContext { uid, epoch: None });
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    let identity = crate::auth::digest(
+        &serde_json::json!({"uid":uid,"policy":policy,"groups":groups,"local_identity":identity})
+            .to_string(),
+    );
+    let mut db = store.db()?;
+    let tx = db.transaction()?;
+    admission_schema(&tx)?;
+    let previous: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT epoch,revision,identity FROM local_admission_uids WHERE uid=?1",
+            [uid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if previous
+        .as_ref()
+        .is_some_and(|(_, revision, _)| (policy.revision as i64) < *revision)
+    {
+        revoke_uid(&tx, uid)?;
+        tx.commit()?;
+        anyhow::bail!("Sign in again");
+    }
+    let epoch = if let Some((epoch, _, old_identity)) = &previous
+        && old_identity == &identity
+    {
+        epoch.clone()
+    } else {
+        revoke_uid(&tx, uid)?;
+        let epoch = crate::auth::random()?;
+        tx.execute("INSERT INTO local_admission_uids VALUES(?1,?2,?3,?4) ON CONFLICT(uid) DO UPDATE SET epoch=excluded.epoch,revision=excluded.revision,identity=excluded.identity",params![uid,epoch,policy.revision as i64,identity])?;
+        epoch
+    };
+    tx.commit()?;
+    Ok(AdmissionContext {
+        uid,
+        epoch: Some(epoch),
+    })
+}
+fn check_bound_session(
+    store: &crate::store::Store,
+    context: &AdmissionContext,
+    token: Option<&str>,
+) -> Result<()> {
+    if let (Some(epoch), Some(token)) = (&context.epoch, token) {
+        ensure!(store.db()?.query_row("SELECT EXISTS(SELECT 1 FROM local_admission_sessions a JOIN terminal_sessions s ON s.hash=a.hash WHERE a.hash=?1 AND a.uid=?2 AND s.uid=?2 AND a.epoch=?3)",params![crate::auth::digest(token),context.uid,epoch],|r|r.get::<_,bool>(0))?,"Sign in again");
+    }
+    Ok(())
+}
+fn bind_issued_session(
+    store: &crate::store::Store,
+    context: &AdmissionContext,
+    value: &Value,
+) -> Result<()> {
+    if let (Some(epoch), Some(token)) = (&context.epoch, value["token"].as_str()) {
+        let mut db = store.db()?;
+        let tx = db.transaction()?;
+        if !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_admission_uids WHERE uid=?1 AND epoch=?2)",
+            params![context.uid, epoch],
+            |r| r.get::<_, bool>(0),
+        )? {
+            // A concurrent observed removal invalidated the login in flight.
+            tx.execute(
+                "DELETE FROM terminal_confirmations WHERE session_hash=?1",
+                [crate::auth::digest(token)],
+            )?;
+            tx.execute(
+                "DELETE FROM terminal_sessions WHERE hash=?1 AND uid=?2",
+                params![crate::auth::digest(token), context.uid],
+            )?;
+            tx.commit()?;
+            anyhow::bail!("Sign in again");
+        }
+        ensure!(
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM terminal_sessions WHERE hash=?1 AND uid=?2)",
+                params![crate::auth::digest(token), context.uid],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "Sign in again"
+        );
+        tx.execute("DELETE FROM local_admission_sessions WHERE hash NOT IN (SELECT hash FROM terminal_sessions)",[])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO local_admission_sessions VALUES(?1,?2,?3)",
+            params![crate::auth::digest(token), context.uid, epoch],
+        )?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+fn admission_dispatch(
+    store: &crate::store::Store,
+    uid: u32,
+    request: crate::roles::Envelope,
+    refresh: &impl Fn(u32) -> Result<Authorization>,
+) -> Result<Value> {
+    let context = refresh_context(store, uid, refresh)?;
+    check_bound_session(store, &context, request.session.as_deref())?;
+    let result = crate::runtime::authenticated_dispatch(store, uid, request);
+    if let Ok(value) = &result {
+        bind_issued_session(store, &context, value)?;
+    }
+    let current = refresh_context(store, uid, refresh)?;
+    if current != context {
+        revoke_observed(store, uid)?;
+        anyhow::bail!("Sign in again");
+    }
+    result
+}
+/// Normal compiled protocol implementation; fixture helpers supply policy only.
 fn serve_one(
     mut stream: UnixStream,
     store: &crate::store::Store,
-    refresh: impl Fn(u32) -> Result<(Policy, Vec<u32>)>,
+    refresh: impl Fn(u32) -> Result<Authorization>,
 ) -> Result<()> {
     let uid = peer_uid(&stream)?;
-    let (policy, groups) = refresh(uid)?;
-    admitted(&policy, uid, &groups)?;
-    let line = read_bounded(
-        &mut stream,
-        16384,
-        std::time::Instant::now() + Duration::from_secs(3),
-        true,
-    )?;
-    let request: crate::roles::Envelope =
-        serde_json::from_slice(&line).map_err(|_| anyhow::anyhow!("Invalid terminal request"))?;
-    let (policy, groups) = refresh(uid)?;
-    admitted(&policy, uid, &groups)?;
-    let result = crate::runtime::authenticated_dispatch(store, uid, request);
-    let (policy, groups) = refresh(uid)?;
-    admitted(&policy, uid, &groups)?;
+    let result = (|| -> Result<Value> {
+        refresh_context(store, uid, &refresh)?;
+        let line = read_bounded(
+            &mut stream,
+            16384,
+            std::time::Instant::now() + Duration::from_secs(3),
+            true,
+        )?;
+        let request: crate::roles::Envelope = serde_json::from_slice(&line)
+            .map_err(|_| anyhow::anyhow!("Invalid terminal request"))?;
+        admission_dispatch(store, uid, request, &refresh)
+    })();
     let reply = match result {
         Ok(v) => serde_json::json!({"ok":true,"value":v}),
-        Err(_) => serde_json::json!({"ok":false,"error":"Request refused"}),
+        Err(e) => serde_json::json!({"ok":false,"error":safe_error(&e.to_string())}),
     };
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(&reply)?);
     ensure!(encoded.len() <= 2 * 1024 * 1024, "Response exceeded limits");
@@ -484,11 +682,51 @@ fn bind_listener(
     endpoint(policy, socket, anchor)?;
     Ok(listener)
 }
-fn current_authorization(uid: u32) -> Result<(Policy, Vec<u32>)> {
+// Local-files identity model only: trusted inode identity and nanosecond mtime/
+// ctime detect replacement and remove/readd even when final contents match.
+// This deliberately expires all admitted sessions on unrelated account edits.
+fn identity_metadata(paths: &[&Path]) -> Result<String> {
+    let mut identities = Vec::new();
+    for path in paths {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let m = file.metadata()?;
+        ensure!(
+            m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0 && m.nlink() == 1,
+            "Untrusted local identity metadata"
+        );
+        identities.push((
+            m.dev(),
+            m.ino(),
+            m.mode(),
+            m.uid(),
+            m.gid(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ));
+    }
+    Ok(crate::auth::digest(&serde_json::to_string(&identities)?))
+}
+fn current_authorization(uid: u32) -> Result<Authorization> {
+    let paths = [
+        Path::new(POLICY_PATH),
+        Path::new("/etc/passwd"),
+        Path::new("/etc/group"),
+    ];
+    let before = identity_metadata(&paths)?;
     let policy = current_policy()?;
     let groups = current_groups(uid)?;
     admitted(&policy, uid, &groups)?;
-    Ok((policy, groups))
+    ensure!(
+        before == identity_metadata(&paths)?,
+        "Local identity changed; retry"
+    );
+    Ok((policy, groups, before))
 }
 /// Fixed listener, max8 concurrent bounded connection/password workers. All
 /// provisioning and OS admission remain unreachable until independent qualification.
@@ -535,7 +773,7 @@ impl Drop for ConnectionPermit {
 fn serve_listener(
     listener: std::os::unix::net::UnixListener,
     store: &crate::store::Store,
-    refresh: fn(u32) -> Result<(Policy, Vec<u32>)>,
+    refresh: fn(u32) -> Result<Authorization>,
 ) -> Result<()> {
     let budget = std::sync::Arc::new(ConnectionBudget::default());
     for connection in listener.incoming() {
@@ -576,6 +814,168 @@ mod tests {
         p.daemon_uid = unsafe { libc::geteuid() };
         p
     }
+    fn login_envelope() -> crate::roles::Envelope {
+        serde_json::from_value(serde_json::json!({"version":1,"request_id":"admission-login","session":null,"confirmation":null,"payload":{"action":"login","account":"owner@fixture.invalid","password":"fixture-password-long"}})).unwrap()
+    }
+    fn whoami_envelope(token: &str) -> crate::roles::Envelope {
+        crate::roles::Envelope {
+            version: 1,
+            request_id: "admission-whoami".into(),
+            session: Some(token.into()),
+            confirmation: None,
+            payload: crate::roles::Action::Whoami,
+        }
+    }
+    #[test]
+    fn observed_removal_revokes_sessions_confirmations_and_allows_fresh_login() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&t.path().join("controller"))?;
+        store.init(
+            "owner@fixture.invalid",
+            "fixture-password-long",
+            crate::store::Profile::Light,
+            false,
+        )?;
+        let refresh = |_| Ok((policy(), vec![23456], "first-identity".into()));
+        let before_removal = refresh_context(&store, 34567, &refresh)?;
+        let login = admission_dispatch(&store, 34567, login_envelope(), &refresh)?;
+        let token = login["token"].as_str().unwrap();
+        admission_dispatch(&store, 34567, whoami_envelope(token), &refresh)?;
+        let hash = crate::auth::digest(token);
+        store.db()?.execute("INSERT INTO terminal_confirmations VALUES('fixture-confirmation',?1,1,'fixture-request',?2)",params![hash,crate::auth::now()+300])?;
+        // A private-owner session with the same UID is not an admission session.
+        store.db()?.execute("INSERT INTO terminal_sessions SELECT 'private-owner',user_id,uid,auth_revision,created,expires,last_use,authenticated_at FROM terminal_sessions WHERE hash=?1",[&hash])?;
+        assert!(
+            admission_dispatch(&store, 34567, whoami_envelope(token), &|_| Ok((
+                policy(),
+                vec![],
+                "first-identity".into()
+            )))
+            .is_err()
+        );
+        let db = store.db()?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM terminal_confirmations", [], |r| r
+                .get::<_, u32>(0))?,
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM terminal_sessions WHERE hash=?1",
+                [&hash],
+                |r| r.get::<_, u32>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM terminal_sessions WHERE hash='private-owner'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )?,
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM audit WHERE action='security:local_admission_revoked'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )?,
+            1
+        );
+        drop(db);
+        // Same policy revision and identity restored: deleted token stays deleted.
+        assert!(admission_dispatch(&store, 34567, whoami_envelope(token), &refresh).is_err());
+        assert!(before_removal != refresh_context(&store, 34567, &refresh)?);
+        let fresh = admission_dispatch(&store, 34567, login_envelope(), &refresh)?;
+        let token = fresh["token"].as_str().unwrap();
+        admission_dispatch(&store, 34567, whoami_envelope(token), &refresh)?;
+        // Quiet remove/readd between requests changes trusted filesystem metadata.
+        let changed = |_| Ok((policy(), vec![23456], "second-identity".into()));
+        assert!(admission_dispatch(&store, 34567, whoami_envelope(token), &changed).is_err());
+        let fresh = admission_dispatch(&store, 34567, login_envelope(), &changed)?;
+        admission_dispatch(
+            &store,
+            34567,
+            whoami_envelope(fresh["token"].as_str().unwrap()),
+            &changed,
+        )?;
+        // Persisted epoch survives a reopened Store.
+        let reopened = crate::store::Store::open(&store.root)?;
+        assert!(admission_dispatch(&reopened, 34567, whoami_envelope(token), &refresh).is_err());
+        Ok(())
+    }
+    #[test]
+    fn removal_during_login_does_not_leave_an_issued_session() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&t.path().join("controller"))?;
+        store.init(
+            "owner@fixture.invalid",
+            "fixture-password-long",
+            crate::store::Profile::Light,
+            false,
+        )?;
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            admission_dispatch(&store, 34567, login_envelope(), &|_| {
+                calls.set(calls.get() + 1);
+                Ok((
+                    policy(),
+                    if calls.get() == 1 {
+                        vec![23456]
+                    } else {
+                        vec![]
+                    },
+                    "fixture".into(),
+                ))
+            })
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .db()?
+                .query_row("SELECT count(*) FROM terminal_sessions", [], |r| r
+                    .get::<_, u32>(0))?,
+            0
+        );
+        Ok(())
+    }
+    #[test]
+    fn trusted_metadata_detects_same_content_rewrite_and_replacement() -> Result<()> {
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(());
+        }
+        let t = tempfile::tempdir()?;
+        let path = t.path().join("account-fixture");
+        fs::write(&path, b"same final contents")?;
+        let initial = identity_metadata(&[&path])?;
+        std::thread::sleep(Duration::from_millis(2));
+        fs::write(&path, b"temporary removal")?;
+        fs::write(&path, b"same final contents")?;
+        let rewritten = identity_metadata(&[&path])?;
+        assert_ne!(initial, rewritten);
+        let replacement = t.path().join("replacement");
+        fs::write(&replacement, b"same final contents")?;
+        fs::rename(&replacement, &path)?;
+        assert_ne!(rewritten, identity_metadata(&[&path])?);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        assert!(identity_metadata(&[&path]).is_err());
+        Ok(())
+    }
+    #[test]
+    fn safe_auth_errors_survive_but_internal_details_are_redacted() {
+        for message in [
+            "Authentication refused",
+            "Sign in again",
+            "User changed; reload",
+        ] {
+            assert_eq!(safe_error(message), message);
+        }
+        assert_eq!(
+            safe_error("database path or private implementation detail"),
+            "Request unavailable"
+        );
+    }
     #[test]
     fn membership_never_grants_role_and_service_group_is_refused() -> Result<()> {
         let p = policy();
@@ -604,6 +1004,12 @@ mod tests {
         assert_eq!(plan["socket_mode"], "0660");
         assert!(apply_installer_plan(&plan).is_err());
         p.admission_gid = p.service_gid;
+        assert!(p.validate().is_err());
+        p = policy();
+        p.admission_gid = u32::MAX;
+        assert!(p.validate().is_err());
+        p = policy();
+        p.service_gid = u32::MAX;
         assert!(p.validate().is_err());
         p = policy();
         p.members.push(34567);
@@ -696,7 +1102,9 @@ mod tests {
         let root = store.root.clone();
         let worker = std::thread::spawn(move || -> Result<()> {
             let (stream, _) = listener.accept()?;
-            serve_one(stream, &store, |_| Ok((fixture_policy(), vec![])))
+            serve_one(stream, &store, |_| {
+                Ok((fixture_policy(), vec![], "fixture".into()))
+            })
         });
         let request = crate::roles::Envelope {
             version: 1,
@@ -814,7 +1222,7 @@ assert json.loads(s.recv(65536))['ok'] is False
         // common compiled dispatcher refuses a non-owner passwordless session.
         let result = serve_one(stream, &store, |uid| {
             assert_eq!(uid, 65534);
-            Ok((p.clone(), vec![65534]))
+            Ok((p.clone(), vec![65534], "fixture".into()))
         });
         if result.is_err() {
             let _ = child.kill();
@@ -872,7 +1280,12 @@ assert json.loads(s.recv(65536))['ok'] is False
             let (mut client, server) = UnixStream::pair()?;
             client.write_all(&data)?;
             client.shutdown(std::net::Shutdown::Write)?;
-            assert!(serve_one(server, &store, |_| Ok((fixture_policy(), vec![]))).is_err());
+            serve_one(server, &store, |_| {
+                Ok((fixture_policy(), vec![], "fixture".into()))
+            })?;
+            let mut reply = String::new();
+            client.read_to_string(&mut reply)?;
+            assert_eq!(serde_json::from_str::<Value>(&reply)?["ok"], false);
         }
         Ok(())
     }
@@ -902,7 +1315,7 @@ assert json.loads(s.recv(65536))['ok'] is False
         serve_one(server, &store, |actual| {
             assert_eq!(actual, uid);
             refresh.set(refresh.get() + 1);
-            Ok((fixture_policy(), vec![]))
+            Ok((fixture_policy(), vec![], "fixture".into()))
         })?;
         let mut reply = String::new();
         client.read_to_string(&mut reply)?;
@@ -924,14 +1337,14 @@ assert json.loads(s.recv(65536))['ok'] is False
         client.write_all(&data)?;
         client.write_all(b"\n")?;
         let calls = std::cell::Cell::new(0);
-        assert!(
-            serve_one(server, &store, |_| {
-                calls.set(calls.get() + 1);
-                ensure!(calls.get() < 2, "Removed member");
-                Ok((fixture_policy(), vec![]))
-            })
-            .is_err()
-        );
+        serve_one(server, &store, |_| {
+            calls.set(calls.get() + 1);
+            ensure!(calls.get() < 2, "Removed member");
+            Ok((fixture_policy(), vec![], "fixture".into()))
+        })?;
+        let mut reply = String::new();
+        client.read_to_string(&mut reply)?;
+        assert_eq!(serde_json::from_str::<Value>(&reply)?["ok"], false);
         assert_eq!(calls.get(), 2);
         Ok(())
     }
