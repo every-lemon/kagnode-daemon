@@ -194,6 +194,9 @@ body:has([data-core-login]) main {
   border-radius: 50%;
   background: var(--badge-dot, var(--kn-muted));
 }
+.badge:not(.ok):not(.warn):not(.bad)::before {
+  display: none;
+}
 .badge.ok {
   color: var(--kn-text);
   --badge-dot: #1a9b5b;
@@ -332,6 +335,17 @@ form.stack > button.primary {
   flex-wrap: wrap;
   gap: 6px;
 }
+@media (min-width: 641px) {
+  .row-actions {
+    flex-wrap: nowrap;
+    white-space: nowrap;
+  }
+}
+html[data-kn-core] .admin-main .panel {
+  padding: 0 !important;
+  border: 0 !important;
+  background: none !important;
+}
 .sign-in {
   max-width: 420px;
   margin: 0 auto;
@@ -364,6 +378,7 @@ dialog {
     clip: rect(0 0 0 0);
   }
   .admin-main .data-table tr {
+    box-sizing: border-box;
     border: 1px solid var(--kn-line, rgba(128, 128, 128, 0.35));
     border-radius: 12px;
     padding: 8px 12px;

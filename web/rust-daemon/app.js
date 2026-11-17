@@ -1144,7 +1144,6 @@
         ? g.map(([p, l]) => (PRODUCT_NAMES[p] || p) + ": " + l).join(", ")
         : "none";
     }
-    const tone = { operator: "info", manager: "ok", viewer: "" };
 
     function signIn(message) {
       heading.textContent = "Administration";
@@ -1201,7 +1200,7 @@
       who.append(
         el("strong", me.user.account),
         document.createTextNode(" "),
-        badge(me.user.role, tone[me.user.role]),
+        badge(me.user.role),
       );
       if (me.protection === "unprotected")
         who.append(document.createTextNode(" "), badge("unprotected", "warn"));
@@ -1462,7 +1461,7 @@
         actions.append(edit, toggle, reset);
         return [
           u.account + (u.id === me.user.id ? " (you)" : ""),
-          badge(u.role, tone[u.role]),
+          badge(u.role),
           servicesText(u),
           badge(u.disabled ? "disabled" : "active", u.disabled ? "bad" : "ok"),
           actions,
