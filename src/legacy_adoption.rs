@@ -145,7 +145,7 @@ fn read(base: &Path, rel: &str, max: u64) -> Result<(FileState, Vec<u8>)> {
             && m.uid() == 0
             && m.gid() == 0
             && m.nlink() == 1
-            && m.mode() & 0o022 == 0
+            && m.mode() & 0o7022 == 0
             && m.len() <= max,
         "legacy_unsafe_file"
     );
@@ -839,6 +839,15 @@ mod tests {
         let exposed = serde_json::to_string(&p).unwrap() + &serde_json::to_string(&r).unwrap();
         assert!(!exposed.contains("SYNTHETIC-SECRET"));
         assert!(!exposed.contains("Operator"));
+    }
+    #[test]
+    fn special_file_modes_refused_before_copy() {
+        let Some((t, b)) = fixture() else { return };
+        for mode in [0o4755, 0o2755, 0o1755] {
+            fs::set_permissions(b.join(OLD), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(inspect_fixture(&b).is_err());
+        }
+        assert!(!t.path().join("copy").exists());
     }
     #[test]
     fn unknown_binary_refused() {

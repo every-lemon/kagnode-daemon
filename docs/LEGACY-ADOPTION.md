@@ -31,7 +31,7 @@ and either `--root ROOT serve` or `serve --root ROOT`. ROOT is `/srv/kagnode` or
 
 Directory components are opened through checked directory descriptors; reads use
 O_NOFOLLOW/O_NONBLOCK, root ownership, single-link regular files, no group/world
-writes and bounded lengths. Reads compare inode, mode, owner, size, mtime and
+writes or special file mode bits, and bounded lengths. Reads compare inode, mode, owner, size, mtime and
 ctime before/after and against the named file. The final inventory rereads every
 file and entry identity. There is no guarantee of a consistent application
 snapshot: active writers cause refusal when observed. This inventory cannot
